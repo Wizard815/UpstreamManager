@@ -28,6 +28,8 @@ class UpstreamComparison:
     conflict: bool = False
     conflict_detail: str | None = None
     refspec: str | None = None
+    conflict_files: list[str] = field(default_factory=list)
+    missing_ref: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -42,77 +44,72 @@ class UpstreamComparison:
             "conflict": self.conflict,
             "conflict_detail": self.conflict_detail,
             "refspec": self.refspec,
+            "conflict_files": self.conflict_files,
+            "missing_ref": self.missing_ref,
         }
 
 
-def _fetch_remote(path: str, remote: str) -> bool:
-    res = gitops._run(["git", "fetch", remote], cwd=path, check=False)
-    if res.returncode != 0:
-        # remote may not exist locally; add it
-        url = _remote_url(path, remote)
-        if url:
-            gitops._run(["git", "remote", "add", remote, url], cwd=path)
-            gitops._run(["git", "fetch", remote], cwd=path)
-    return res.returncode == 0
-
-
 def _remote_url(path: str, remote: str) -> str | None:
-    remotes = gitops.remotes(path)
-    for k, v in remotes.items():
-        if k == remote:
-            return v
-    return None
+    return gitops.remotes(path).get(remote)
 
 
-def compare_upstream(path: str, upstream: dict, focus_branch: str | None = None) -> UpstreamComparison:
-    """Compare focus branch (default current) against the upstream's branch."""
+_merge_cache: dict[tuple[str, str], dict] = {}
+
+
+def cached_merge_check(path: str, local_sha: str, upstream_sha: str) -> dict:
+    """merge_check keyed by the two commit ids, so unchanged refs are never re-merged."""
+    key = (local_sha, upstream_sha)
+    if key not in _merge_cache:
+        if len(_merge_cache) > 200:
+            _merge_cache.clear()
+        _merge_cache[key] = gitops.merge_check(path, local_sha, upstream_sha)
+    return _merge_cache[key]
+
+
+def compare_upstream(path: str, upstream: dict, focus_branch: str | None = None,
+                     fetch: bool = False) -> UpstreamComparison:
+    """Compare the focus branch against the upstream's branch.
+
+    `behind` = commits the upstream has that the focus branch lacks; `ahead` =
+    commits only the focus branch has. Network access only happens with
+    fetch=True (the Fetch button, the daily check); everything else reads the
+    refs already in the repo. Conflicts come from a merge simulation that does
+    not touch the working tree.
+    """
     remote = upstream["name"]
     url = upstream.get("url") or _remote_url(path, remote) or remote
-    branch = upstream.get("branch") or (focus_branch or gitops.current_branch(path) or "main")
+    focus = focus_branch or gitops.current_branch(path) or "main"
+    branch = upstream.get("branch") or focus
 
-    _fetch_remote(path, remote)
+    fetch_error = None
+    if fetch:
+        ok, msg = gitops.fetch(path, remote)
+        if not ok:
+            fetch_error = msg
 
-    # ensure the remote-tracking branch exists for the upstream's own branch
-    # fetch all remote branches into refs/remotes/<name>/* (works even if the
-    # specific branch name isn't resolvable as a refspec target)
-    gitops._git(["fetch", "-f", remote, f"+refs/heads/*:refs/remotes/{remote}/*"], path)
     ref = f"refs/remotes/{remote}/{branch}"
-    local = gitops.short_sha(path, focus_branch or gitops.current_branch(path) or "main")
+    if not gitops.ref_exists(path, ref):
+        return UpstreamComparison(name=remote, url=url, branch=branch, ahead=0, behind=0, up_to_date=False,
+                                  conflict_detail=fetch_error or f"{remote}/{branch} not fetched yet - press Fetch",
+                                  missing_ref=True)
+    local = gitops.short_sha(path, focus)
     upstream_sha = gitops.short_sha(path, ref)
+    behind, ahead = gitops.behind_ahead(path, focus, ref)
 
-    ahead = 0
-    behind = 0
-    try:
-        ahead = int(gitops._git(["rev-list", "--count", f"{local}..{upstream_sha}"], path) or 0)
-    except Exception:
-        ahead = 0
-    try:
-        behind = int(gitops._git(["rev-list", "--count", f"{upstream_sha}..{local}"], path) or 0)
-    except Exception:
-        behind = 0
-
-    conflict = False
-    conflict_detail = None
-    if ahead and behind and upstream_sha:
-        # both sides moved — merge will likely need resolution
-        res = gitops._run(["git", "merge", "--no-commit", "--no-ff", upstream_sha], cwd=path)
-        if res.returncode != 0:
-            conflict = True
-            conflict_detail = res.stderr.strip() or res.stdout.strip()
-        else:
-            gitops._run(["git", "merge", "--abort"], cwd=path)
+    conflict, files, detail = False, [], fetch_error
+    if behind and ahead and local and upstream_sha:
+        # both sides moved: simulate the merge (read-only)
+        check = cached_merge_check(path, local, upstream_sha)
+        conflict, files = check["conflict"], check["files"]
+        if not check["ok"]:
+            detail = check.get("error")
+        elif conflict:
+            detail = f"{len(files)} conflicting file(s)"
 
     return UpstreamComparison(
-        name=remote,
-        url=url,
-        branch=branch,
-        ahead=ahead,
-        behind=behind,
-        up_to_date=(ahead == 0 and behind == 0),
-        local_sha=local,
-        upstream_sha=upstream_sha,
-        conflict=conflict,
-        conflict_detail=conflict_detail,
+        name=remote, url=url, branch=branch, ahead=ahead, behind=behind,
+        up_to_date=(ahead == 0 and behind == 0), local_sha=local, upstream_sha=upstream_sha,
+        conflict=conflict, conflict_detail=detail, conflict_files=files,
     )
 
 
@@ -141,7 +138,7 @@ class MergePlan:
 
 
 def build_merge_plan(path: str, repo_id: str, name: str, upstreams: list[dict],
-                     focus_branch: str | None = None) -> MergePlan:
+                     focus_branch: str | None = None, fetch: bool = False) -> MergePlan:
     """Compare each upstream to the focus branch and decide if a safe merge is possible."""
     focus = focus_branch or gitops.current_branch(path) or "main"
     comparisons: list[UpstreamComparison] = []
@@ -151,9 +148,11 @@ def build_merge_plan(path: str, repo_id: str, name: str, upstreams: list[dict],
     for up in upstreams:
         if not up.get("enabled", True):
             continue
-        comp = compare_upstream(path, up, focus)
+        comp = compare_upstream(path, up, focus, fetch=fetch)
         comparisons.append(comp)
-        if comp.conflict:
+        if comp.missing_ref:
+            actions.append(f"FETCH {up['name']}/{up.get('branch', focus)} first")
+        elif comp.conflict:
             conflicts.append(f"{up['name']}/{up.get('branch', focus)}")
             actions.append(f"SKIP merge {up['name']}/{up.get('branch', focus)}: conflict")
         elif comp.ahead or comp.behind:

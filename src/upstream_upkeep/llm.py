@@ -1,10 +1,10 @@
-"""LLM chat via the hermes-agent backend (llama-swap, OpenAI-compatible).
+"""LLM chat over any OpenAI-compatible server (llama-swap, llama-server, Argos, ...).
 
-Shares the same provider/base_url/model as Studio. Each call hits the
-`/v1/chat/completions` endpoint with the active LLM config from the hermes
-config.yaml (or the local app settings fallback). UPSTREAM_LLM_BASE_URL /
-UPSTREAM_LLM_MODEL override both without touching either file, which is how a
-dry run points the app at a different model.
+The connection (base URL, model, optional API key) is the app's own setting,
+kept in its state file and edited on the Settings page; it is independent of
+hermes-agent. UPSTREAM_LLM_BASE_URL / UPSTREAM_LLM_MODEL / UPSTREAM_LLM_API_KEY
+override it without touching the state file, which is how a dry run points the
+app at a different model.
 
 Every request is assembled from three layers:
   1. live repo facts (path, branches, upstreams, recent commits)
@@ -18,44 +18,125 @@ import os
 
 import requests
 
-from . import gitops, hermes_config, memory, store
+from pathlib import Path
+
+from . import gitops, memory, store, upstream_check
 
 # Rough character budget for replayed session turns (~4 chars per token).
 HISTORY_CHARS = 24_000
+MAX_TOKENS = 2048
 
 
 def config() -> dict:
-    """Return the LLM config: env override, then local settings, then hermes config.yaml."""
+    """The LLM connection: env override, then the app's saved settings.
+
+    With no model chosen, the first one the server lists is used.
+    """
     local = store.load_llm_config()
-    hermes_llm = hermes_config.resolve_llm_config()
-    return {
-        "model": os.environ.get("UPSTREAM_LLM_MODEL") or local.get("model") or hermes_llm.get("model"),
-        "base_url": (os.environ.get("UPSTREAM_LLM_BASE_URL") or local.get("base_url") or hermes_llm.get("base_url") or "").rstrip("/"),
-        "api_mode": local.get("api_mode") or hermes_llm.get("api_mode"),
+    cfg = {
+        "model": os.environ.get("UPSTREAM_LLM_MODEL") or local.get("model") or "",
+        "base_url": (os.environ.get("UPSTREAM_LLM_BASE_URL") or local.get("base_url") or "").rstrip("/"),
+        "api_key": os.environ.get("UPSTREAM_LLM_API_KEY") or local.get("api_key") or "",
     }
+    if not cfg["model"]:
+        models, _ = list_models(cfg["base_url"], cfg["api_key"])
+        cfg["model"] = models[0] if models else ""
+    return cfg
+
+
+def _headers(api_key: str) -> dict:
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
+SYSTEM_PROMPT = """You are the assistant inside Upstream Management, a web app that watches one git repository and its upstreams.
+
+What you can and cannot do:
+- You cannot run commands, open files or browse. You only know what is written in this message: the live repo facts, your memories, and any items the user attached (commits, files).
+- Never offer to run git commands and never ask the user to paste output that the repo facts below already give you (ahead/behind counts, conflicting files, recent commits, working-tree state). Read the numbers from the facts and answer.
+- If you need a file or commit that is not below, tell the user to attach it with the Tag button (Files and Commits panels next to the chat), then wait. Do not guess its contents.
+- If a fact says an upstream is not fetched yet, tell the user to press Fetch on that upstream.
+- Answer directly and concretely. Do not end every reply with a question. Ask at most one clarifying question, and only when you truly cannot proceed.
+- When something needs doing in git (merge, rebase, resolving conflicts), give the exact commands for the user to run themselves, with the real branch and remote names from the facts.
+- Use the memories when they help, and say so when you rely on one."""
+
+ATTACH_CHARS = 8000
 
 
 def repo_facts(repo: dict) -> str:
     path = repo.get("path", "")
+    st = gitops.status_summary(path)
+    focus = repo.get("focus_branch")
     lines = [
         f"Repository: {repo.get('name') or repo.get('id')} (id {repo.get('id')})",
         f"Local path: {path}",
-        f"Focus branch: {repo.get('focus_branch')} (checked out: {gitops.current_branch(path)})",
+        f"Focus branch: {focus} (checked out: {st['branch']})",
+        "Working tree: " + (f"{st['dirty']} changed file(s), e.g. {', '.join(st['changed'][:8])}" if st["dirty"] else "clean"),
     ]
     if repo.get("remote_url"):
         lines.append(f"Origin: {repo['remote_url']}")
     for u in repo.get("upstreams") or []:
-        state = "enabled" if u.get("enabled", True) else "disabled"
-        lines.append(f"Upstream {u.get('name')}: {u.get('url')} branch {u.get('branch')} ({state})")
+        if not u.get("enabled", True):
+            lines.append(f"Upstream {u.get('name')}: {u.get('url')} (disabled)")
+            continue
+        try:
+            c = upstream_check.compare_upstream(path, u, focus)
+        except Exception as e:  # keep chatting even if one upstream is broken
+            lines.append(f"Upstream {u.get('name')}: {u.get('url')} - comparison failed: {e}")
+            continue
+        if c.missing_ref:
+            lines.append(f"Upstream {c.name}: {c.url} branch {c.branch} - NOT FETCHED YET (press Fetch to compare)")
+            continue
+        line = (f"Upstream {c.name}: {c.url} branch {c.branch} - {focus} is {c.behind} commit(s) BEHIND it "
+                f"(it has {c.behind} commits you lack) and {c.ahead} commit(s) AHEAD of it")
+        if c.behind and c.ahead:
+            line += (f"; a merge would conflict in {len(c.conflict_files)} file(s): {', '.join(c.conflict_files[:15])}"
+                     if c.conflict else "; a merge would apply cleanly (no conflicts)")
+        elif c.up_to_date:
+            line += "; up to date"
+        lines.append(line)
+        if c.behind:
+            missing = gitops.list_commits(path, f"{focus}..refs/remotes/{c.name}/{c.branch}", 0, 8)
+            if missing:
+                lines.append("  newest commits you are missing: " + "; ".join(f"{m['sha']} {m['subject']}" for m in missing))
+    try:
+        top = sorted(p.name + ("/" if p.is_dir() else "") for p in Path(path).iterdir() if p.name != ".git")
+        lines.append("Top-level files: " + ", ".join(top[:60]))
+    except OSError:
+        pass
     commits = gitops.recent_commits(path, 10)
     if commits:
-        lines.append("Recent commits:")
+        lines.append("Recent commits on your branch:")
         lines += [f"  {c['sha']} {c['date'][:10]} {c['subject']}" for c in commits]
     return "\n".join(lines)
 
 
+def attachments_block(repo: dict, attachments: list[dict]) -> str:
+    """Expand the commits/files the user tagged into text the model can read."""
+    parts = []
+    for a in attachments[:6]:
+        try:
+            if a.get("type") == "commit":
+                d = gitops.commit_detail(repo["path"], a["id"], ATTACH_CHARS)
+                parts.append(f"[Attached commit {d['sha'][:10]} by {d['author']} on {d['date'][:10]}]\n{d['message']}\n{d['stat']}\n"
+                             f"{d['patch']}" + ("\n...(patch truncated)" if d["truncated"] else ""))
+            elif a.get("type") == "file":
+                root = Path(repo["path"]).resolve()
+                f = (root / a["id"]).resolve()
+                if root not in f.parents or not f.is_file():
+                    continue
+                text = f.read_text(encoding="utf-8", errors="replace")
+                body = text[:ATTACH_CHARS] + ("\n...(file truncated)" if len(text) > ATTACH_CHARS else "")
+                parts.append(f"[Attached file {a['id']}]\n{body}")
+        except Exception as e:
+            parts.append(f"[Attachment {a.get('id')} could not be read: {e}]")
+    return "\n\n".join(parts)
+
+
 def _memory_block(repo_id: str, message: str) -> str:
-    own = memory.search(message, repo_id=repo_id, k=8)
+    # Commits are far more numerous than notes and preferences, so they would crowd
+    # the latter out of one shared top-k. Search the two groups separately.
+    own = (memory.search(message, repo_id=repo_id, kind="commit", k=5)
+           + memory.search(message, repo_id=repo_id, exclude_kind="commit", k=5))
     other = memory.search(message, exclude=repo_id, k=4)
     parts = []
     if own:
@@ -79,38 +160,44 @@ def _history(session: dict) -> list[dict]:
     return list(reversed(out))
 
 
-def build_messages(repo: dict, session: dict, message: str) -> list[dict]:
-    system = (
-        "You are Upstream Management's assistant for a single repository. "
-        "Answer repo questions concisely and concretely. When asked about upstreams, "
-        "suggest concrete changes via a merge request. Use the memories below when "
-        "they help, and say so when you are relying on one.\n\n"
-        + repo_facts(repo)
-    )
+def build_messages(repo: dict, session: dict, message: str, attachments: list[dict] | None = None) -> list[dict]:
+    system = SYSTEM_PROMPT + "\n\n" + repo_facts(repo)
     mem = _memory_block(repo["id"], message)
     if mem:
         system += "\n\n" + mem
+    att = attachments_block(repo, attachments or [])
+    if att:
+        system += "\n\nThe user attached these for this question:\n\n" + att
     return [{"role": "system", "content": system}, *_history(session), {"role": "user", "content": message}]
 
 
-def chat(repo_id: str, message: str, session_id: str | None = None) -> dict:
+def chat(repo_id: str, message: str, session_id: str | None = None, attachments: list[dict] | None = None) -> dict:
     """Send a chat message to the LLM and return {ok, reply, error, session}."""
     repo = store.get_repo(repo_id)
     if not repo:
         return {"ok": False, "error": "repo not found"}
     session = store.get_session(repo_id, session_id)
     cfg = config()
-    messages = build_messages(repo, session, message)
-    store.add_chat_message(repo_id, session["id"], "user", message)
+    messages = build_messages(repo, session, message, attachments)
+    store.add_chat_message(repo_id, session["id"], "user", message, attachments=attachments or None)
     try:
         resp = requests.post(
             f"{cfg['base_url']}/chat/completions",
-            json={"model": cfg["model"], "messages": messages, "max_tokens": 1024, "temperature": 0.5},
-            timeout=300,
+            json={
+                "model": cfg["model"], "messages": messages, "max_tokens": MAX_TOKENS, "temperature": 0.5,
+                # Reasoning models (Gemma 4, Qwen3.5) otherwise spend the whole budget
+                # thinking; llama-server honours this per request, others ignore it.
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            headers=_headers(cfg["api_key"]), timeout=300,
         )
         resp.raise_for_status()
-        reply = resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:  # network / parse / API error
+        choice = resp.json()["choices"][0]
+        reply = (choice["message"].get("content") or "").strip()
+        if not reply:
+            raise ValueError(f"model returned no answer (finish_reason={choice.get('finish_reason')}); "
+                             "it may have used all tokens on reasoning")
+    except Exception as e:  # network / parse / API error / empty answer
         store.add_chat_message(repo_id, session["id"], "assistant", f"[LLM error: {e}]", error=True)
         return {"ok": False, "error": str(e), "reply": "", "session": session["id"]}
 
@@ -119,12 +206,15 @@ def chat(repo_id: str, message: str, session_id: str | None = None) -> dict:
     return {"ok": True, "reply": reply, "session": session["id"]}
 
 
-def available_models() -> list[str]:
-    """List the model names available from the LLM server."""
-    cfg = config()
+def list_models(base_url: str | None = None, api_key: str | None = None) -> tuple[list[str], str | None]:
+    """Model ids the server offers, as (ids, error). Defaults to the saved connection."""
+    if base_url is None:
+        local = store.load_llm_config()
+        base_url = os.environ.get("UPSTREAM_LLM_BASE_URL") or local.get("base_url") or ""
+        api_key = os.environ.get("UPSTREAM_LLM_API_KEY") or local.get("api_key") or ""
     try:
-        resp = requests.get(f"{cfg['base_url']}/models", timeout=10)
+        resp = requests.get(f"{base_url.rstrip('/')}/models", headers=_headers(api_key or ""), timeout=10)
         resp.raise_for_status()
-        return [m.get("id") for m in resp.json().get("data", [])]
-    except Exception:
-        return []
+        return [m["id"] for m in resp.json().get("data", []) if m.get("id")], None
+    except Exception as e:
+        return [], str(e)

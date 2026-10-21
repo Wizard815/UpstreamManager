@@ -93,27 +93,58 @@ async function loadRepos(container) {
       } catch (e) { toast(String(e), "error"); }
       finally { runBtn.disabled = false; runBtn.textContent = "▶ Run Daily Check"; }
     }
-    list.append(runBtn)
+    const fetchBtn = el("button", { class: "btn ghost", style: "margin:12px 0 12px 8px" }, "Fetch all upstreams")
+    fetchBtn.onclick = async () => {
+      fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…"
+      for (const r of repos) await api(apiUrl(`/api/repo/${r.id}/fetch`), { method: "POST" }).catch(() => {})
+      await loadRepos(list)
+    }
+    list.append(runBtn, fetchBtn)
   } catch (e) { toast(String(e), "error") }
 }
 
+const badge = (cls, txt, title) => el("span", { class: `badge ${cls}`, title: title || null }, txt)
+
+// ↓ behind = commits the upstream has that you lack; ↑ ahead = commits only you have.
+function upstreamBadges(u) {
+  if (u.missing_ref) return [badge("warn", "not fetched", u.conflict_detail || "press Fetch")]
+  const out = []
+  if (u.up_to_date) out.push(badge("up", "up to date"))
+  else {
+    out.push(badge(u.behind ? "warn" : "", `↓ ${u.behind} behind`, "commits the upstream has that you lack"))
+    out.push(badge("", `↑ ${u.ahead} ahead`, "commits only you have"))
+  }
+  if (u.conflict) out.push(badge("bad", `⚠ ${(u.conflict_files || []).length} conflicting files`, (u.conflict_files || []).join("\n")))
+  else if (u.behind && u.ahead) out.push(badge("up", "merges cleanly"))
+  return out
+}
+
 async function repoCard(repo) {
-  const badge = (cls, txt) => el("span", { class: `badge ${cls}` }, txt)
+  const ups = repo.upstream_details || []
+  const lc = repo.last_commit
   return el("div", { class: "repo-card", id: `repo-${repo.id}` },
     el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:12px" },
-      el("div", {},
-        el("h3", {}, repo.name || repo.id,
-          repo.conflicts?.length ? badge("warn", `${repo.conflicts.length} conflict`) :
-          repo.behind > 0 ? badge("up", `${repo.behind} behind`) : badge("up", "up to date")
-        )
-      ),
-      el("div", { style: "display:flex;gap:6px" },
-        el("button", { class: "btn ghost", onclick: () => route(`/repo/${repo.id}`) }, "Open")
-      )
-    ),
+      el("h3", { style: "margin:0" }, repo.name || repo.id, " ", badge("", repo.focus_branch || "")),
+      el("button", { class: "btn ghost", onclick: () => route(`/repo/${repo.id}`) }, "Open")),
     el("div", { class: "muted" }, `${repo.kind} · ${repo.path}`),
-    el("div", { style: "margin-top:6px" }, ...(repo.upstreams || []).map(u => badge("", `↑ ${u}`)))
+    lc ? el("div", { class: "muted" }, `last commit ${lc.sha} · ${(lc.date || "").slice(0, 10)} · ${lc.subject}`) : null,
+    ...ups.map(u => el("div", { style: "margin-top:8px" }, el("strong", {}, `${u.name}/${u.branch} `), ...upstreamBadges(u))),
+    !ups.length && !repo.error ? el("div", { class: "muted", style: "margin-top:8px" }, "No upstream configured.") : null,
+    repo.dirty ? el("div", { style: "margin-top:6px" }, badge("warn", `${repo.dirty} uncommitted change${repo.dirty > 1 ? "s" : ""}`)) : null,
+    repo.error ? el("div", { style: "color:#e08080;margin-top:6px" }, repo.error) : null
   )
+}
+
+// ---- tagged items: commits/files the user pins to the chat so the model can read them
+const loadTags = (id) => { try { return JSON.parse(localStorage.getItem(`tags:${id}`) || "[]") } catch { return [] } }
+const saveTags = (id, t) => { try { localStorage.setItem(`tags:${id}`, JSON.stringify(t)) } catch {} }
+let refreshTray = () => {}
+let refreshCommits = () => {}
+function addTag(repoId, tag) {
+  const t = loadTags(repoId)
+  if (!t.some(x => x.type === tag.type && x.id === tag.id)) { t.push(tag); saveTags(repoId, t) }
+  refreshTray()
+  toast(`Tagged ${tag.label} for the chat`, "ok")
 }
 
 async function renderRepoPage(repoId) {
@@ -144,13 +175,12 @@ async function renderRepoPage(repoId) {
   ))
 
   const upWrap = el("div", { style: "margin-top:20px" })
-  upWrap.append(el("h3", {}, "Upstreams"))
   await refreshUpstreams(upWrap, repoId)
 
   const chatWrap = el("div")
-  const memWrap = el("div")
-  content.append(upWrap, el("div", { class: "grid", style: "margin-top:20px;align-items:start" }, chatWrap, memWrap))
-  await Promise.all([renderChat(chatWrap, repoId, repo.focus_branch), renderMemory(memWrap, repoId)])
+  const toolsWrap = el("div")
+  content.append(upWrap, el("div", { class: "grid repo-grid", style: "margin-top:20px;align-items:start" }, chatWrap, toolsWrap))
+  await Promise.all([renderChat(chatWrap, repoId, repo.focus_branch), renderTools(toolsWrap, repoId)])
 }
 
 async function repoBranches(path) {
@@ -161,55 +191,74 @@ async function repoBranches(path) {
 }
 
 async function refreshUpstreams(wrap, repoId) {
-  const repo = await api(apiUrl(`/api/repo/${repoId}`))
+  const [repo, cmp] = await Promise.all([api(apiUrl(`/api/repo/${repoId}`)), api(apiUrl(`/api/repo/${repoId}/compare`))])
+  const byName = Object.fromEntries((cmp.plan?.upstreams || []).map(u => [u.name, u]))
   wrap.innerHTML = ""
-  wrap.append(el("h3", {}, "Upstreams"))
+  const git = cmp.git || {}
+  const fetchAll = el("button", { class: "btn" }, "Fetch all")
+  fetchAll.onclick = async () => {
+    fetchAll.disabled = true; fetchAll.textContent = "Fetching…"
+    await api(apiUrl(`/api/repo/${repoId}/fetch`), { method: "POST" })
+    await refreshUpstreams(wrap, repoId); refreshCommits()
+  }
+  wrap.append(el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:12px" },
+    el("h3", { style: "margin:0" }, "Upstreams"),
+    el("div", { class: "muted" }, git.dirty ? `${git.dirty} uncommitted change(s) in working tree` : "working tree clean"),
+    fetchAll))
   for (const u of repo.upstreams || []) {
+    const c = byName[u.name]
+    const files = c?.conflict_files || []
     const upEl = el("div", { class: "upstream" },
-      el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:12px" },
+      el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap" },
         el("div", {},
-          el("strong", {}, `${u.name} / ${u.branch}`),
-          el("span", { class: "badge" }, u.enabled ? "active" : "disabled")
+          el("strong", {}, `${u.name} / ${u.branch} `),
+          ...(u.enabled ? (c ? upstreamBadges(c) : []) : [badge("", "disabled")])
         ),
         el("div", { style: "display:flex;gap:6px" },
+          el("button", { class: "btn ghost", onclick: async (e) => {
+            e.target.textContent = "Fetching…"
+            const r = await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}/rebase`), { method: "POST" })
+            const err = (r.plan?.upstreams || []).find(x => x.name === u.name)?.conflict_detail
+            if (err && /fatal|could not|unable/i.test(err)) toast(err, "error")
+            await refreshUpstreams(wrap, repoId); refreshCommits()
+          } }, "Fetch"),
           el("button", { class: "btn ghost", onclick: async () => {
             await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}/enable`), { method: "POST", body: JSON.stringify({ enabled: !u.enabled }) })
             await refreshUpstreams(wrap, repoId)
           } }, u.enabled ? "Disable" : "Enable"),
-          el("button", { class: "btn ghost", onclick: async () => {
-            toast("Fetching + recomputing…", "info")
-            await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}/rebase`), { method: "POST" })
-            await refreshUpstreams(wrap, repoId)
-          } }, "Rebase"),
           el("button", { class: "btn danger", onclick: async () => {
+            if (!confirm(`Remove upstream ${u.name}?`)) return
             await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}`), { method: "DELETE" })
             await refreshUpstreams(wrap, repoId)
           } }, "Remove")
         )
       ),
-      el("div", { class: "muted" }, u.url)
+      el("div", { class: "muted" }, u.url),
+      c && c.missing_ref ? el("div", { class: "muted", style: "color:#e0a060" }, c.conflict_detail) : null,
+      files.length ? el("details", { style: "margin-top:6px" }, el("summary", {}, `Conflicting files (${files.length})`),
+        el("div", { class: "muted", style: "font-family:monospace;font-size:12px" }, ...files.map(f => el("div", {}, f)))) : null
     )
     wrap.append(upEl)
   }
-  const nameIn = el("input", { placeholder: "remote name (e.g. llamacpp)", style: "width:160px" })
-  const urlIn = el("input", { placeholder: "https://github.com/ggerganov/llama.cpp.git", style: "width:320px" })
+  const nameIn = el("input", { placeholder: "remote name (e.g. upstream)", style: "width:180px" })
+  const urlIn = el("input", { placeholder: "https://github.com/org/repo.git", style: "width:320px" })
   const addUpBtn = el("button", { class: "btn", style: "align-self:flex-end" }, "Add upstream")
   addUpBtn.onclick = async () => {
     try {
       await api(apiUrl(`/api/repo/${repoId}/upstream`), { method: "POST", body: JSON.stringify({ name: nameIn.value.trim(), url: urlIn.value.trim() }) })
-      toast("Upstream added", "ok")
+      toast("Upstream added. Press Fetch to compare.", "ok")
       await refreshUpstreams(wrap, repoId)
     } catch (e) { toast(String(e), "error") }
   }
-  wrap.append(el("div", { style: "display:flex;gap:8px;margin-top:12px" }, nameIn, urlIn, addUpBtn))
+  wrap.append(el("div", { style: "display:flex;gap:8px;margin-top:12px;flex-wrap:wrap" }, nameIn, urlIn, addUpBtn))
 }
 
 // Chat: one conversation per session. "New chat" resets what the model sees of
-// the conversation; repo facts and long-term memory still go with every message.
+// the conversation; repo facts, memory and tagged commits/files go with every message.
 async function renderChat(wrap, repoId, focus, sessionId) {
   wrap.innerHTML = ""
   const sessions = await api(apiUrl(`/api/repo/${repoId}/sessions`))
-  const sessSel = el("select", { style: "max-width:260px" })
+  const sessSel = el("select", { style: "max-width:240px" })
   for (const s of sessions) sessSel.append(el("option", { value: s.id }, `${s.title || "New chat"} · ${s.count} msgs`))
   const hist = await api(apiUrl(`/api/chat/${repoId}` + (sessionId ? `?session=${sessionId}` : "")))
   if (![...sessSel.options].some(o => o.value === hist.session)) sessSel.append(el("option", { value: hist.session }, "New chat · 0 msgs"))
@@ -223,37 +272,214 @@ async function renderChat(wrap, repoId, focus, sessionId) {
     const res = await api(apiUrl(`/api/repo/${repoId}/sessions`), { method: "POST", body: "{}" })
     await renderChat(wrap, repoId, focus, res.session)
   }
+  const delBtn = el("button", { class: "btn ghost", title: "Delete this conversation (memory is kept)" }, "Delete chat")
+  delBtn.onclick = async () => {
+    if (!confirm("Delete this chat? The repo memory is kept.")) return
+    const res = await api(apiUrl(`/api/repo/${repoId}/sessions/${hist.session}`), { method: "DELETE" })
+    await renderChat(wrap, repoId, focus, res.active)
+  }
   wrap.append(
-    el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:8px" },
+    el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap" },
       el("h3", { style: "margin:0" }, `Chat · ${focus}`),
-      el("div", { style: "display:flex;gap:6px" }, sessSel, newBtn)),
+      el("div", { style: "display:flex;gap:6px" }, sessSel, newBtn, delBtn)),
   )
   const box = el("div", { class: "chat-box", style: "margin-top:8px;height:420px" })
-  const msgIn = el("textarea", { placeholder: "Ask about this repo… (Ctrl+Enter to send)", rows: "2", style: "width:100%;resize:vertical;margin-top:8px" })
+  const msgIn = el("textarea", { placeholder: "Ask about this repo… (Enter to send, Shift+Enter for a new line)", rows: "2", style: "width:100%;resize:vertical;margin-top:8px" })
   const sendBtn = el("button", { class: "btn", style: "margin-top:8px" }, "Send")
-  const addMsg = (m) => box.append(el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.error ? " err" : ""}` }, m.content))
+  const tray = el("div", { class: "tray" })
+  refreshTray = () => {
+    tray.innerHTML = ""
+    const tags = loadTags(repoId)
+    if (!tags.length) { tray.append(el("span", { class: "muted" }, "Nothing tagged. Use Tag on a commit or file so the model can read it.")); return }
+    tray.append(el("span", { class: "muted" }, "Sent with every message:"))
+    for (const t of tags) {
+      const x = el("button", { class: "chip-x", title: "Remove" }, "×")
+      x.onclick = () => { saveTags(repoId, loadTags(repoId).filter(y => !(y.type === t.type && y.id === t.id))); refreshTray() }
+      tray.append(el("span", { class: "chip" }, `${t.type === "commit" ? "◆" : "▤"} ${t.label}`, x))
+    }
+  }
+  refreshTray()
+  const addMsg = (m) => {
+    const d = el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.error ? " err" : ""}` }, m.content)
+    if (m.attachments?.length) d.append(el("div", { class: "muted", style: "margin-top:4px;font-size:12px" }, "📎 " + m.attachments.map(a => a.label).join(", ")))
+    box.append(d)
+    return d
+  }
   sendBtn.onclick = async () => {
     const text = msgIn.value.trim()
-    if (!text) return
+    if (!text || sendBtn.disabled) return
+    const attachments = loadTags(repoId)
     msgIn.value = ""
     sendBtn.disabled = true
-    addMsg({ role: "user", content: text })
+    if (!hist.messages?.length) box.querySelector("p.muted")?.remove()
+    addMsg({ role: "user", content: text, attachments })
     const replyBox = el("div", { class: "msg bot" }, "Thinking…")
     box.append(replyBox)
     box.scrollTop = box.scrollHeight
     try {
-      const res = await api(apiUrl(`/api/repo/${repoId}/chat`), { method: "POST", body: JSON.stringify({ message: text, session: hist.session }) })
+      const res = await api(apiUrl(`/api/repo/${repoId}/chat`), { method: "POST", body: JSON.stringify({ message: text, session: hist.session, attachments }) })
       replyBox.textContent = res.ok ? res.reply : `Error: ${res.error}`
       if (!res.ok) replyBox.classList.add("err")
     } catch (e) { replyBox.textContent = `Error: ${e}`; replyBox.classList.add("err") }
     sendBtn.disabled = false
     box.scrollTop = box.scrollHeight
   }
-  msgIn.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) sendBtn.click() })
+  msgIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendBtn.click() }
+  })
   for (const m of hist.messages || []) addMsg(m)
   if (!(hist.messages || []).length) box.append(el("p", { class: "muted" }, "New conversation. The assistant still knows this repo and what it remembers about it."))
-  wrap.append(box, msgIn, sendBtn)
+  wrap.append(box, tray, msgIn, sendBtn)
   box.scrollTop = box.scrollHeight
+}
+
+// Right-hand tools: commits, files, memory.
+function renderTools(wrap, repoId) {
+  const names = ["Commits", "Files", "Memory"]
+  const bar = el("div", { class: "tabs" })
+  const panes = {}
+  const built = {}
+  const builders = { Commits: renderCommits, Files: renderFiles, Memory: renderMemory }
+  const show = async (n) => {
+    for (const k of names) { panes[k].style.display = k === n ? "" : "none"; bar.children[names.indexOf(k)].classList.toggle("active", k === n) }
+    if (!built[n]) { built[n] = true; await builders[n](panes[n], repoId) }
+  }
+  for (const n of names) {
+    panes[n] = el("div", { style: "display:none" })
+    bar.append(el("button", { class: "tab", onclick: () => show(n) }, n))
+  }
+  wrap.append(bar, ...names.map(n => panes[n]))
+  return show("Commits")
+}
+
+// Commits: what the upstream has that you lack, what only you have, or everything.
+async function renderCommits(wrap, repoId) {
+  const repo = await api(apiUrl(`/api/repo/${repoId}`))
+  const viewSel = el("select", {},
+    el("option", { value: "behind" }, "Missing from upstream (behind)"),
+    el("option", { value: "ahead" }, "Only on my branch (ahead)"),
+    el("option", { value: "all" }, "All commits"))
+  const upSel = el("select", {}, ...(repo.upstreams || []).map(u => el("option", { value: u.name }, u.name)))
+  // open on the upstream that has the most commits you are missing
+  const cmp = await api(apiUrl(`/api/repo/${repoId}/compare`)).catch(() => ({}))
+  const worst = [...(cmp.plan?.upstreams || [])].sort((a, b) => b.behind - a.behind)[0]
+  if (worst && worst.behind) upSel.value = worst.name
+  const qIn = el("input", { placeholder: "Search commit messages…", style: "flex:1;min-width:0" })
+  const list = el("div", { class: "mem-list", style: "max-height:520px" })
+  const more = el("button", { class: "btn ghost", style: "margin-top:6px;display:none" }, "Load more")
+  const info = el("div", { class: "muted", style: "margin-top:6px" })
+  let skip = 0
+  const load = async (reset) => {
+    if (reset) { skip = 0; list.innerHTML = "" }
+    const q = `view=${viewSel.value}&upstream=${encodeURIComponent(upSel.value)}&skip=${skip}&limit=50&q=${encodeURIComponent(qIn.value.trim())}`
+    const res = await api(apiUrl(`/api/repo/${repoId}/commits?${q}`))
+    if (!res.ok) { info.textContent = res.error; more.style.display = "none"; return }
+    info.textContent = ""
+    for (const c of res.items) {
+      const tag = el("button", { class: "btn ghost", title: "Attach to the chat" }, "Tag")
+      tag.onclick = () => addTag(repoId, { type: "commit", id: c.full, label: `${c.sha} ${c.subject.slice(0, 40)}` })
+      const view = el("button", { class: "btn ghost" }, "View")
+      view.onclick = () => showCommit(repoId, c.full)
+      list.append(el("div", { class: "mem" },
+        el("code", { style: "color:#9fb4ff" }, c.sha),
+        el("div", { style: "flex:1;min-width:0" }, el("div", {}, c.subject), el("div", { class: "muted", style: "font-size:12px" }, `${c.author} · ${c.date.slice(0, 10)}`)),
+        view, tag))
+    }
+    skip += res.items.length
+    if (!list.children.length) info.textContent = viewSel.value === "behind" ? "Nothing missing: you have every upstream commit." : "No commits."
+    more.style.display = res.more ? "" : "none"
+  }
+  refreshCommits = () => load(true)
+  more.onclick = () => load(false)
+  viewSel.onchange = () => load(true)
+  upSel.onchange = () => load(true)
+  qIn.addEventListener("keydown", (e) => { if (e.key === "Enter") load(true) })
+  wrap.append(el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" }, viewSel, upSel.options.length > 1 ? upSel : "", qIn), info, list, more)
+  await load(true)
+}
+
+async function showCommit(repoId, sha) {
+  const d = await api(apiUrl(`/api/repo/${repoId}/commit/${sha}`))
+  const close = () => { ov.remove(); document.removeEventListener("keydown", onKey) }
+  const onKey = (e) => { if (e.key === "Escape") close() }
+  const patch = el("pre", { class: "code-pre" })
+  for (const line of (d.patch || "").split("\n")) {
+    const cls = line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "del" : line.startsWith("@@") ? "hunk" : line.startsWith("diff ") ? "file" : ""
+    patch.append(el("div", { class: `dl ${cls}` }, line || " "))
+  }
+  const tag = el("button", { class: "btn" }, "Tag for chat")
+  tag.onclick = () => { addTag(repoId, { type: "commit", id: d.sha, label: `${d.sha.slice(0, 8)} ${(d.message || "").split("\n")[0].slice(0, 40)}` }) }
+  const ov = el("div", { class: "overlay", onclick: (e) => { if (e.target === ov) close() } },
+    el("div", { class: "overlay-panel" },
+      el("div", { style: "display:flex;justify-content:space-between;gap:8px" },
+        el("h3", { style: "margin:0" }, d.ok ? d.sha.slice(0, 10) : "Commit"), el("div", { style: "display:flex;gap:6px" }, tag, el("button", { class: "btn ghost", onclick: close }, "Close"))),
+      d.ok ? el("div", {},
+        el("div", { class: "muted" }, `${d.author} · ${(d.date || "").slice(0, 10)}`),
+        el("pre", { style: "white-space:pre-wrap;margin:8px 0" }, d.message),
+        el("pre", { class: "muted", style: "white-space:pre-wrap;font-size:12px" }, d.stat),
+        patch, d.truncated ? el("p", { class: "muted" }, "Patch truncated.") : null) : el("p", {}, d.error || "Not found")))
+  document.addEventListener("keydown", onKey)
+  document.body.append(ov)
+}
+
+// Files: a read-only tree plus a line-numbered viewer with find.
+async function renderFiles(wrap, repoId) {
+  const tree = el("div", { class: "tree" })
+  const viewer = el("div", { class: "viewer" }, el("p", { class: "muted", style: "padding:12px" }, "Pick a file."))
+  wrap.append(el("div", { class: "files" }, tree, viewer))
+  const LH = 18
+  const openFile = async (path) => {
+    const f = await api(apiUrl(`/api/repo/${repoId}/file?path=${encodeURIComponent(path)}`)).catch(() => ({ ok: false, error: "could not read file" }))
+    viewer.innerHTML = ""
+    const tag = el("button", { class: "btn ghost" }, "Tag for chat")
+    tag.onclick = () => addTag(repoId, { type: "file", id: path, label: path.split("/").slice(-2).join("/") })
+    const copy = el("button", { class: "btn ghost" }, "Copy path")
+    copy.onclick = () => { navigator.clipboard?.writeText(path); toast("Path copied", "ok") }
+    const findIn = el("input", { placeholder: "Find…", style: "width:110px" })
+    const head = el("div", { class: "viewer-head" }, el("strong", { style: "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis" }, path), findIn, tag, copy)
+    viewer.append(head)
+    if (!f.ok) { viewer.append(el("p", { class: "muted", style: "padding:12px" }, f.error || "cannot show this file")); return }
+    const lines = f.content.split("\n")
+    const gutter = el("pre", { class: "gutter" }, lines.map((_, i) => i + 1).join("\n"))
+    const src = el("pre", { class: "src" }, f.content)
+    const hl = el("div", { class: "hl", style: "display:none" })
+    const body = el("div", { class: "code-body" }, el("div", { class: "code-inner" }, gutter, src, hl))
+    viewer.append(body, el("div", { class: "muted", style: "padding:4px 8px;font-size:12px" }, `${lines.length} lines`))
+    let last = -1
+    const find = () => {
+      const q = findIn.value.toLowerCase()
+      if (!q) return
+      let i = lines.findIndex((l, n) => n > last && l.toLowerCase().includes(q))
+      if (i < 0) i = lines.findIndex(l => l.toLowerCase().includes(q))
+      if (i < 0) { toast("Not found", "info"); return }
+      last = i
+      hl.style.display = ""; hl.style.top = `${i * LH + 8}px`
+      body.scrollTop = Math.max(0, i * LH - 80)
+    }
+    findIn.addEventListener("keydown", (e) => { if (e.key === "Enter") find() })
+  }
+  const loadDir = async (path, container, depth) => {
+    const res = await api(apiUrl(`/api/repo/${repoId}/tree?path=${encodeURIComponent(path)}`))
+    container.innerHTML = ""
+    for (const e of res.entries || []) {
+      const row = el("div", { class: "trow", style: `padding-left:${8 + depth * 14}px` }, e.type === "dir" ? "▸ " : "· ", e.name)
+      container.append(row)
+      if (e.type === "dir") {
+        const kids = el("div", { style: "display:none" })
+        container.append(kids)
+        let open = false
+        row.onclick = async () => {
+          open = !open
+          row.firstChild.textContent = open ? "▾ " : "▸ "
+          kids.style.display = open ? "" : "none"
+          if (open && !kids.children.length) await loadDir(e.path, kids, depth + 1)
+        }
+      } else {
+        row.onclick = () => { $$(".trow.sel", tree).forEach(r => r.classList.remove("sel")); row.classList.add("sel"); openFile(e.path) }
+      }
+    }
+  }
+  await loadDir("", tree, 0)
 }
 
 // Memory: what the assistant remembers about this repo (mem0). Search can span
@@ -270,7 +496,7 @@ async function renderMemory(wrap, repoId) {
     const res = await api(apiUrl(`/api/repo/${repoId}/memory?q=${encodeURIComponent(q)}&scope=${scopeSel.value}`))
     statusEl.textContent = !res.ok
       ? `Memory unavailable: ${res.error || "unknown error"}`
-      : `${res.items.length} ${q ? "matches" : "memories"} · embeddings: ${res.embed_provider} ${res.embed_model}`
+      : `${res.items.length} ${q ? "matches" : "memories"} · embeddings: ${res.embed_provider} ${res.embed_model} · auto-clean ${res.auto_cleanup ? "on" : "off"}`
     list.innerHTML = ""
     for (const m of res.items || []) {
       const del = el("button", { class: "btn ghost mem-del", title: "Forget this" }, "×")
@@ -306,7 +532,18 @@ async function renderMemory(wrap, repoId) {
     idxBtn.textContent = "Index commits"
     await load()
   }
-  head.append(idxBtn)
+  const cleanBtn = el("button", { class: "btn ghost", title: "Remove duplicates, junk and old events. Also runs automatically." }, "Clean up")
+  cleanBtn.onclick = async () => {
+    cleanBtn.disabled = true
+    try {
+      const res = await api(apiUrl(`/api/repo/${repoId}/memory/cleanup`), { method: "POST", body: "{}" })
+      const why = Object.entries(res.reasons || {}).map(([k, v]) => `${v} ${k}`).join(", ")
+      toast(res.removed ? `Removed ${res.removed} (${why}), ${res.kept} kept` : "Already clean", "ok")
+    } catch (e) { toast(String(e), "error") }
+    cleanBtn.disabled = false
+    await load()
+  }
+  head.append(el("div", { style: "display:flex;gap:6px" }, cleanBtn, idxBtn))
   wrap.append(head, statusEl,
     el("div", { style: "display:flex;gap:6px;margin-top:8px" }, qIn, scopeSel),
     el("div", { style: "display:flex;gap:6px;margin-top:6px" }, noteIn, noteBtn),
@@ -362,22 +599,41 @@ async function renderSettings() {
   content.append(card)
   try {
     const local = await api(apiUrl('/api/settings'))
-    const hermes = await fetch(apiUrl('/api/hermes-llm')).then(r => r.json().catch(() => ({})))
-    const llm = { ...hermes, ...(local.llm || {}) }
-    const modelIn = el("input", { value: llm.model || "", style: "width:320px" })
-    const urlIn = el("input", { value: llm.base_url || "", style: "width:420px" })
+    const llm = local.llm || {}
+    const urlIn = el("input", { value: llm.base_url || "http://127.0.0.1:8080/v1", placeholder: "http://host:8080/v1", style: "width:420px" })
+    const keyIn = el("input", { value: llm.api_key || "", type: "password", placeholder: "optional", style: "width:320px" })
+    const modelSel = el("select", { style: "width:420px" })
+    const modelStatus = el("div", { class: "muted" }, "")
+    const loadModels = async () => {
+      const q = `?base_url=${encodeURIComponent(urlIn.value)}&api_key=${encodeURIComponent(keyIn.value)}`
+      const r = await fetch(apiUrl('/api/models') + q).then(r => r.json().catch(() => ({ data: [], error: "bad response" })))
+      const ids = (r.data || []).map(m => m.id)
+      if (llm.model && !ids.includes(llm.model)) ids.unshift(llm.model)
+      modelSel.innerHTML = ""
+      for (const id of ids) modelSel.append(el("option", { value: id }, id))
+      modelSel.value = (modelSelValue || llm.model || ids[0] || "")
+      modelStatus.textContent = r.error ? `Could not list models: ${r.error}` : `${(r.data || []).length} models available`
+    }
+    let modelSelValue = llm.model
+    modelSel.onchange = () => { modelSelValue = modelSel.value }
+    const refreshBtn = el("button", { class: "btn ghost" }, "Refresh models")
+    refreshBtn.onclick = loadModels
     const saveBtn = el("button", { class: "btn", style: "margin-top:8px" }, "Save")
     saveBtn.onclick = async () => {
-      await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ llm: { model: modelIn.value, base_url: urlIn.value } }) })
-      toast("Settings saved (also written to hermes config.yaml)", "ok")
+      await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ llm: { model: modelSel.value, base_url: urlIn.value.trim(), api_key: keyIn.value } }) })
+      toast("Model connection saved", "ok")
     }
     card.append(
       el("div", { style: "display:flex;flex-direction:column;gap:12px" },
-        el("label", {}, "Model", modelIn),
-        el("label", {}, "Base URL", urlIn),
-        saveBtn
+        el("div", { class: "muted" }, "Any OpenAI-compatible server (llama-swap, llama-server, Argos). Independent of hermes-agent."),
+        el("label", {}, "Server URL", urlIn),
+        el("label", {}, "API key", keyIn),
+        el("label", {}, "Model", modelSel),
+        modelStatus,
+        el("div", { style: "display:flex;gap:8px" }, refreshBtn, saveBtn)
       )
     )
+    loadModels()
     const mem = local.memory || {}
     const st = await api(apiUrl('/api/memory/status'))
     const provSel = el("select", {}, el("option", { value: "fastembed" }, "fastembed (in-process, CPU)"), el("option", { value: "openai" }, "OpenAI-compatible server"))
@@ -398,15 +654,6 @@ async function renderSettings() {
         el("label", {}, "Embedding model", embModelIn),
         el("label", {}, "Embedding server URL", embUrlIn),
         memStatus, memSave))
-    try {
-      const models = await fetch(apiUrl('/api/models')).then(r => r.json().catch(() => ({ data: [] })))
-      card.append(el("h4", { style: "margin-top:16px" }, "Available models (llama-swap)"))
-      const grid = el("div", { style: "display:flex;flex-wrap:wrap;gap:6px;margin-top:8px" })
-      for (const m of (models.data || []).slice(0, 30)) {
-        grid.append(el("button", { class: "btn ghost", onclick: () => { modelIn.value = m.id } }, m.id))
-      }
-      card.append(grid)
-    } catch {}
   } catch (e) { toast(String(e), "error") }
 }
 

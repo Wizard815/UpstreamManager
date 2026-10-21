@@ -20,7 +20,7 @@ Endpoints:
   POST /request/<id>/decide           -> approve/deny with a comment
   POST /repo/<id>/chat                -> send a chat message (llama-swap)
   GET  /chat/<id>                     -> chat history for a repo
-  GET  /settings, POST /settings      -> LLM config (mirrors hermes config.yaml)
+  GET  /settings, POST /settings      -> the app's own LLM connection + memory settings
   GET  /files, GET/POST/PUT/DELETE /files/* -> read/write files in a repo (GUI editing)
 """
 from __future__ import annotations
@@ -111,12 +111,102 @@ def api_add_upstream(repo_id):
 
 
 @flask_app.route("/api/repo/<repo_id>/upstream/<name>/rebase", methods=["POST"])
-def api_rebase_upstream(repo_id, name):
+@flask_app.route("/api/repo/<repo_id>/fetch", methods=["POST"])
+def api_fetch(repo_id, name=None):
+    """Fetch the upstream(s) from the network, then return the fresh comparison."""
     repo = registry.get_repo(repo_id)
     if not repo:
         abort(404)
-    plan = upstream_check.build_merge_plan(repo["path"], repo["id"], repo["name"], repo["upstreams"])
+    ups = [u for u in repo["upstreams"] if name in (None, u["name"])]
+    plan = upstream_check.build_merge_plan(repo["path"], repo["id"], repo["name"], ups,
+                                           focus_branch=repo.get("focus_branch"), fetch=True)
     return jsonify({"ok": True, "plan": plan.to_dict()})
+
+
+@flask_app.route("/api/repo/<repo_id>/compare")
+def api_compare(repo_id):
+    """Ahead/behind and merge-conflict check per upstream, from refs already fetched."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    plan = upstream_check.build_merge_plan(repo["path"], repo["id"], repo["name"], repo["upstreams"],
+                                           focus_branch=repo.get("focus_branch"))
+    return jsonify({"ok": True, "plan": plan.to_dict(), "git": gitops.status_summary(repo["path"])})
+
+
+@flask_app.route("/api/repo/<repo_id>/commits")
+def api_commits(repo_id):
+    """Commits, paged. view=all (focus branch) | behind (upstream has, you lack) | ahead (only yours)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    view = request.args.get("view", "all")
+    focus = repo.get("focus_branch") or "HEAD"
+    up = request.args.get("upstream") or (repo["upstreams"][0]["name"] if repo.get("upstreams") else None)
+    upref = f"refs/remotes/{up}/{focus}" if up else None
+    if view in ("behind", "ahead") and not (upref and gitops.ref_exists(repo["path"], upref)):
+        return jsonify({"ok": False, "error": "upstream not fetched yet - press Fetch", "items": []})
+    rev = {"all": focus, "behind": f"{focus}..{upref}", "ahead": f"{upref}..{focus}"}.get(view, focus)
+    skip = max(0, int(request.args.get("skip", 0)))
+    limit = min(200, max(1, int(request.args.get("limit", 50))))
+    items = gitops.list_commits(repo["path"], rev, skip, limit, request.args.get("q", "").strip())
+    return jsonify({"ok": True, "items": items, "more": len(items) == limit})
+
+
+@flask_app.route("/api/repo/<repo_id>/commit/<sha>")
+def api_commit(repo_id, sha):
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    try:
+        return jsonify({"ok": True, **gitops.commit_detail(repo["path"], sha)})
+    except gitops.GitError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+
+def _repo_file(repo: dict, rel: str) -> Path | None:
+    """Resolve `rel` inside the repo, or None if it would escape it."""
+    root = Path(repo["path"]).resolve()
+    full = (root / rel).resolve()
+    return full if full == root or root in full.parents else None
+
+
+@flask_app.route("/api/repo/<repo_id>/tree")
+def api_tree(repo_id):
+    """One directory level of the working tree (read-only file browser)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    d = _repo_file(repo, request.args.get("path", ""))
+    if d is None or not d.is_dir():
+        abort(400)
+    root = Path(repo["path"]).resolve()
+    entries = []
+    for c in d.iterdir():
+        if c.name == ".git":
+            continue
+        entries.append({"name": c.name, "type": "dir" if c.is_dir() else "file",
+                        "path": c.relative_to(root).as_posix(), "size": c.stat().st_size if c.is_file() else None})
+    entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
+    return jsonify({"ok": True, "path": d.relative_to(root).as_posix() if d != root else "", "entries": entries})
+
+
+@flask_app.route("/api/repo/<repo_id>/file")
+def api_file(repo_id):
+    """Text contents of one file (read-only, capped at 1 MB)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    f = _repo_file(repo, request.args.get("path", ""))
+    if f is None or not f.is_file():
+        abort(404)
+    if f.stat().st_size > 1_000_000:
+        return jsonify({"ok": False, "error": "file is larger than 1 MB"})
+    try:
+        text = f.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return jsonify({"ok": False, "error": "binary file"})
+    return jsonify({"ok": True, "path": request.args.get("path", ""), "content": text, "lines": text.count(chr(10)) + 1})
 
 
 @flask_app.route("/api/repo/<repo_id>/upstream/<name>/enable", methods=["POST"])
@@ -150,7 +240,7 @@ def api_run_daily():
             try:
                 plan = upstream_check.build_merge_plan(
                     repo["path"], repo["id"], repo["name"], repo["upstreams"],
-                    focus_branch=repo.get("focus_branch"),
+                    focus_branch=repo.get("focus_branch"), fetch=True,
                 )
                 # decide auto-merge vs request
                 if plan.safe:
@@ -251,7 +341,7 @@ def api_chat(repo_id):
     if not message:
         abort(400)
     from . import llm
-    reply = llm.chat(repo_id, message, data.get("session"))
+    reply = llm.chat(repo_id, message, data.get("session"), data.get("attachments") or [])
     return jsonify(reply)
 
 
@@ -279,6 +369,13 @@ def api_new_session(repo_id):
     sid = (request.get_json(silent=True) or {}).get("session")
     session = store.set_active_session(repo_id, sid) if sid else store.new_session(repo_id)
     return jsonify({"ok": True, "session": session["id"]})
+
+
+@flask_app.route("/api/repo/<repo_id>/sessions/<session_id>", methods=["DELETE"])
+def api_delete_session(repo_id, session_id):
+    if not registry.get_repo(repo_id):
+        abort(404)
+    return jsonify({"ok": store.delete_session(repo_id, session_id), "active": store.get_session(repo_id)["id"]})
 
 
 # --------------------------------------------------------------------- memory
@@ -342,7 +439,15 @@ def api_memory_index_commits(repo_id):
         added += 1
     repo["indexed_commits"] = sorted(done)
     store.save_repo(repo)
-    return jsonify({"ok": True, "added": added, "total": len(done)})
+    cleaned = memory.cleanup(repo_id) if memory._settings()["auto_cleanup"] else None
+    return jsonify({"ok": True, "added": added, "total": len(done), "cleaned": cleaned})
+
+
+@flask_app.route("/api/repo/<repo_id>/memory/cleanup", methods=["POST"])
+def api_memory_cleanup(repo_id):
+    if not registry.get_repo(repo_id):
+        abort(404)
+    return jsonify({"ok": True, **memory.cleanup(repo_id)})
 
 
 @flask_app.route("/api/memory/<memory_id>", methods=["DELETE"])
@@ -360,12 +465,8 @@ def api_settings():
 def api_save_settings():
     data = request.get_json(force=True) or {}
     new = save_settings(data)
-    if "memory" in data:
+    if "memory" in data or "llm" in data:  # mem0 bakes in the chat model for extraction
         memory.reload()
-    # also mirror LLM config to hermes config.yaml so studio & this app share backend
-    if "llm" in data:
-        from . import hermes_config
-        hermes_config.set_llm(data["llm"])
     return jsonify({"ok": True, "settings": new})
 
 
@@ -397,7 +498,7 @@ def api_file_contents():
     repo = registry.get_repo(repo_id) if repo_id else None
     base = repo["path"] if repo else os.getcwd()
     full = os.path.normpath(os.path.join(base, path))
-    if not full.startswith(base):
+    if Path(base).resolve() not in Path(full).resolve().parents:
         abort(400)
     p = Path(full)
     if not p.is_file():
@@ -418,7 +519,7 @@ def api_file_write():
     repo = registry.get_repo(repo_id) if repo_id else None
     base = repo["path"] if repo else os.getcwd()
     full = os.path.normpath(os.path.join(base, path))
-    if not full.startswith(base):
+    if Path(base).resolve() not in Path(full).resolve().parents:
         abort(400)
     p = Path(full)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -437,16 +538,12 @@ def api_branches():
     return jsonify({"branches": branches})
 
 
-@flask_app.route("/api/hermes-llm")
-def api_hermes_llm():
-    from . import hermes_config
-    return jsonify(hermes_config.resolve_llm_config())
-
-
 @flask_app.route("/api/models")
 def api_models():
+    """Models the server offers; ?base_url=&api_key= probe a server before saving."""
     from . import llm
-    return jsonify({"data": [{"id": m} for m in llm.available_models()]})
+    models, error = llm.list_models(request.args.get("base_url"), request.args.get("api_key"))
+    return jsonify({"data": [{"id": m} for m in models], "error": error})
 
 
 TEMPLATE = r"""<!DOCTYPE html>
@@ -490,7 +587,36 @@ TEMPLATE = r"""<!DOCTYPE html>
   .badge.kind-event { background: #332a14; border-color: #5a4a23; }
   .badge.kind-decision { background: #2b1d40; border-color: #45306a; }
   .badge.kind-note { background: #14301f; border-color: #235a3a; }
-  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .badge.bad { background: #3a1d1d; border-color: #6a2d2d; }
+  .repo-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); }
+  .tabs { display: flex; gap: 4px; margin-bottom: 10px; }
+  .tab { background: #171a21; color: #cfd3dc; border: 1px solid #2a2f3a; border-radius: 6px 6px 0 0; padding: 6px 14px; cursor: pointer; }
+  .tab.active { background: #232833; border-color: #3a4152; color: #fff; }
+  .tray { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; font-size: 12px; }
+  .chip { background: #1d2a40; border: 1px solid #2c4366; border-radius: 12px; padding: 2px 4px 2px 10px; }
+  .chip-x { background: none; border: none; color: #9fb4ff; cursor: pointer; font-size: 14px; }
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 900; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .overlay-panel { background: #171a21; border: 1px solid #2a2f3a; border-radius: 10px; padding: 16px; width: min(1100px, 100%); max-height: 90vh; overflow: auto; }
+  .code-pre { margin: 8px 0 0; font: 12px/18px ui-monospace, Consolas, monospace; background: #0f1115; border: 1px solid #2a2f3a; border-radius: 6px; overflow: auto; max-height: 55vh; }
+  .dl { white-space: pre; padding: 0 8px; }
+  .dl.add { background: #12301c; color: #9be3b0; }
+  .dl.del { background: #3a1d1d; color: #f0a0a0; }
+  .dl.hunk { color: #7fb0ff; }
+  .dl.file { color: #e0c070; font-weight: 600; }
+  .files { display: grid; grid-template-columns: 38% 62%; border: 1px solid #2a2f3a; border-radius: 8px; height: 560px; overflow: hidden; }
+  .tree { overflow: auto; border-right: 1px solid #2a2f3a; font-size: 13px; padding: 4px 0; background: #11141a; }
+  .trow { cursor: pointer; padding: 2px 8px; white-space: nowrap; }
+  .trow:hover { background: #1b2030; }
+  .trow.sel { background: #25304a; }
+  .viewer { display: flex; flex-direction: column; min-width: 0; background: #0f1115; }
+  .viewer-head { display: flex; gap: 6px; align-items: center; padding: 6px 8px; border-bottom: 1px solid #2a2f3a; font-size: 13px; }
+  .code-body { flex: 1; overflow: auto; position: relative; }
+  .code-inner { display: flex; position: relative; min-width: max-content; padding: 8px 0; }
+  .gutter, .src { margin: 0; font: 12px/18px ui-monospace, Consolas, monospace; }
+  .gutter { text-align: right; color: #566; padding: 0 10px; border-right: 1px solid #2a2f3a; user-select: none; position: sticky; left: 0; background: #0f1115; }
+  .src { padding: 0 14px; tab-size: 4; }
+  .hl { position: absolute; left: 0; right: 0; height: 18px; background: rgba(255, 210, 80, .18); pointer-events: none; }
+  @media (max-width: 900px) { .grid, .repo-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
