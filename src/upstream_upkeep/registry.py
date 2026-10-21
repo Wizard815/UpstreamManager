@@ -26,12 +26,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import gitops
+from .config import PROJECT_ROOT
 from . import store
 from . import upstream_check
 
 WATCH_FOLDERS = [
     Path("/home/codebox/Repos"),
-    Path("/home/codebox/workspace/Upstream-Upkeep/watch"),
+    PROJECT_ROOT / "watch",
     Path("/home/codebox/OnePiece"),
 ]
 

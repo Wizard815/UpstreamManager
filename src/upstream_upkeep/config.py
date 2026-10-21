@@ -14,7 +14,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-CONFIG_PATH = Path(os.environ.get("UPSTREAM_STATE_FILE", "/home/codebox/workspace/Upstream-Upkeep/data/state.json"))
+# Project root is three levels up from this file (src/upstream_upkeep/config.py).
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PATH = Path(os.environ.get("UPSTREAM_STATE_FILE", PROJECT_ROOT / "data" / "state.json"))
 
 _lock = threading.RLock()
 
