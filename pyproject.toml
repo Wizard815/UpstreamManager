@@ -1,0 +1,18 @@
+[project]
+name = "upstream-upkeep"
+version = "0.1.0"
+description = "Studio connector that keeps local repos in sync with upstreams and recent changes, with daily checks, approval-gated pushes, per-repo chat, and an LLM settings page sharing the same backend as Studio."
+readme = "README.md"
+authors = [
+    { name = "Wizard815", email = "fellasnetwork815@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "flask>=3.0",
+    "pyyaml>=6.0.3",
+    "requests>=2.31",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"

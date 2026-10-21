@@ -1,0 +1,24 @@
+[Unit]
+Description=Upstream-Keep (upstream management web app)
+Documentation=file:/home/codebox/workspace/Upstream-Upkeep/README.md
+After=network.target
+
+[Service]
+Type=simple
+User=codebox
+Group=codebox
+WorkingDirectory=/home/codebox/workspace/Upstream-Upkeep
+Environment=PORT=5001
+Environment=PYTHONUNBUFFERED=1
+Environment=UPSTREAM_STATE_FILE=/home/codebox/workspace/Upstream-Upkeep/data/state.json
+ExecStart=/home/codebox/workspace/Upstream-Upkeep/.venv/bin/python -m upstream_upkeep.run
+Restart=on-failure
+RestartSec=5
+
+# NOTE: do NOT point ExecStart at daemonize_upkeep.py. That wrapper does a
+# double-fork + setsid, which is exactly what systemd's Type=simple forbids:
+# the tracked process would exit immediately and the unit would flap. systemd
+# does the daemonising; the app must run in the foreground.
+
+[Install]
+WantedBy=multi-user.target
