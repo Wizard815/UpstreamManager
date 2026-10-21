@@ -147,11 +147,10 @@ async function renderRepoPage(repoId) {
   upWrap.append(el("h3", {}, "Upstreams"))
   await refreshUpstreams(upWrap, repoId)
 
-  const chatWrap = el("div", { style: "margin-top:20px" })
-  chatWrap.append(el("h3", {}, "Chat"))
-  await renderChat(chatWrap, repoId, repo.focus_branch)
-
-  content.append(upWrap, chatWrap)
+  const chatWrap = el("div")
+  const memWrap = el("div")
+  content.append(upWrap, el("div", { class: "grid", style: "margin-top:20px;align-items:start" }, chatWrap, memWrap))
+  await Promise.all([renderChat(chatWrap, repoId, repo.focus_branch), renderMemory(memWrap, repoId)])
 }
 
 async function repoBranches(path) {
@@ -205,30 +204,114 @@ async function refreshUpstreams(wrap, repoId) {
   wrap.append(el("div", { style: "display:flex;gap:8px;margin-top:12px" }, nameIn, urlIn, addUpBtn))
 }
 
-async function renderChat(wrap, repoId, focus) {
-  wrap.append(el("h3", {}, `Chat · ${focus}`))
-  const box = el("div", { class: "chat-box" })
-  const msgIn = el("textarea", { placeholder: "Ask about this repo…", rows: "2", style: "width:100%;resize:vertical;margin-top:8px" })
+// Chat: one conversation per session. "New chat" resets what the model sees of
+// the conversation; repo facts and long-term memory still go with every message.
+async function renderChat(wrap, repoId, focus, sessionId) {
+  wrap.innerHTML = ""
+  const sessions = await api(apiUrl(`/api/repo/${repoId}/sessions`))
+  const sessSel = el("select", { style: "max-width:260px" })
+  for (const s of sessions) sessSel.append(el("option", { value: s.id }, `${s.title || "New chat"} · ${s.count} msgs`))
+  const hist = await api(apiUrl(`/api/chat/${repoId}` + (sessionId ? `?session=${sessionId}` : "")))
+  if (![...sessSel.options].some(o => o.value === hist.session)) sessSel.append(el("option", { value: hist.session }, "New chat · 0 msgs"))
+  sessSel.value = hist.session
+  sessSel.onchange = async () => {
+    await api(apiUrl(`/api/repo/${repoId}/sessions`), { method: "POST", body: JSON.stringify({ session: sessSel.value }) })
+    await renderChat(wrap, repoId, focus, sessSel.value)
+  }
+  const newBtn = el("button", { class: "btn ghost", title: "Start a new conversation. The repo memory is kept." }, "New chat")
+  newBtn.onclick = async () => {
+    const res = await api(apiUrl(`/api/repo/${repoId}/sessions`), { method: "POST", body: "{}" })
+    await renderChat(wrap, repoId, focus, res.session)
+  }
+  wrap.append(
+    el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:8px" },
+      el("h3", { style: "margin:0" }, `Chat · ${focus}`),
+      el("div", { style: "display:flex;gap:6px" }, sessSel, newBtn)),
+  )
+  const box = el("div", { class: "chat-box", style: "margin-top:8px;height:420px" })
+  const msgIn = el("textarea", { placeholder: "Ask about this repo… (Ctrl+Enter to send)", rows: "2", style: "width:100%;resize:vertical;margin-top:8px" })
   const sendBtn = el("button", { class: "btn", style: "margin-top:8px" }, "Send")
+  const addMsg = (m) => box.append(el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.error ? " err" : ""}` }, m.content))
   sendBtn.onclick = async () => {
     const text = msgIn.value.trim()
     if (!text) return
     msgIn.value = ""
-    box.append(el("div", { class: "msg user" }, text))
+    sendBtn.disabled = true
+    addMsg({ role: "user", content: text })
     const replyBox = el("div", { class: "msg bot" }, "Thinking…")
     box.append(replyBox)
+    box.scrollTop = box.scrollHeight
     try {
-      const res = await api(apiUrl(`/api/repo/${repoId}/chat`), { method: "POST", body: JSON.stringify({ message: text }) })
+      const res = await api(apiUrl(`/api/repo/${repoId}/chat`), { method: "POST", body: JSON.stringify({ message: text, session: hist.session }) })
       replyBox.textContent = res.ok ? res.reply : `Error: ${res.error}`
-    } catch (e) { replyBox.textContent = `Error: ${e}` }
+      if (!res.ok) replyBox.classList.add("err")
+    } catch (e) { replyBox.textContent = `Error: ${e}`; replyBox.classList.add("err") }
+    sendBtn.disabled = false
     box.scrollTop = box.scrollHeight
   }
-  const hist = await api(apiUrl(`/api/chat/${repoId}`))
-  for (const m of hist.messages || []) {
-    box.append(el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}` }, m.content))
-  }
-  box.scrollTop = box.scrollHeight
+  msgIn.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) sendBtn.click() })
+  for (const m of hist.messages || []) addMsg(m)
+  if (!(hist.messages || []).length) box.append(el("p", { class: "muted" }, "New conversation. The assistant still knows this repo and what it remembers about it."))
   wrap.append(box, msgIn, sendBtn)
+  box.scrollTop = box.scrollHeight
+}
+
+// Memory: what the assistant remembers about this repo (mem0). Search can span
+// every watched repo to find similar changes elsewhere.
+async function renderMemory(wrap, repoId) {
+  wrap.innerHTML = ""
+  const head = el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:8px" }, el("h3", { style: "margin:0" }, "Memory"))
+  const statusEl = el("div", { class: "muted", style: "margin-top:4px" }, "Loading…")
+  const qIn = el("input", { placeholder: "Search memories…", style: "flex:1;min-width:0" })
+  const scopeSel = el("select", {}, el("option", { value: "repo" }, "This repo"), el("option", { value: "all" }, "All repos"))
+  const list = el("div", { class: "mem-list" })
+  const load = async () => {
+    const q = qIn.value.trim()
+    const res = await api(apiUrl(`/api/repo/${repoId}/memory?q=${encodeURIComponent(q)}&scope=${scopeSel.value}`))
+    statusEl.textContent = !res.ok
+      ? `Memory unavailable: ${res.error || "unknown error"}`
+      : `${res.items.length} ${q ? "matches" : "memories"} · embeddings: ${res.embed_provider} ${res.embed_model}`
+    list.innerHTML = ""
+    for (const m of res.items || []) {
+      const del = el("button", { class: "btn ghost mem-del", title: "Forget this" }, "×")
+      del.onclick = async () => { await api(apiUrl(`/api/memory/${m.id}`), { method: "DELETE" }); await load() }
+      list.append(el("div", { class: "mem" },
+        el("div", {},
+          el("span", { class: `badge kind-${m.kind}` }, m.kind),
+          m.repo && m.repo !== repoId ? el("span", { class: "badge warn" }, m.repo) : "",
+          m.score != null ? el("span", { class: "muted" }, ` ${Number(m.score).toFixed(2)}`) : ""),
+        el("div", { style: "flex:1" }, m.memory), del))
+    }
+    if (!(res.items || []).length && res.ok) list.append(el("p", { class: "muted" }, q ? "No matches." : "Nothing remembered yet. Chat, index commits, or add a note."))
+  }
+  qIn.addEventListener("keydown", (e) => { if (e.key === "Enter") load() })
+  scopeSel.onchange = load
+  const noteIn = el("input", { placeholder: "Add a note to remember…", style: "flex:1;min-width:0" })
+  const noteBtn = el("button", { class: "btn ghost" }, "Remember")
+  noteBtn.onclick = async () => {
+    if (!noteIn.value.trim()) return
+    await api(apiUrl(`/api/repo/${repoId}/memory`), { method: "POST", body: JSON.stringify({ text: noteIn.value.trim() }) })
+    noteIn.value = ""
+    await load()
+  }
+  const idxBtn = el("button", { class: "btn ghost", title: "Store the last 50 commits (subject + files) so related changes can be found by meaning" }, "Index commits")
+  idxBtn.onclick = async () => {
+    idxBtn.disabled = true
+    idxBtn.textContent = "Indexing…"
+    try {
+      const res = await api(apiUrl(`/api/repo/${repoId}/memory/index-commits`), { method: "POST", body: "{}" })
+      toast(res.ok ? `Indexed ${res.added} new commits (${res.total} total)` : "Indexing failed", res.ok ? "ok" : "error")
+    } catch (e) { toast(String(e), "error") }
+    idxBtn.disabled = false
+    idxBtn.textContent = "Index commits"
+    await load()
+  }
+  head.append(idxBtn)
+  wrap.append(head, statusEl,
+    el("div", { style: "display:flex;gap:6px;margin-top:8px" }, qIn, scopeSel),
+    el("div", { style: "display:flex;gap:6px;margin-top:6px" }, noteIn, noteBtn),
+    list)
+  await load()
 }
 
 async function renderRequests() {
@@ -295,6 +378,26 @@ async function renderSettings() {
         saveBtn
       )
     )
+    const mem = local.memory || {}
+    const st = await api(apiUrl('/api/memory/status'))
+    const provSel = el("select", {}, el("option", { value: "fastembed" }, "fastembed (in-process, CPU)"), el("option", { value: "openai" }, "OpenAI-compatible server"))
+    provSel.value = st.embed_provider
+    const embModelIn = el("input", { value: st.embed_model || "", style: "width:320px" })
+    const embUrlIn = el("input", { value: st.embed_base_url || "", placeholder: "http://host:8082/v1 (server only)", style: "width:420px" })
+    const memSave = el("button", { class: "btn", style: "margin-top:8px" }, "Save & reload memory")
+    const memStatus = el("div", { class: "muted" }, st.ok ? "Memory is running." : `Memory not running: ${st.error || "not started"}`)
+    memSave.onclick = async () => {
+      await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ memory: { ...mem, embed_provider: provSel.value, embed_model: embModelIn.value, embed_base_url: embUrlIn.value } }) })
+      const r = await api(apiUrl("/api/memory/status"))
+      memStatus.textContent = r.ok ? "Memory is running." : `Memory not running: ${r.error}`
+      toast(r.ok ? "Memory reloaded" : "Memory failed to start", r.ok ? "ok" : "error")
+    }
+    card.append(el("h4", { style: "margin-top:20px" }, "Memory embeddings (mem0)"),
+      el("div", { style: "display:flex;flex-direction:column;gap:12px" },
+        el("label", {}, "Provider ", provSel),
+        el("label", {}, "Embedding model", embModelIn),
+        el("label", {}, "Embedding server URL", embUrlIn),
+        memStatus, memSave))
     try {
       const models = await fetch(apiUrl('/api/models')).then(r => r.json().catch(() => ({ data: [] })))
       card.append(el("h4", { style: "margin-top:16px" }, "Available models (llama-swap)"))

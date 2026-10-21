@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -148,17 +149,64 @@ def decide_request(req_id: str, decision: str, comment: str | None = None) -> di
 
 
 # --------------------------------------------------------------------- chat
-def get_chat_history(repo_id: str) -> list[dict]:
-    repo = get_repo(repo_id)
-    return repo.get("chat_history", []) if repo else []
+# Each repo keeps a list of chat sessions. Starting a new session resets what
+# the LLM sees of the conversation; long-term memory (memory.py) is unaffected.
+def _sessions(repo: dict) -> list[dict]:
+    sessions = repo.setdefault("chat_sessions", [])
+    legacy = repo.pop("chat_history", None)
+    if legacy:  # pre-session state: keep old messages as their own session
+        sessions.insert(0, {"id": "s-imported", "title": "Imported history",
+                            "created_at": legacy[0].get("timestamp") or config.now_iso(),
+                            "messages": legacy})
+        repo.setdefault("active_session", "s-imported")
+    return sessions
 
 
-def add_chat_message(repo_id: str, role: str, content: str) -> dict:
+def list_sessions(repo_id: str) -> list[dict]:
     repo = get_repo(repo_id)
     if not repo:
-        return {}
-    hist = repo.setdefault("chat_history", [])
+        return []
+    active = repo.get("active_session")
+    return [{"id": s["id"], "title": s.get("title"), "created_at": s.get("created_at"),
+             "count": len(s.get("messages", [])), "active": s["id"] == active}
+            for s in _sessions(repo)]
+
+
+def new_session(repo_id: str) -> dict:
+    repo = get_repo(repo_id)
+    sessions = _sessions(repo)
+    sid = f"s-{uuid.uuid4().hex[:8]}"
+    session = {"id": sid, "title": None, "created_at": config.now_iso(), "messages": []}
+    sessions.append(session)
+    repo["active_session"] = sid
+    save_state()
+    return session
+
+
+def get_session(repo_id: str, session_id: str | None = None) -> dict:
+    """The requested session, else the active one, else a fresh one."""
+    repo = get_repo(repo_id)
+    want = session_id or repo.get("active_session")
+    for s in _sessions(repo):
+        if s["id"] == want:
+            return s
+    return new_session(repo_id)
+
+
+def set_active_session(repo_id: str, session_id: str) -> dict:
+    session = get_session(repo_id, session_id)
+    get_repo(repo_id)["active_session"] = session["id"]
+    save_state()
+    return session
+
+
+def add_chat_message(repo_id: str, session_id: str, role: str, content: str, error: bool = False) -> dict:
+    session = get_session(repo_id, session_id)
     msg = {"role": role, "content": content, "timestamp": config.now_iso()}
-    hist.append(msg)
+    if error:
+        msg["error"] = True
+    session["messages"].append(msg)
+    if not session.get("title") and role == "user":
+        session["title"] = content.strip().splitlines()[0][:60]
     save_state()
     return msg
