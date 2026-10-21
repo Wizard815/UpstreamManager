@@ -12,7 +12,7 @@ const BASE = (
 // it with BASE. The click interceptor strips the leading BASE off absolute
 // hrefs before calling this so we never double-prefix the path. Also triggers
 // router() so every navigation (including top-nav clicks) re-renders.
-const route = (path) => { history.pushState({}, '', BASE + path.replace(/^\/+/, '')); router() }
+const route = (path) => { history.pushState({}, '', `${BASE}/${path.replace(/^\/+/, '')}`); router() }
 
 const $ = (sel, root = document) => root.querySelector(sel)
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)]
@@ -322,6 +322,8 @@ function currentView() {
 
 async function router() {
   const [view, id] = currentView()
+  // Static heading belongs to the repo list; the other views render their own.
+  $("#page-title").hidden = view !== "repos"
   if (view === "repos") await renderRepos()
   else if (view === "repo") await renderRepoPage(id)
   else if (view === "requests") await renderRequests()
@@ -346,5 +348,5 @@ document.addEventListener('click', (e) => {
   route(navPath)
 })
 window.addEventListener('popstate', router)
-document.addEventListener('DOMContentLoaded', router)
+// The script tag sits at the end of <body>, so the DOM is ready already.
 router()

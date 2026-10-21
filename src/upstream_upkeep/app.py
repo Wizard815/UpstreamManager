@@ -44,7 +44,12 @@ _run_lock = threading.Lock()
 
 
 @flask_app.route("/")
-def index():
+@flask_app.route("/repos")
+@flask_app.route("/requests")
+@flask_app.route("/settings")
+@flask_app.route("/repo/<repo_id>")
+def index(repo_id: str | None = None):
+    # View paths all serve the same shell; app.js renders from location.pathname.
     base = request.headers.get("X-Upstream-Base", "").rstrip("/")
     return render_template_string(TEMPLATE, base_url=base)
 
@@ -376,7 +381,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   <h2 id="page-title">Watched Repositories</h2>
   <div id="content">Loading…</div>
 </main>
-<script src="/static/app.js"></script>
+<script src="{{ base_url }}/static/app.js"></script>
 </body>
 </html>
 """
