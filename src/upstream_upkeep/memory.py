@@ -38,6 +38,7 @@ _lock = threading.Lock()
 # Embedded Qdrant is not safe for concurrent use; Waitress threads and the
 # background chat extraction all go through this.
 _io = threading.RLock()
+_COMMIT_FACT = re.compile(r"\b[0-9a-f]{8}\b")
 _mem = None
 _error: str | None = None
 
@@ -51,6 +52,7 @@ def _settings() -> dict:
         "embed_provider": provider,
         "embed_model": os.environ.get("UPSTREAM_EMBED_MODEL") or s.get("embed_model") or default_model,
         "embed_base_url": os.environ.get("UPSTREAM_EMBED_BASE_URL") or s.get("embed_base_url") or "",
+        "auto_cleanup": (os.environ.get("UPSTREAM_MEMORY_AUTOCLEAN") or s.get("auto_cleanup", "on")) != "off",
     }
 
 
@@ -87,7 +89,7 @@ def _build():
     slug = re.sub(r"[^a-z0-9]+", "_", cfg["embed_model"].lower()).strip("_")
     return Memory.from_config({
         "llm": {"provider": "openai", "config": {
-            "model": chat["model"], "openai_base_url": chat["base_url"], "api_key": "none",
+            "model": chat["model"], "openai_base_url": chat["base_url"], "api_key": chat["api_key"] or "none",
             "temperature": 0.1, "max_tokens": 1024}},
         "embedder": embedder,
         "vector_store": {"provider": "qdrant", "config": {
@@ -157,7 +159,9 @@ def remember(repo_id: str, text: str, kind: str, extra: dict | None = None) -> l
 def learn_from_chat(repo_id: str, user_msg: str, reply: str) -> None:
     """Let mem0 pull durable facts out of a chat turn, in the background.
 
-    It is one more LLM call, so it must not hold up the chat reply.
+    It is one more LLM call, so it must not hold up the chat reply. Only the
+    user's message is extracted from: the reply restates repo facts (commits
+    the index already holds) and would be saved back as duplicate memories.
     """
     def run():
         m = get()
@@ -165,14 +169,22 @@ def learn_from_chat(repo_id: str, user_msg: str, reply: str) -> None:
             return
         try:
             with _io:
-                m.add([{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}],
-                      user_id=USER, metadata={"repo": repo_id, "kind": "chat"})
+                res = m.add([{"role": "user", "content": user_msg}],
+                            user_id=USER, metadata={"repo": repo_id, "kind": "chat"})
+                # Small models still restate commits they were shown; the commit index
+                # already holds those, so drop any such fact instead of keeping a duplicate.
+                for r in res.get("results", []):
+                    if r.get("id") and _COMMIT_FACT.search(r.get("memory") or ""):
+                        m.delete(r["id"])
+            if _settings()["auto_cleanup"]:
+                cleanup(repo_id)
         except Exception as e:
             log.warning("memory extraction failed for %s: %s", repo_id, e)
     threading.Thread(target=run, daemon=True).start()
 
 
-def search(query: str, repo_id: str | None = None, exclude: str | None = None, k: int = 8) -> list[dict]:
+def search(query: str, repo_id: str | None = None, exclude: str | None = None, k: int = 8,
+           kind: str | None = None, exclude_kind: str | None = None) -> list[dict]:
     m = get()
     if m is None or not query.strip():
         return []
@@ -181,6 +193,10 @@ def search(query: str, repo_id: str | None = None, exclude: str | None = None, k
         filters["repo"] = repo_id
     elif exclude:
         filters["repo"] = {"ne": exclude}
+    if kind:
+        filters["kind"] = kind
+    elif exclude_kind:
+        filters["kind"] = {"ne": exclude_kind}
     with _io:
         res = m.search(query, filters=filters, top_k=k)
     return [_fmt(r) for r in res.get("results", [])]
@@ -201,3 +217,54 @@ def forget(memory_id: str) -> None:
     if m is not None:
         with _io:
             m.delete(memory_id)
+
+
+_WORDS = re.compile(r"[a-z0-9]+")
+_COMMIT_SHA = re.compile(r"^Commit ([0-9a-f]{7,40}) ")
+MAX_EVENTS = 50
+
+
+def _similar(a: set, b: set) -> bool:
+    return bool(a and b) and len(a & b) / len(a | b) >= 0.8
+
+
+def cleanup(repo_id: str) -> dict:
+    """Prune a repo's memories: junk, exact and near duplicates, stale events.
+
+    Oldest copy wins, so a memory keeps its original date. Safe to run any time;
+    it runs automatically after chat extraction and commit indexing.
+    """
+    if get() is None:
+        return {"removed": 0, "kept": 0, "reasons": {}}
+    items = sorted(list_repo(repo_id, k=2000), key=lambda r: r.get("created_at") or "")  # oldest first
+    drop: dict[str, str] = {}
+    seen_sha: set[str] = set()
+    kept_words: dict[str, list[set]] = {}
+    events: list[dict] = []
+    for it in items:
+        text = (it.get("memory") or "").strip()
+        kind = it.get("kind") or "chat"
+        words = set(_WORDS.findall(text.lower()))
+        if len(text) < 8:
+            drop[it["id"]] = "empty"
+        elif kind == "chat" and _COMMIT_FACT.search(text):
+            drop[it["id"]] = "restated commit"
+        elif kind == "commit" and (m := _COMMIT_SHA.match(text)):
+            if m.group(1) in seen_sha:
+                drop[it["id"]] = "duplicate commit"
+            seen_sha.add(m.group(1))
+        elif kind == "event":
+            events.append(it)
+        elif kind != "commit":
+            if any(_similar(words, w) for w in kept_words.get(kind, [])):
+                drop[it["id"]] = "duplicate"
+            else:
+                kept_words.setdefault(kind, []).append(words)
+    for it in events[:-MAX_EVENTS]:  # keep only the newest events
+        drop[it["id"]] = "old event"
+    for mid in drop:
+        forget(mid)
+    reasons: dict[str, int] = {}
+    for r in drop.values():
+        reasons[r] = reasons.get(r, 0) + 1
+    return {"removed": len(drop), "kept": len(items) - len(drop), "reasons": reasons}
