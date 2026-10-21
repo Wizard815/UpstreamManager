@@ -33,7 +33,7 @@ from pathlib import Path
 import requests
 from flask import Flask, jsonify, request, render_template_string, abort
 
-from . import registry, store, upstream_check, change_engine, daily_check, gitops
+from . import config, registry, store, upstream_check, change_engine, daily_check, gitops, memory
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -195,7 +195,25 @@ def api_run_daily():
                     })
             except Exception as e:
                 results.append({"repo_id": repo["id"], "status": "error", "error": str(e)})
+    for r in results:
+        _remember_daily(r)
     return jsonify({"ok": True, "results": results})
+
+
+def _remember_daily(r: dict) -> None:
+    status = r.get("status")
+    if status == "merged":
+        text = f"Daily check merged upstream {r.get('upstream')} ({r.get('behind')} commits behind, {r.get('ahead')} ahead)."
+    elif status == "request_raised":
+        text = f"Daily check found conflicts and raised an approval request: {', '.join(map(str, r.get('conflicts') or [])) or 'see request'}."
+    elif status == "error":
+        text = f"Daily check failed: {r.get('error')}"
+    else:
+        return
+    try:
+        memory.remember(r["repo_id"], f"{config.now_iso()[:10]}: {text}", kind="event")
+    except Exception:
+        pass
 
 
 @flask_app.route("/api/requests")
@@ -213,6 +231,13 @@ def api_decide(req_id):
     result = store.decide_request(req_id, decision, comment)
     if not result:
         abort(404)
+    try:
+        memory.remember(result["repo_id"], (
+            f"{config.now_iso()[:10]}: You {result['status']} the merge request for branch "
+            f"{result.get('focus_branch')} (conflicts: {', '.join(map(str, result.get('conflicts') or [])) or 'none'})"
+            + (f". Comment: {comment}" if comment else ".")), kind="decision")
+    except Exception:
+        pass
     return jsonify({"ok": True, "request": result})
 
 
@@ -226,16 +251,104 @@ def api_chat(repo_id):
     if not message:
         abort(400)
     from . import llm
-    reply = llm.chat(repo_id, message, repo["focus_branch"])
+    reply = llm.chat(repo_id, message, data.get("session"))
     return jsonify(reply)
 
 
 @flask_app.route("/api/chat/<repo_id>")
 def api_chat_history(repo_id):
+    """Messages of one session (?session=<id>, default: the active one)."""
+    if not registry.get_repo(repo_id):
+        abort(404)
+    session = store.get_session(repo_id, request.args.get("session"))
+    return jsonify({"session": session["id"], "title": session.get("title"), "messages": session["messages"]})
+
+
+@flask_app.route("/api/repo/<repo_id>/sessions")
+def api_sessions(repo_id):
+    if not registry.get_repo(repo_id):
+        abort(404)
+    return jsonify(store.list_sessions(repo_id))
+
+
+@flask_app.route("/api/repo/<repo_id>/sessions", methods=["POST"])
+def api_new_session(repo_id):
+    """Start a fresh conversation (or switch with {"session": id}); memory is kept."""
+    if not registry.get_repo(repo_id):
+        abort(404)
+    sid = (request.get_json(silent=True) or {}).get("session")
+    session = store.set_active_session(repo_id, sid) if sid else store.new_session(repo_id)
+    return jsonify({"ok": True, "session": session["id"]})
+
+
+# --------------------------------------------------------------------- memory
+@flask_app.route("/api/memory/status")
+def api_memory_status():
+    memory.get()
+    return jsonify(memory.status())
+
+
+@flask_app.route("/api/memory/reload", methods=["POST"])
+def api_memory_reload():
+    return jsonify(memory.reload())
+
+
+@flask_app.route("/api/repo/<repo_id>/memory")
+def api_memory(repo_id):
+    """All memories of a repo, or a search with ?q= (&scope=all for every repo)."""
+    if not registry.get_repo(repo_id):
+        abort(404)
+    q = request.args.get("q", "").strip()
+    try:
+        if not q:
+            items = memory.list_repo(repo_id)
+        elif request.args.get("scope") == "all":
+            items = memory.search(q, k=20)
+        else:
+            items = memory.search(q, repo_id=repo_id, k=20)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "items": []})
+    return jsonify({"ok": True, "items": items, **memory.status()})
+
+
+@flask_app.route("/api/repo/<repo_id>/memory", methods=["POST"])
+def api_memory_add(repo_id):
+    if not registry.get_repo(repo_id):
+        abort(404)
+    text = ((request.get_json(force=True) or {}).get("text") or "").strip()
+    if not text:
+        abort(400)
+    return jsonify({"ok": True, "items": memory.remember(repo_id, text, kind="note")})
+
+
+@flask_app.route("/api/repo/<repo_id>/memory/index-commits", methods=["POST"])
+def api_memory_index_commits(repo_id):
+    """Store recent commits (subject + touched files) as memories so related
+    changes, here and in other repos, can be found by meaning."""
     repo = registry.get_repo(repo_id)
     if not repo:
         abort(404)
-    return jsonify(store.get_chat_history(repo_id))
+    n = int((request.get_json(silent=True) or {}).get("count", 50))
+    done = set(repo.get("indexed_commits") or [])
+    added = 0
+    for c in gitops.recent_commits(repo["path"], n, with_files=True):
+        if c["sha"] in done:
+            continue
+        files = c.get("files") or []
+        shown = ", ".join(files[:15]) + (f" (+{len(files) - 15} more)" if len(files) > 15 else "")
+        memory.remember(repo_id, f"Commit {c['sha']} on {c['date'][:10]} by {c['author']}: {c['subject']}. Files: {shown or 'none'}",
+                        kind="commit", extra={"sha": c["sha"]})
+        done.add(c["sha"])
+        added += 1
+    repo["indexed_commits"] = sorted(done)
+    store.save_repo(repo)
+    return jsonify({"ok": True, "added": added, "total": len(done)})
+
+
+@flask_app.route("/api/memory/<memory_id>", methods=["DELETE"])
+def api_memory_delete(memory_id):
+    memory.forget(memory_id)
+    return jsonify({"ok": True})
 
 
 @flask_app.route("/api/settings")
@@ -247,6 +360,8 @@ def api_settings():
 def api_save_settings():
     data = request.get_json(force=True) or {}
     new = save_settings(data)
+    if "memory" in data:
+        memory.reload()
     # also mirror LLM config to hermes config.yaml so studio & this app share backend
     if "llm" in data:
         from . import hermes_config
@@ -365,7 +480,17 @@ TEMPLATE = r"""<!DOCTYPE html>
   .chat-box { height: 300px; overflow-y: auto; border: 1px solid #2a2f3a; border-radius: 8px; padding: 12px; background: #0f1115; }
   .msg { margin-bottom: 10px; padding: 8px 12px; border-radius: 8px; max-width: 80%; }
   .msg.user { background: #2f5bff; margin-left: auto; }
-  .msg.bot { background: #232833; }
+  .msg.bot { background: #232833; white-space: pre-wrap; }
+  .msg.err { background: #3a1d1d; }
+  .msg { white-space: pre-wrap; }
+  .mem-list { margin-top: 10px; max-height: 420px; overflow-y: auto; }
+  .mem { display: flex; gap: 8px; align-items: flex-start; padding: 8px; border: 1px solid #2a2f3a; border-radius: 8px; margin-bottom: 6px; font-size: 13px; }
+  .mem-del { padding: 2px 8px; }
+  .badge.kind-commit { background: #1d2a40; border-color: #2c4366; }
+  .badge.kind-event { background: #332a14; border-color: #5a4a23; }
+  .badge.kind-decision { background: #2b1d40; border-color: #45306a; }
+  .badge.kind-note { background: #14301f; border-color: #235a3a; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>

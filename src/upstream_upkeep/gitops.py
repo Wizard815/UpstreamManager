@@ -113,6 +113,29 @@ def current_branch(path: str) -> str | None:
     return current_branch_name(path)
 
 
+def recent_commits(path: str, n: int = 20, with_files: bool = False) -> list[dict]:
+    """Newest-first commits on HEAD: {sha, date, author, subject[, files]}."""
+    sep = "\x1f"
+    args = ["log", f"-{n}", f"--format=%x1e%h{sep}%aI{sep}%an{sep}%s"]
+    if with_files:
+        args.append("--name-only")
+    try:
+        out = _git(args, path)
+    except GitError:
+        return []
+    commits = []
+    for block in out.split("\x1e"):
+        if not block.strip():
+            continue
+        head, *rest = block.strip().split("\n")
+        sha, date, author, subject = (head.split(sep) + ["", "", "", ""])[:4]
+        c = {"sha": sha, "date": date, "author": author, "subject": subject}
+        if with_files:
+            c["files"] = [f for f in rest if f.strip()]
+        commits.append(c)
+    return commits
+
+
 def short_sha(path: str, rev: str | None = None) -> str | None:
     try:
         if rev is None:
