@@ -1,17 +1,18 @@
 [Unit]
 Description=Upstream-Keep (upstream management web app)
-Documentation=file:/home/codebox/workspace/Upstream-Upkeep/README.md
+Documentation=file:/home/codebox/workspace/uptrack-upkeep/README.md
 After=network.target
 
 [Service]
 Type=simple
 User=codebox
 Group=codebox
-WorkingDirectory=/home/codebox/workspace/Upstream-Upkeep
+WorkingDirectory=/home/codebox/workspace/uptrack-upkeep
 Environment=PORT=5001
 Environment=PYTHONUNBUFFERED=1
-Environment=UPSTREAM_STATE_FILE=/home/codebox/workspace/Upstream-Upkeep/data/state.json
-ExecStart=/home/codebox/workspace/Upstream-Upkeep/.venv/bin/python -m upstream_upkeep.run
+# systemd's default PATH does not include ~/.local/bin, where uv lives.
+Environment=PATH=/home/codebox/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/codebox/.local/bin/uv run --project /home/codebox/workspace/uptrack-upkeep python -m upstream_upkeep.run
 Restart=on-failure
 RestartSec=5
 
