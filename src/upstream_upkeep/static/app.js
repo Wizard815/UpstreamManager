@@ -279,6 +279,7 @@ async function refreshUpstreams(wrap, repoId) {
             if (err && /fatal|could not|unable/i.test(err)) toast(err, "error")
             await refreshUpstreams(wrap, repoId); refreshCommits()
           }) }, "Fetch"),
+          el("button", { class: "btn ghost", "aria-label": `Pull report for ${u.name}`, onclick: (e) => busy(e.currentTarget, "Analysing…", () => showPullReport(repoId, { upstream: u.name })) }, "Pull report"),
           el("button", { class: "btn ghost", "aria-label": `${u.enabled ? "Disable" : "Enable"} ${u.name}`, onclick: (e) => busy(e.currentTarget, null, async () => {
             await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}/enable`), { method: "POST", body: JSON.stringify({ enabled: !u.enabled }) })
             await refreshUpstreams(wrap, repoId)
@@ -376,6 +377,7 @@ async function renderComponents(wrap, repoId) {
       el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap" },
         el("div", {}, el("strong", {}, `${c.name} `), el("span", { class: "muted" }, `${c.path} · ${c.branch || "?"} `), ...status),
         el("div", { style: "display:flex;gap:6px" },
+          c.behind ? (() => { const b = el("button", { class: "btn ghost", "aria-label": `Pull report for ${c.name}` }, "Pull report"); b.onclick = () => busy(b, "Analysing…", () => showPullReport(repoId, { component: c.name })); return b })() : null,
           c.behind ? (() => { const b = el("button", { class: "btn ghost", "aria-label": `Request update for ${c.name}` }, "Request update"); b.onclick = () => raise(b, [c.name]); return b })() : null,
           fetchBtn)),
       el("div", { class: "muted" }, `${c.url}` + (c.pin ? ` · pinned ${c.pin.slice(0, 8)}` : "") + (c.upstream ? ` · upstream ${c.upstream.slice(0, 8)}` : "")),
@@ -440,10 +442,11 @@ async function renderChat(wrap, repoId, focus, sessionId) {
   refreshTray()
   // Replies are Markdown; renderMarkdown escapes everything first (see md.js).
   const setReply = (d, text) => { d.innerHTML = renderMarkdown(text) }
-  const addMsg = (m) => {
+  const addMsg = (m, index) => {
     const d = el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.error ? " err" : ""}` })
     if (m.role === "user" || m.error) d.textContent = m.content
     else setReply(d, m.content)
+    if (m.edits?.length) d.append(editCard(repoId, hist.session, index, m))
     if (m.attachments?.length) d.append(el("div", { class: "muted", style: "margin-top:4px;font-size:12px" }, "📎 " + m.attachments.map(a => a.label).join(", ")))
     box.append(d)
     return d
@@ -462,7 +465,7 @@ async function renderChat(wrap, repoId, focus, sessionId) {
     box.scrollTop = box.scrollHeight
     try {
       const res = await api(apiUrl(`/api/repo/${repoId}/chat`), { method: "POST", body: JSON.stringify({ message: text, session: hist.session, attachments }) })
-      if (res.ok) setReply(replyBox, res.reply)
+      if (res.ok) { setReply(replyBox, res.reply); if (res.edits?.length) replyBox.append(editCard(repoId, hist.session, res.index, { edits: res.edits })) }
       else { replyBox.textContent = `Error: ${res.error}`; replyBox.classList.add("err") }
     } catch (e) { replyBox.textContent = `Error: ${e.message}`; replyBox.classList.add("err") }
     sendBtn.disabled = false
@@ -472,10 +475,58 @@ async function renderChat(wrap, repoId, focus, sessionId) {
   msgIn.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendBtn.click() }
   })
-  for (const m of hist.messages || []) addMsg(m)
+  ;(hist.messages || []).forEach((m, i) => addMsg(m, i))
   if (!(hist.messages || []).length) box.append(el("p", { class: "muted" }, "New conversation. The assistant still knows this repo and what it remembers about it."))
   wrap.append(box, tray, msgIn, sendBtn)
   box.scrollTop = box.scrollHeight
+}
+
+// Edits the model proposed in a reply: each shows its diff (or why it doesn't
+// match the file). Nothing is written until Apply; Undo restores the old text.
+function editCard(repoId, session, index, m) {
+  const box = el("div", { class: "edits" })
+  const render = (state) => {
+    box.innerHTML = ""
+    const results = state.edit_results || m.edits
+    const okCount = m.edits.filter(e => e.ok).length
+    box.append(el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap" },
+      el("strong", {}, `Proposed edits (${okCount}/${m.edits.length} match the files)`),
+      state.applied ? el("span", { class: "badge up" }, "applied") : null))
+    results.forEach((e, i) => {
+      const diff = el("pre", { class: "code-pre", style: "max-height:240px" })
+      for (const line of (e.diff || "").split("\n")) {
+        if (!line) continue
+        const cls = line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "del" : line.startsWith("@@") ? "hunk" : ""
+        diff.append(el("div", { class: `dl ${cls}` }, line))
+      }
+      box.append(el("div", { class: "upstream" },
+        el("div", {}, el("code", {}, e.path), " ", e.ok ? badge("up", e.new_file ? "new file" : "matches") : badge("bad", "won't apply")),
+        e.error ? el("div", { class: "muted", style: "color:#e08080" }, e.error) : null,
+        e.diff ? diff : null))
+    })
+    const act = el("div", { style: "display:flex;gap:6px;margin-top:6px" })
+    if (!state.applied && okCount) {
+      const b = el("button", { class: "btn" }, okCount === m.edits.length ? "Apply" : `Apply the ${okCount} that match`)
+      b.onclick = () => busy(b, "Applying…", async () => {
+        const r = await api(apiUrl(`/api/repo/${repoId}/edits/apply`), { method: "POST", body: JSON.stringify({ session, index, only: m.edits.map((e, i) => e.ok ? i : -1).filter(i => i >= 0) }) })
+        toast(r.ok ? "Edits applied to the working tree (not committed)" : "Some edits did not apply", r.ok ? "ok" : "error")
+        render({ applied: r.applied, edit_results: r.results })
+      })
+      act.append(b)
+    }
+    if (state.applied) {
+      const u = el("button", { class: "btn ghost" }, "Undo")
+      u.onclick = () => busy(u, "Undoing…", async () => {
+        const r = await api(apiUrl(`/api/repo/${repoId}/edits/undo`), { method: "POST", body: JSON.stringify({ session, index }) })
+        toast(`Restored ${r.restored.join(", ")}`, "ok")
+        render({})
+      })
+      act.append(u)
+    }
+    box.append(act)
+  }
+  render({ applied: m.applied, edit_results: m.edit_results })
+  return box
 }
 
 // Right-hand tools: commits, files, memory.
@@ -617,6 +668,81 @@ async function showCommit(repoId, sha, component = null) {
   document.addEventListener("keydown", onKey)
   document.body.append(ov)
   closeBtn.focus()
+}
+
+// A modal dialog: Escape closes, Tab stays inside, focus returns to the opener.
+function openDialog(title, ...body) {
+  const opener = document.activeElement
+  const close = () => { ov.remove(); document.removeEventListener("keydown", onKey); opener?.focus?.() }
+  const onKey = (e) => {
+    if (e.key === "Escape") return close()
+    if (e.key !== "Tab") return
+    const f = [...ov.querySelectorAll("button, [href], input, [tabindex]:not([tabindex='-1'])")].filter(x => !x.disabled)
+    if (!f.length) return
+    const first = f[0], last = f[f.length - 1]
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus() }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
+  }
+  const closeBtn = el("button", { class: "btn ghost", onclick: () => close() }, "Close")
+  const id = `dlg-${Math.random().toString(36).slice(2, 8)}`
+  const ov = el("div", { class: "overlay", onclick: (e) => { if (e.target === ov) close() } },
+    el("div", { class: "overlay-panel", role: "dialog", "aria-modal": "true", "aria-labelledby": id },
+      el("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap" }, el("h3", { style: "margin:0", id }, title), closeBtn),
+      ...body))
+  document.addEventListener("keydown", onKey)
+  document.body.append(ov)
+  closeBtn.focus()
+  return close
+}
+
+// Pull report: of the incoming commits, how many are a no-issue pull and how many
+// touch files that would conflict; plus the clean part that can be merged now.
+async function showPullReport(repoId, { upstream, component }) {
+  const qs = component ? `component=${encodeURIComponent(component)}` : `upstream=${encodeURIComponent(upstream)}`
+  const r = await api(apiUrl(`/api/repo/${repoId}/pull-report?${qs}`))
+  if (!r.ok) return toast(r.error, "error")
+  const stat = (n, label, cls = "") => el("div", { class: `stat ${cls}` }, el("div", { class: "stat-n" }, String(n)), el("div", { class: "muted" }, label))
+  const cp = r.clean_prefix || {}
+  const list = (title, items) => items.length ? el("details", { style: "margin-top:10px" }, el("summary", {}, title),
+    el("div", { class: "mem-list" }, ...items.map(c => el("div", { class: "mem" }, el("code", { style: "color:#9fb4ff" }, c.sha),
+      el("div", { style: "flex:1;min-width:0" }, el("div", {}, c.subject), el("div", { class: "muted", style: "font-size:12px" }, c.files.join(", "))))))) : null
+  const actions = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin-top:12px" })
+  let close
+  if (component) {
+    const b = el("button", { class: "btn" }, "Request update for this component")
+    b.onclick = () => busy(b, "Raising…", async () => {
+      const x = await api(apiUrl(`/api/repo/${repoId}/components/request`), { method: "POST", body: JSON.stringify({ names: [component] }) })
+      if (!x.ok) return toast(x.error, "info")
+      close(); toast("Update request raised.", "ok"); route("/requests")
+    })
+    if (r.incoming) actions.append(b)
+  } else if (cp.sha && cp.commits) {
+    const b = el("button", { class: "btn" }, cp.complete ? `Request pull of all ${cp.commits} commits` : `Request pull of the clean part (${cp.commits} commits)`)
+    b.onclick = () => busy(b, "Raising…", async () => {
+      await api(apiUrl(`/api/repo/${repoId}/upstream/${encodeURIComponent(upstream)}/request-pull`), { method: "POST", body: JSON.stringify({ target: cp.sha }) })
+      close(); toast("Pull request raised. Approve it on the Requests page.", "ok"); route("/requests")
+    })
+    actions.append(b)
+  }
+  close = openDialog(`Pull report · ${r.source} → ${r.into}`,
+    el("div", { class: "stats" },
+      stat(r.incoming, "incoming commits"),
+      stat(r.no_issue, "no-issue changes", "good"),
+      stat(r.conflicting, "touch conflicting files", r.conflicting ? "bad" : ""),
+      r.watched ? stat(r.watched, "touch watched files", "warn") : null,
+      stat(r.merge_commits, "merge commits")),
+    el("p", { class: "muted" }, r.fast_forward
+      ? "There are no commits of yours on this side, so every incoming commit comes in as a fast-forward: nothing can conflict."
+      : `You have ${r.yours} commit(s) of your own here. ${r.conflict_files.length} file(s) would conflict in a full merge.`),
+    !r.fast_forward ? el("p", {}, cp.complete ? "Everything merges cleanly right now."
+      : cp.commits ? `The first ${cp.commits} of ${r.incoming} commits merge with no conflict (up to ${cp.short}); the first conflict comes at ${cp.first_conflict}.`
+      : `Even the first incoming commit conflicts (${cp.first_conflict}).`) : null,
+    r.conflict_files.length ? el("details", {}, el("summary", {}, `Conflicting files (${r.conflict_files.length})`),
+      el("div", { class: "muted", style: "font-family:monospace;font-size:12px" }, ...r.conflict_files.map(f => el("div", {}, f)))) : null,
+    list(`Commits that touch conflicting files (first ${r.conflicting_sample.length} of ${r.conflicting})`, r.conflicting_sample),
+    list(`Commits that touch watched files (first ${r.watched_sample.length} of ${r.watched})`, r.watched_sample),
+    el("p", { class: "muted", style: "font-size:12px" }, "No-issue commits are not pulled one by one past a conflict: they often build on the conflicting ones. The clean part is the safe unit."),
+    actions)
 }
 
 // Files: a read-only tree plus a line-numbered viewer with find.

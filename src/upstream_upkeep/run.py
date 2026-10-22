@@ -24,6 +24,7 @@ if __name__ == "__main__":
         host=os.environ.get("HOST", "127.0.0.1"),
         port=int(os.environ.get("PORT", "5000")),
         threads=int(os.environ.get("UPSTREAM_THREADS", "8")),
-        # LLM chat and git fetches can run for minutes; don't drop them early.
-        channel_timeout=300,
+        # LLM chat and git fetches can run for minutes; don't drop them early
+        # (keep this above UPSTREAM_LLM_TIMEOUT).
+        channel_timeout=int(os.environ.get("UPSTREAM_LLM_TIMEOUT", "900")) + 60,
     )

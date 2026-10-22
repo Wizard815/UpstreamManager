@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, render_template_string, abort
 
-from . import components, config, registry, store, upstream_check, daily_check, gitops, memory
+from . import components, config, edits, pull_report, registry, store, upstream_check, daily_check, gitops, memory
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -220,6 +220,103 @@ def api_components_request(repo_id):
     if not req:
         return jsonify({"ok": False, "error": "nothing to update (press Fetch first to check)"})
     return jsonify({"ok": True, "request": store.snapshot(req)})
+
+
+# ------------------------------------------------------------ pull reports
+@flask_app.route("/api/repo/<repo_id>/pull-report")
+def api_pull_report(repo_id):
+    """How many incoming commits are a no-issue pull vs touch conflicting files,
+    for ?upstream=<remote> (into the focus branch) or ?component=<name> (into its pin)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    focus = repo.get("focus_branch") or "HEAD"
+    comp_name = request.args.get("component")
+    if comp_name:
+        comp = next((c for c in repo.get("components") or [] if c["name"] == comp_name), None)
+        if not comp:
+            abort(404)
+        st = components.compare(repo["path"], comp)
+        if st["status"] in ("not_checked_out", "not_fetched", "error"):
+            return jsonify({"ok": False, "error": st["detail"]})
+        sub = str(Path(repo["path"]) / comp["path"])
+        report = pull_report.analyze(sub, st["pin"], f"refs/remotes/origin/{st['branch']}", comp.get("watch_paths"))
+        return jsonify({**report, "source": f"component {comp_name}", "into": f"pin {st['pin'][:10]}"})
+    up = next((u for u in repo.get("upstreams", []) if u["name"] == request.args.get("upstream")), None)
+    if not up:
+        abort(404)
+    ref = f"refs/remotes/{up['name']}/{up.get('branch') or focus}"
+    if not gitops.ref_exists(repo["path"], ref):
+        return jsonify({"ok": False, "error": f"{up['name']}/{up.get('branch') or focus} not fetched yet - press Fetch"})
+    report = pull_report.analyze(repo["path"], focus, ref)
+    return jsonify({**report, "source": f"{up['name']}/{up.get('branch') or focus}", "into": focus})
+
+
+@flask_app.route("/api/repo/<repo_id>/upstream/<name>/request-pull", methods=["POST"])
+def api_request_pull(repo_id, name):
+    """Raise an approval request to merge the upstream up to `target` (the clean part)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    up = next((u for u in repo.get("upstreams", []) if u["name"] == name), None)
+    target = (request.get_json(silent=True) or {}).get("target")
+    if not up or not target or not gitops.ref_exists(repo["path"], target):
+        abort(400)
+    focus = repo.get("focus_branch") or gitops.current_branch(repo["path"]) or "main"
+    behind, ahead = gitops.behind_ahead(repo["path"], focus, target)
+    rec = store.record_request({
+        "id": f"{repo['id']}:{focus}", "repo_id": repo["id"], "repo_name": repo["name"], "focus_branch": focus,
+        "conflicts": [], "safe": True, "status": "pending", "created_at": config.now_iso(),
+        "comment": None, "decided_at": None,
+        "upstreams": [{"name": up["name"], "url": up.get("url"), "branch": up.get("branch") or focus,
+                       "target": gitops.short_sha(repo["path"], target), "behind": behind, "ahead": ahead,
+                       "conflict": False, "conflict_files": [],
+                       "reason": f"pull the clean part: {behind} commit(s) up to {target[:10]} (merges without conflicts)"}],
+    })
+    return jsonify({"ok": True, "request": store.snapshot(rec)})
+
+
+# ----------------------------------------------------------- model edits
+def _edit_message(repo_id: str):
+    data = request.get_json(force=True) or {}
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    msg = store.get_message(repo_id, data.get("session"), int(data.get("index", -1)))
+    if not msg or not msg.get("edits"):
+        abort(404)
+    return repo, msg, data
+
+
+@flask_app.route("/api/repo/<repo_id>/edits/apply", methods=["POST"])
+def api_edits_apply(repo_id):
+    """Apply the edits the model proposed in one reply ({"session", "index", "only": [i...]})."""
+    repo, msg, data = _edit_message(repo_id)
+    if msg.get("applied"):
+        return jsonify({"ok": False, "error": "already applied; undo first"}), 409
+    # Re-read the edits from the reply itself, so a fixed parser or a changed file is always respected.
+    proposed = edits.parse(msg["content"])
+    chosen = [e for i, e in enumerate(proposed) if data.get("only") is None or i in data["only"]]
+    result = edits.apply(repo["path"], chosen)
+    with store.lock:
+        msg["edit_results"] = result["results"]
+        if result["change"]:
+            msg["applied"] = result["change"]
+        store.save_state()
+    return jsonify({"ok": result["ok"], "results": result["results"], "applied": bool(result["change"])})
+
+
+@flask_app.route("/api/repo/<repo_id>/edits/undo", methods=["POST"])
+def api_edits_undo(repo_id):
+    repo, msg, _ = _edit_message(repo_id)
+    if not msg.get("applied"):
+        return jsonify({"ok": False, "error": "nothing to undo"}), 409
+    restored = edits.undo(repo["path"], msg["applied"])
+    with store.lock:
+        msg.pop("applied", None)
+        msg.pop("edit_results", None)
+        store.save_state()
+    return jsonify({"ok": True, "restored": restored})
 
 
 @flask_app.route("/api/repo/<repo_id>/commits")
@@ -523,6 +620,12 @@ def api_chat_history(repo_id):
     if not registry.get_repo(repo_id):
         abort(404)
     session = store.snapshot(store.get_session(repo_id, request.args.get("session")))
+    repo = registry.get_repo(repo_id)
+    for m in session["messages"]:
+        # Edits not applied yet are checked against the files as they are now.
+        if m.get("edits") and not m.get("applied"):
+            m["edits"] = [{k: v for k, v in edits.preview(repo["path"], e).items() if k != "_new"}
+                          for e in edits.parse(m["content"])]
     return jsonify({"session": session["id"], "title": session.get("title"), "messages": session["messages"]})
 
 
@@ -830,6 +933,11 @@ TEMPLATE = r"""<!DOCTYPE html>
   .gutter { text-align: right; color: #566; padding: 0 10px; border-right: 1px solid #2a2f3a; user-select: none; position: sticky; left: 0; background: #0f1115; }
   .src { padding: 0 14px; tab-size: 4; }
   .hl { position: absolute; left: 0; right: 0; height: 18px; background: rgba(255, 210, 80, .18); pointer-events: none; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin: 12px 0; }
+  .stat { border: 1px solid #2a2f3a; border-radius: 8px; padding: 10px; background: #11141a; }
+  .stat-n { font-size: 22px; font-weight: 600; }
+  .stat.good .stat-n { color: #8fd9a8; } .stat.bad .stat-n { color: #f0a0a0; } .stat.warn .stat-n { color: #e0c070; }
+  .edits { margin-top: 10px; border-top: 1px solid #3a4152; padding-top: 8px; white-space: normal; }
   @media (max-width: 900px) { .grid, .repo-grid { grid-template-columns: 1fr; } }
   @media (max-width: 700px) {
     main { padding: 14px; }
