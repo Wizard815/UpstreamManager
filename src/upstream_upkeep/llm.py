@@ -20,11 +20,14 @@ import requests
 
 from pathlib import Path
 
-from . import components, gitops, memory, store, upstream_check
+from . import components, edits, gitops, memory, store, upstream_check
 
 # Rough character budget for replayed session turns (~4 chars per token).
 HISTORY_CHARS = 24_000
 MAX_TOKENS = 2048
+# Seconds to wait for one reply. Local models on a throttled laptop GPU can run
+# at a few tokens a second, so the default is generous.
+TIMEOUT = int(os.environ.get("UPSTREAM_LLM_TIMEOUT", "900"))
 
 
 def config() -> dict:
@@ -58,6 +61,8 @@ What you can and cannot do:
 - Answer directly and concretely. Do not end every reply with a question. Ask at most one clarifying question, and only when you truly cannot proceed.
 - When something needs doing in git (merge, rebase, resolving conflicts), give the exact commands for the user to run themselves, with the real branch and remote names from the facts.
 - Use the memories when they help, and say so when you rely on one."""
+
+SYSTEM_PROMPT += "\n\n" + edits.EDIT_INSTRUCTIONS
 
 ATTACH_CHARS = 8000
 MAX_ATTACHMENTS = 6  # keep in step with MAX_TAGS in static/app.js
@@ -224,10 +229,12 @@ def build_messages(repo: dict, session: dict, message: str, attachments: list[di
     mem = _memory_block(repo["id"], message)
     if mem:
         system += "\n\n" + mem
+    # Attachments go in the user's turn, right before the request: small models
+    # ground on the latest user message far better than on a long system prompt.
     att = attachments_block(repo, attachments or [])
-    if att:
-        system += "\n\nThe user attached these for this question:\n\n" + att
-    return [{"role": "system", "content": system}, *_history(session), {"role": "user", "content": message}]
+    user = (f"Attached files and commits (current contents, exactly as they are on disk):\n\n{att}\n\n---\n\n{message}"
+            if att else message)
+    return [{"role": "system", "content": system}, *_history(session), {"role": "user", "content": user}]
 
 
 def chat(repo_id: str, message: str, session_id: str | None = None, attachments: list[dict] | None = None) -> dict:
@@ -248,7 +255,7 @@ def chat(repo_id: str, message: str, session_id: str | None = None, attachments:
                 # thinking; llama-server honours this per request, others ignore it.
                 "chat_template_kwargs": {"enable_thinking": False},
             },
-            headers=_headers(cfg["api_key"]), timeout=300,
+            headers=_headers(cfg["api_key"]), timeout=TIMEOUT,
         )
         resp.raise_for_status()
         choice = resp.json()["choices"][0]
@@ -260,9 +267,11 @@ def chat(repo_id: str, message: str, session_id: str | None = None, attachments:
         store.add_chat_message(repo_id, session["id"], "assistant", f"[LLM error: {e}]", error=True)
         return {"ok": False, "error": str(e), "reply": "", "session": session["id"]}
 
-    store.add_chat_message(repo_id, session["id"], "assistant", reply)
+    proposed = [{k: v for k, v in edits.preview(repo["path"], e).items() if k != "_new"} for e in edits.parse(reply)]
+    msg = store.add_chat_message(repo_id, session["id"], "assistant", reply, extra={"edits": proposed} if proposed else None)
     memory.learn_from_chat(repo_id, message, reply)
-    return {"ok": True, "reply": reply, "session": session["id"]}
+    index = len(store.get_session(repo_id, session["id"])["messages"]) - 1
+    return {"ok": True, "reply": reply, "session": session["id"], "edits": msg.get("edits", []), "index": index}
 
 
 def list_models(base_url: str | None = None, api_key: str | None = None) -> tuple[list[str], str | None]:

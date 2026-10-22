@@ -232,6 +232,12 @@ def delete_session(repo_id: str, session_id: str) -> bool:
     return True
 
 
+def get_message(repo_id: str, session_id: str, index: int) -> dict | None:
+    """One message of a session by position (the live dict: change it under `lock`)."""
+    msgs = get_session(repo_id, session_id)["messages"]
+    return msgs[index] if 0 <= index < len(msgs) else None
+
+
 @_locked
 def get_session(repo_id: str, session_id: str | None = None) -> dict:
     """The requested session, else the active one, else a fresh one."""
@@ -253,11 +259,13 @@ def set_active_session(repo_id: str, session_id: str) -> dict:
 
 @_locked
 def add_chat_message(repo_id: str, session_id: str, role: str, content: str, error: bool = False,
-                     attachments: list | None = None) -> dict:
+                     attachments: list | None = None, extra: dict | None = None) -> dict:
     session = get_session(repo_id, session_id)
     msg = {"role": role, "content": content, "timestamp": config.now_iso()}
     if attachments:
         msg["attachments"] = attachments
+    if extra:
+        msg.update(extra)
     if error:
         msg["error"] = True
     session["messages"].append(msg)
