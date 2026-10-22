@@ -9,6 +9,9 @@ User=codebox
 Group=codebox
 WorkingDirectory=/home/codebox/workspace/uptrack-upkeep
 Environment=PORT=5001
+# The app listens on 127.0.0.1 by default (it has no login). Uncomment only if
+# other machines must reach it directly rather than through a local proxy.
+#Environment=HOST=0.0.0.0
 Environment=PYTHONUNBUFFERED=1
 # systemd's default PATH does not include ~/.local/bin, where uv lives.
 Environment=PATH=/home/codebox/.local/bin:/usr/local/bin:/usr/bin:/bin
