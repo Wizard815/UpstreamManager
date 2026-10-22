@@ -25,7 +25,7 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import gitops
+from . import components, gitops
 from .config import PROJECT_ROOT
 from . import store
 from . import upstream_check
@@ -129,6 +129,7 @@ def add_repo(path: str | None, url: str | None, name: str | None,
                 for n, u in remotes.items()
             ],
         }
+        repo["components"] = components.sync({**(store.get_repo(repo["id"]) or {}), **repo})
         return store.upsert_repo(repo)
 
     if url:
@@ -154,6 +155,7 @@ def add_repo(path: str | None, url: str | None, name: str | None,
                 for n, u in remotes.items()
             ],
         }
+        repo["components"] = components.sync({**(store.get_repo(repo["id"]) or {}), **repo})
         return store.upsert_repo(repo)
 
     raise ValueError("provide path= or url=")
@@ -277,6 +279,7 @@ def repo_summary() -> list[dict]:
             "ahead": sum(u["ahead"] for u in ups),
             "conflicts": conflicts,
             "upstream_details": ups,
+            "components": _component_summary(repo),
             "upstreams": [u["name"] for u in repo.get("upstreams", [])],
             "last_commit": commits[0] if commits else None,
             "dirty": gitops.status_summary(repo["path"])["dirty"] if not error else 0,
@@ -295,6 +298,15 @@ def repo_by_path(path: str) -> dict | None:
         if Path(r["path"]).resolve() == want:
             return r
     return None
+
+
+def _component_summary(repo: dict) -> list[dict]:
+    """Per-component drift for the repo list (no network)."""
+    try:
+        return [{k: c.get(k) for k in ("name", "path", "status", "behind", "local", "enabled", "watched_changes")}
+                for c in components.compare_all(repo)]
+    except Exception as e:  # never break the list over one hub
+        return [{"name": "components", "status": "error", "detail": str(e)}]
 
 
 def get_watching_repos() -> list[dict]:
