@@ -16,10 +16,26 @@ const route = (path) => { history.pushState({}, '', `${BASE}/${path.replace(/^\/
 
 const $ = (sel, root = document) => root.querySelector(sel)
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)]
-const api = (path, opts = {}) => {
+// JSON API call. Resolves with the parsed body on 2xx; otherwise rejects with an
+// Error carrying the server's message (`.status`, `.data` attached), so every
+// failure reaches a catch or the global handler below instead of breaking a panel.
+async function api(path, opts = {}) {
   // callers usually pass apiUrl(...), which already carries BASE; never add it twice
   const url = /^https?:\/\//.test(path) || (BASE && path.startsWith(`${BASE}/`)) ? path : `${BASE}${path}`
-  return fetch(url, { headers: { "Content-Type": "application/json", ...opts.headers }, ...opts }).then(r => r.json())
+  let r
+  try {
+    r = await fetch(url, { headers: { "Content-Type": "application/json", ...opts.headers }, ...opts })
+  } catch {
+    throw new Error("Can't reach the Upstream Management server. Is it running?")
+  }
+  const data = await r.json().catch(() => null)
+  if (!r.ok) {
+    const err = new Error(data?.error || `${r.status} ${r.statusText || "request failed"}`)
+    err.status = r.status
+    err.data = data
+    throw err
+  }
+  return data
 }
 const apiUrl = (p) => `${BASE}${p}`
 
@@ -38,13 +54,32 @@ function el(tag, attrs = {}, ...kids) {
   return e
 }
 
+const loading = (text = "Loading…") => el("div", { class: "loading" }, text)
+
+// Disable `btn` and show `label` while `fn` runs; errors become a toast. Returns fn's result.
+async function busy(btn, label, fn) {
+  const old = btn.textContent
+  btn.disabled = true
+  btn.setAttribute("aria-busy", "true")
+  if (label) btn.textContent = label
+  try { return await fn() }
+  catch (e) { toast(e, "error") }
+  finally {
+    if (btn.isConnected) { btn.disabled = false; btn.removeAttribute("aria-busy"); btn.textContent = old }
+  }
+}
+
 function toast(msg, type = "info") {
-  const box = el("div", { class: `toast toast-${type}` }, msg)
+  if (msg instanceof Error) msg = msg.message
+  const box = el("div", { class: `toast toast-${type}`, role: type === "error" ? "alert" : "status" }, msg)
   box.style.cssText = "position:fixed;bottom:20px;right:20px;padding:12px 18px;border-radius:8px;color:#fff;font-size:14px;z-index:999;box-shadow:0 4px 12px rgba(0,0,0,.4)"
   box.style.background = type === "error" ? "#b33" : type === "ok" ? "#2a7d3b" : "#2f5bff"
   document.body.append(box)
-  setTimeout(() => box.remove(), 3000)
+  setTimeout(() => box.remove(), type === "error" ? 6000 : 3000)
 }
+
+// Anything async that failed without its own handler still tells the user.
+window.addEventListener("unhandledrejection", (e) => { toast(e.reason instanceof Error ? e.reason : String(e.reason), "error") })
 
 // --- repos page ---
 async function renderRepos() {
@@ -60,11 +95,11 @@ async function renderRepos() {
     const url = urlIn.value.trim()
     const dir = dirIn.value.trim()
     if (!url && !dir) return toast("Enter a git URL or local path", "error")
-    try {
-      const res = await api(apiUrl('/api/add'), { method: "POST", body: JSON.stringify({ url: url || null, path: dir || null, name: nameIn.value.trim() }) })
-      if (res.ok) { toast("Repo added", "ok"); await loadRepos(); }
-      else toast(res.error || "Failed to add", "error")
-    } catch (e) { toast(String(e), "error"); }
+    await busy(addBtn, url ? "Cloning…" : "Adding…", async () => {
+      await api(apiUrl('/api/add'), { method: "POST", body: JSON.stringify({ url: url || null, path: dir || null, name: nameIn.value.trim() }) })
+      toast("Repo added", "ok")
+      await loadRepos(list)
+    })
   }
   content.append(el("div", { class: "repo-card", style: "margin-bottom:24px" },
     el("h3", {}, "Add or watch a repo"),
@@ -72,7 +107,7 @@ async function renderRepos() {
     el("p", { class: "muted" }, "Drop a repo into the watch folder, or paste a git URL like https://github.com/Wizard815/DNDWORLDAPP.git. Track multiple upstreams per repo (e.g. origin + a llamacpp mirror).")
   ))
 
-  const list = el("div")
+  const list = el("div", {}, loading("Checking repos…"))
   content.append(list)
   await loadRepos(list)
 }
@@ -85,21 +120,19 @@ async function loadRepos(container) {
     if (!repos.length) { list.append(el("p", { class: "muted" }, "No repos yet. Add one above or drop a repo into the watch folder.")); return; }
     for (const r of repos) list.append(await repoCard(r))
     const runBtn = el("button", { class: "btn", style: "margin:12px 0" }, "▶ Run Daily Check")
-    runBtn.onclick = async () => {
-      runBtn.disabled = true; runBtn.textContent = "Running…"
-      try {
-        const res = await api(apiUrl('/api/run-daily'), { method: "POST" })
-        toast(`Done: ${res.results.filter(r => r.status === "merged").length} merged, ${res.results.filter(r => r.status === "request_raised").length} requests raised`, "ok")
-        await loadRepos(list)
-      } catch (e) { toast(String(e), "error"); }
-      finally { runBtn.disabled = false; runBtn.textContent = "▶ Run Daily Check"; }
-    }
-    const fetchBtn = el("button", { class: "btn ghost", style: "margin:12px 0 12px 8px" }, "Fetch all upstreams")
-    fetchBtn.onclick = async () => {
-      fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…"
-      for (const r of repos) await api(apiUrl(`/api/repo/${r.id}/fetch`), { method: "POST" }).catch(() => {})
+    runBtn.onclick = () => busy(runBtn, "Running…", async () => {
+      const res = await api(apiUrl('/api/run-daily'), { method: "POST" })
+      const n = (s) => res.results.filter(r => r.status === s).length
+      toast(`Done: ${n("merged")} fast-forwarded, ${n("request_raised")} requests raised, ${n("error")} errors`, n("error") ? "error" : "ok")
       await loadRepos(list)
-    }
+    })
+    const fetchBtn = el("button", { class: "btn ghost", style: "margin:12px 0 12px 8px" }, "Fetch all upstreams")
+    fetchBtn.onclick = () => busy(fetchBtn, "Fetching…", async () => {
+      const failed = []
+      for (const r of repos) await api(apiUrl(`/api/repo/${r.id}/fetch`), { method: "POST" }).catch(() => failed.push(r.name || r.id))
+      if (failed.length) toast(`Fetch failed for ${failed.join(", ")}`, "error")
+      await loadRepos(list)
+    })
     list.append(runBtn, fetchBtn)
   } catch (e) { toast(String(e), "error") }
 }
@@ -139,48 +172,58 @@ async function repoCard(repo) {
 // ---- tagged items: commits/files the user pins to the chat so the model can read them
 const loadTags = (id) => { try { return JSON.parse(localStorage.getItem(`tags:${id}`) || "[]") } catch { return [] } }
 const saveTags = (id, t) => { try { localStorage.setItem(`tags:${id}`, JSON.stringify(t)) } catch {} }
+// The server reads at most this many attachments per message (llm.MAX_ATTACHMENTS).
+const MAX_TAGS = 6
 let refreshTray = () => {}
 let refreshCommits = () => {}
 function addTag(repoId, tag) {
   const t = loadTags(repoId)
-  if (!t.some(x => x.type === tag.type && x.id === tag.id)) { t.push(tag); saveTags(repoId, t) }
+  if (t.some(x => x.type === tag.type && x.id === tag.id)) return toast(`${tag.label} is already tagged`, "info")
+  if (t.length >= MAX_TAGS) return toast(`You can tag up to ${MAX_TAGS} items. Remove one from the chat tray first.`, "error")
+  t.push(tag)
+  saveTags(repoId, t)
   refreshTray()
   toast(`Tagged ${tag.label} for the chat`, "ok")
 }
 
 async function renderRepoPage(repoId) {
   const content = $("#content")
-  content.innerHTML = ""
+  content.replaceChildren(loading())
   let repo
   try { repo = await api(apiUrl(`/api/repo/${repoId}`)); }
-  catch { content.append(el("p", { class: "muted" }, "Repo not found")); return; }
+  catch (e) { content.replaceChildren(el("p", { class: "muted" }, e.status === 404 ? "Repo not found." : e.message)); return; }
+  content.innerHTML = ""
 
   content.append(el("a", { href: `${BASE}/repos`, style: "color:#9fb4ff", onclick: (e) => { e.preventDefault(); route('/repos') } }, "← All repos"))
 
-  const focusSel = el("select")
+  const focusSel = el("select", { id: `focus-${repoId}` })
   const branches = await repoBranches(repoId)
   for (const b of branches) focusSel.append(el("option", { value: b }, b))
   focusSel.value = repo.focus_branch
   focusSel.onchange = async () => {
-    await api(apiUrl(`/api/repo/${repoId}/focus`), { method: "POST", body: JSON.stringify({ branch: focusSel.value }) })
-    toast("Focus branch updated", "ok")
-    await renderRepoPage(repoId)
+    focusSel.disabled = true
+    try {
+      await api(apiUrl(`/api/repo/${repoId}/focus`), { method: "POST", body: JSON.stringify({ branch: focusSel.value }) })
+      toast("Focus branch updated", "ok")
+      await renderRepoPage(repoId)
+    } catch (e) { toast(e, "error"); focusSel.disabled = false }
   }
 
   content.append(el("div", { class: "grid", style: "margin-top:16px" },
     el("div", {}, el("h2", {}, repo.name || repoId), el("div", { class: "muted" }, repo.path)),
     el("div", {},
-      el("label", { style: "display:block;margin-bottom:4px" }, "Focus branch"),
+      el("label", { for: `focus-${repoId}`, style: "display:block;margin-bottom:4px" }, "Focus branch"),
       focusSel
     )
   ))
 
-  const upWrap = el("div", { style: "margin-top:20px" })
-  await refreshUpstreams(upWrap, repoId)
+  const upWrap = el("div", { style: "margin-top:20px" }, loading("Comparing upstreams…"))
+  content.append(upWrap)
+  await refreshUpstreams(upWrap, repoId).catch(e => upWrap.replaceChildren(el("p", { class: "muted" }, `Could not compare upstreams: ${e.message}`)))
 
   const chatWrap = el("div")
   const toolsWrap = el("div")
-  content.append(upWrap, el("div", { class: "grid repo-grid", style: "margin-top:20px;align-items:start" }, chatWrap, toolsWrap))
+  content.append(el("div", { class: "grid repo-grid", style: "margin-top:20px;align-items:start" }, chatWrap, toolsWrap))
   await Promise.all([renderChat(chatWrap, repoId, repo.focus_branch), renderTools(toolsWrap, repoId)])
 }
 
@@ -197,12 +240,11 @@ async function refreshUpstreams(wrap, repoId) {
   wrap.innerHTML = ""
   const git = cmp.git || {}
   const fetchAll = el("button", { class: "btn" }, "Fetch all")
-  fetchAll.onclick = async () => {
-    fetchAll.disabled = true; fetchAll.textContent = "Fetching…"
+  fetchAll.onclick = () => busy(fetchAll, "Fetching…", async () => {
     await api(apiUrl(`/api/repo/${repoId}/fetch`), { method: "POST" })
     await refreshUpstreams(wrap, repoId); refreshCommits()
-  }
-  wrap.append(el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:12px" },
+  })
+  wrap.append(el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap" },
     el("h3", { style: "margin:0" }, "Upstreams"),
     el("div", { class: "muted" }, git.dirty ? `${git.dirty} uncommitted change(s) in working tree` : "working tree clean"),
     fetchAll))
@@ -215,22 +257,23 @@ async function refreshUpstreams(wrap, repoId) {
           el("strong", {}, `${u.name} / ${u.branch} `),
           ...(u.enabled ? (c ? upstreamBadges(c) : []) : [badge("", "disabled")])
         ),
-        el("div", { style: "display:flex;gap:6px" },
-          el("button", { class: "btn ghost", onclick: async (e) => {
-            e.target.textContent = "Fetching…"
+        el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" },
+          el("button", { class: "btn ghost", "aria-label": `Fetch ${u.name}`, onclick: (e) => busy(e.currentTarget, "Fetching…", async () => {
             const r = await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}/rebase`), { method: "POST" })
             const err = (r.plan?.upstreams || []).find(x => x.name === u.name)?.conflict_detail
             if (err && /fatal|could not|unable/i.test(err)) toast(err, "error")
             await refreshUpstreams(wrap, repoId); refreshCommits()
-          } }, "Fetch"),
-          el("button", { class: "btn ghost", onclick: async () => {
+          }) }, "Fetch"),
+          el("button", { class: "btn ghost", "aria-label": `${u.enabled ? "Disable" : "Enable"} ${u.name}`, onclick: (e) => busy(e.currentTarget, null, async () => {
             await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}/enable`), { method: "POST", body: JSON.stringify({ enabled: !u.enabled }) })
             await refreshUpstreams(wrap, repoId)
-          } }, u.enabled ? "Disable" : "Enable"),
-          el("button", { class: "btn danger", onclick: async () => {
+          }) }, u.enabled ? "Disable" : "Enable"),
+          el("button", { class: "btn danger", "aria-label": `Remove ${u.name}`, onclick: (e) => {
             if (!confirm(`Remove upstream ${u.name}?`)) return
-            await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}`), { method: "DELETE" })
-            await refreshUpstreams(wrap, repoId)
+            return busy(e.currentTarget, "Removing…", async () => {
+              await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}`), { method: "DELETE" })
+              await refreshUpstreams(wrap, repoId)
+            })
           } }, "Remove")
         )
       ),
@@ -241,17 +284,17 @@ async function refreshUpstreams(wrap, repoId) {
     )
     wrap.append(upEl)
   }
-  const nameIn = el("input", { placeholder: "remote name (e.g. upstream)", style: "width:180px" })
-  const urlIn = el("input", { placeholder: "https://github.com/org/repo.git", style: "width:320px" })
-  const branchIn = el("input", { placeholder: "its branch (default: focus)", style: "width:170px", title: "The upstream's branch to compare against, e.g. main or master" })
+  const nameIn = el("input", { placeholder: "remote name (e.g. upstream)", "aria-label": "Remote name", style: "width:180px" })
+  const urlIn = el("input", { placeholder: "https://github.com/org/repo.git", "aria-label": "Remote URL", style: "width:320px" })
+  const branchIn = el("input", { placeholder: "its branch (default: focus)", "aria-label": "Upstream branch", style: "width:170px", title: "The upstream's branch to compare against, e.g. main or master" })
   const addUpBtn = el("button", { class: "btn", style: "align-self:flex-end" }, "Add upstream")
-  addUpBtn.onclick = async () => {
-    try {
-      const res = await api(apiUrl(`/api/repo/${repoId}/upstream`), { method: "POST", body: JSON.stringify({ name: nameIn.value.trim(), url: urlIn.value.trim(), branch: branchIn.value.trim() || null }) })
-      if (res.ok === false) return toast(res.error || "Could not add upstream", "error")
+  addUpBtn.onclick = () => {
+    if (!nameIn.value.trim() || !urlIn.value.trim()) return toast("Enter a remote name and URL", "error")
+    return busy(addUpBtn, "Adding…", async () => {
+      await api(apiUrl(`/api/repo/${repoId}/upstream`), { method: "POST", body: JSON.stringify({ name: nameIn.value.trim(), url: urlIn.value.trim(), branch: branchIn.value.trim() || null }) })
       toast("Upstream added. Press Fetch to compare.", "ok")
       await refreshUpstreams(wrap, repoId)
-    } catch (e) { toast(String(e), "error") }
+    })
   }
   wrap.append(el("div", { style: "display:flex;gap:8px;margin-top:12px;flex-wrap:wrap" }, nameIn, urlIn, branchIn, addUpBtn))
 }
@@ -259,51 +302,58 @@ async function refreshUpstreams(wrap, repoId) {
 // Chat: one conversation per session. "New chat" resets what the model sees of
 // the conversation; repo facts, memory and tagged commits/files go with every message.
 async function renderChat(wrap, repoId, focus, sessionId) {
-  wrap.innerHTML = ""
+  wrap.replaceChildren(loading("Loading chat…"))
   const sessions = await api(apiUrl(`/api/repo/${repoId}/sessions`))
-  const sessSel = el("select", { style: "max-width:240px" })
+  const sessSel = el("select", { style: "max-width:240px", "aria-label": "Chat session" })
   for (const s of sessions) sessSel.append(el("option", { value: s.id }, `${s.title || "New chat"} · ${s.count} msgs`))
   const hist = await api(apiUrl(`/api/chat/${repoId}` + (sessionId ? `?session=${sessionId}` : "")))
   if (![...sessSel.options].some(o => o.value === hist.session)) sessSel.append(el("option", { value: hist.session }, "New chat · 0 msgs"))
   sessSel.value = hist.session
+  wrap.innerHTML = ""
   sessSel.onchange = async () => {
     await api(apiUrl(`/api/repo/${repoId}/sessions`), { method: "POST", body: JSON.stringify({ session: sessSel.value }) })
     await renderChat(wrap, repoId, focus, sessSel.value)
   }
   const newBtn = el("button", { class: "btn ghost", title: "Start a new conversation. The repo memory is kept." }, "New chat")
-  newBtn.onclick = async () => {
+  newBtn.onclick = () => busy(newBtn, null, async () => {
     const res = await api(apiUrl(`/api/repo/${repoId}/sessions`), { method: "POST", body: "{}" })
     await renderChat(wrap, repoId, focus, res.session)
-  }
+  })
   const delBtn = el("button", { class: "btn ghost", title: "Delete this conversation (memory is kept)" }, "Delete chat")
-  delBtn.onclick = async () => {
+  delBtn.onclick = () => {
     if (!confirm("Delete this chat? The repo memory is kept.")) return
-    const res = await api(apiUrl(`/api/repo/${repoId}/sessions/${hist.session}`), { method: "DELETE" })
-    await renderChat(wrap, repoId, focus, res.active)
+    return busy(delBtn, "Deleting…", async () => {
+      const res = await api(apiUrl(`/api/repo/${repoId}/sessions/${hist.session}`), { method: "DELETE" })
+      await renderChat(wrap, repoId, focus, res.active)
+    })
   }
   wrap.append(
     el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap" },
       el("h3", { style: "margin:0" }, `Chat · ${focus}`),
-      el("div", { style: "display:flex;gap:6px" }, sessSel, newBtn, delBtn)),
+      el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" }, sessSel, newBtn, delBtn)),
   )
-  const box = el("div", { class: "chat-box", style: "margin-top:8px;height:420px" })
-  const msgIn = el("textarea", { placeholder: "Ask about this repo… (Enter to send, Shift+Enter for a new line)", rows: "2", style: "width:100%;resize:vertical;margin-top:8px" })
+  const box = el("div", { class: "chat-box", style: "margin-top:8px", role: "log", "aria-live": "polite", "aria-label": "Conversation", tabindex: "0" })
+  const msgIn = el("textarea", { placeholder: "Ask about this repo… (Enter to send, Shift+Enter for a new line)", "aria-label": "Message", rows: "2", style: "width:100%;resize:vertical;margin-top:8px" })
   const sendBtn = el("button", { class: "btn", style: "margin-top:8px" }, "Send")
   const tray = el("div", { class: "tray" })
   refreshTray = () => {
     tray.innerHTML = ""
     const tags = loadTags(repoId)
     if (!tags.length) { tray.append(el("span", { class: "muted" }, "Nothing tagged. Use Tag on a commit or file so the model can read it.")); return }
-    tray.append(el("span", { class: "muted" }, "Sent with every message:"))
+    tray.append(el("span", { class: "muted" }, `Sent with every message (${tags.length}/${MAX_TAGS}):`))
     for (const t of tags) {
-      const x = el("button", { class: "chip-x", title: "Remove" }, "×")
+      const x = el("button", { class: "chip-x", title: "Remove", "aria-label": `Remove ${t.label}` }, "×")
       x.onclick = () => { saveTags(repoId, loadTags(repoId).filter(y => !(y.type === t.type && y.id === t.id))); refreshTray() }
       tray.append(el("span", { class: "chip" }, `${t.type === "commit" ? "◆" : "▤"} ${t.label}`, x))
     }
   }
   refreshTray()
+  // Replies are Markdown; renderMarkdown escapes everything first (see md.js).
+  const setReply = (d, text) => { d.innerHTML = renderMarkdown(text) }
   const addMsg = (m) => {
-    const d = el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.error ? " err" : ""}` }, m.content)
+    const d = el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.error ? " err" : ""}` })
+    if (m.role === "user" || m.error) d.textContent = m.content
+    else setReply(d, m.content)
     if (m.attachments?.length) d.append(el("div", { class: "muted", style: "margin-top:4px;font-size:12px" }, "📎 " + m.attachments.map(a => a.label).join(", ")))
     box.append(d)
     return d
@@ -314,17 +364,19 @@ async function renderChat(wrap, repoId, focus, sessionId) {
     const attachments = loadTags(repoId)
     msgIn.value = ""
     sendBtn.disabled = true
+    sendBtn.textContent = "Sending…"
     if (!hist.messages?.length) box.querySelector("p.muted")?.remove()
     addMsg({ role: "user", content: text, attachments })
-    const replyBox = el("div", { class: "msg bot" }, "Thinking…")
+    const replyBox = el("div", { class: "msg bot" }, loading("Thinking…"))
     box.append(replyBox)
     box.scrollTop = box.scrollHeight
     try {
       const res = await api(apiUrl(`/api/repo/${repoId}/chat`), { method: "POST", body: JSON.stringify({ message: text, session: hist.session, attachments }) })
-      replyBox.textContent = res.ok ? res.reply : `Error: ${res.error}`
-      if (!res.ok) replyBox.classList.add("err")
-    } catch (e) { replyBox.textContent = `Error: ${e}`; replyBox.classList.add("err") }
+      if (res.ok) setReply(replyBox, res.reply)
+      else { replyBox.textContent = `Error: ${res.error}`; replyBox.classList.add("err") }
+    } catch (e) { replyBox.textContent = `Error: ${e.message}`; replyBox.classList.add("err") }
     sendBtn.disabled = false
+    sendBtn.textContent = "Send"
     box.scrollTop = box.scrollHeight
   }
   msgIn.addEventListener("keydown", (e) => {
@@ -339,17 +391,40 @@ async function renderChat(wrap, repoId, focus, sessionId) {
 // Right-hand tools: commits, files, memory.
 function renderTools(wrap, repoId) {
   const names = ["Commits", "Files", "Memory"]
-  const bar = el("div", { class: "tabs" })
+  const bar = el("div", { class: "tabs", role: "tablist", "aria-label": "Repo tools" })
   const panes = {}
+  const tabs = {}
   const built = {}
   const builders = { Commits: renderCommits, Files: renderFiles, Memory: renderMemory }
-  const show = async (n) => {
-    for (const k of names) { panes[k].style.display = k === n ? "" : "none"; bar.children[names.indexOf(k)].classList.toggle("active", k === n) }
-    if (!built[n]) { built[n] = true; await builders[n](panes[n], repoId) }
+  const show = async (n, focus = false) => {
+    for (const k of names) {
+      const on = k === n
+      panes[k].hidden = !on
+      tabs[k].classList.toggle("active", on)
+      tabs[k].setAttribute("aria-selected", String(on))
+      tabs[k].tabIndex = on ? 0 : -1
+    }
+    if (focus) tabs[n].focus()
+    if (!built[n]) {
+      built[n] = true
+      panes[n].replaceChildren(loading())
+      try { await builders[n](panes[n], repoId) }
+      catch (e) { built[n] = false; panes[n].replaceChildren(el("p", { class: "muted" }, `Could not load ${n.toLowerCase()}: ${e.message}`)) }
+    }
   }
   for (const n of names) {
-    panes[n] = el("div", { style: "display:none" })
-    bar.append(el("button", { class: "tab", onclick: () => show(n) }, n))
+    const id = `tab-${repoId}-${n}`
+    panes[n] = el("div", { role: "tabpanel", id: `${id}-panel`, "aria-labelledby": id, hidden: "" })
+    tabs[n] = el("button", { class: "tab", role: "tab", id, "aria-controls": `${id}-panel`, onclick: () => show(n) }, n)
+    // Arrow keys move between tabs (WAI-ARIA tabs pattern).
+    tabs[n].addEventListener("keydown", (e) => {
+      const i = names.indexOf(n)
+      const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: names.length - 1 }[e.key]
+      if (next === undefined) return
+      e.preventDefault()
+      show(names[(next + names.length) % names.length], true)
+    })
+    bar.append(tabs[n])
   }
   wrap.append(bar, ...names.map(n => panes[n]))
   return show("Commits")
@@ -358,31 +433,35 @@ function renderTools(wrap, repoId) {
 // Commits: what the upstream has that you lack, what only you have, or everything.
 async function renderCommits(wrap, repoId) {
   const repo = await api(apiUrl(`/api/repo/${repoId}`))
-  const viewSel = el("select", {},
+  wrap.innerHTML = ""
+  const viewSel = el("select", { "aria-label": "Which commits" },
     el("option", { value: "behind" }, "Missing from upstream (behind)"),
     el("option", { value: "ahead" }, "Only on my branch (ahead)"),
     el("option", { value: "all" }, "All commits"))
-  const upSel = el("select", {}, ...(repo.upstreams || []).map(u => el("option", { value: u.name }, u.name)))
+  const upSel = el("select", { "aria-label": "Upstream" }, ...(repo.upstreams || []).map(u => el("option", { value: u.name }, u.name)))
   // open on the upstream that has the most commits you are missing
   const cmp = await api(apiUrl(`/api/repo/${repoId}/compare`)).catch(() => ({}))
   const worst = [...(cmp.plan?.upstreams || [])].sort((a, b) => b.behind - a.behind)[0]
   if (worst && worst.behind) upSel.value = worst.name
-  const qIn = el("input", { placeholder: "Search commit messages…", style: "flex:1;min-width:0" })
+  const qIn = el("input", { placeholder: "Search commit messages…", "aria-label": "Search commit messages", style: "flex:1;min-width:120px" })
   const list = el("div", { class: "mem-list", style: "max-height:520px" })
   const more = el("button", { class: "btn ghost", style: "margin-top:6px;display:none" }, "Load more")
   const info = el("div", { class: "muted", style: "margin-top:6px" })
   let skip = 0
   const load = async (reset) => {
-    if (reset) { skip = 0; list.innerHTML = "" }
+    if (reset) { skip = 0; list.replaceChildren(loading()) }
     const q = `view=${viewSel.value}&upstream=${encodeURIComponent(upSel.value)}&skip=${skip}&limit=50&q=${encodeURIComponent(qIn.value.trim())}`
-    const res = await api(apiUrl(`/api/repo/${repoId}/commits?${q}`))
+    let res
+    try { res = await api(apiUrl(`/api/repo/${repoId}/commits?${q}`)) }
+    catch (e) { res = { ok: false, error: e.message } }
+    list.querySelector(".loading")?.remove()
     if (!res.ok) { info.textContent = res.error; more.style.display = "none"; return }
     info.textContent = ""
     for (const c of res.items) {
-      const tag = el("button", { class: "btn ghost", title: "Attach to the chat" }, "Tag")
+      const tag = el("button", { class: "btn ghost", title: "Attach to the chat", "aria-label": `Tag commit ${c.sha} for the chat` }, "Tag")
       tag.onclick = () => addTag(repoId, { type: "commit", id: c.full, label: `${c.sha} ${c.subject.slice(0, 40)}` })
-      const view = el("button", { class: "btn ghost" }, "View")
-      view.onclick = () => showCommit(repoId, c.full)
+      const view = el("button", { class: "btn ghost", "aria-label": `View commit ${c.sha}` }, "View")
+      view.onclick = () => busy(view, null, () => showCommit(repoId, c.full))
       list.append(el("div", { class: "mem" },
         el("code", { style: "color:#9fb4ff" }, c.sha),
         el("div", { style: "flex:1;min-width:0" }, el("div", {}, c.subject), el("div", { class: "muted", style: "font-size:12px" }, `${c.author} · ${c.date.slice(0, 10)}`)),
@@ -393,7 +472,7 @@ async function renderCommits(wrap, repoId) {
     more.style.display = res.more ? "" : "none"
   }
   refreshCommits = () => load(true)
-  more.onclick = () => load(false)
+  more.onclick = () => busy(more, "Loading…", () => load(false))
   viewSel.onchange = () => load(true)
   upSel.onchange = () => load(true)
   qIn.addEventListener("keydown", (e) => { if (e.key === "Enter") load(true) })
@@ -402,20 +481,32 @@ async function renderCommits(wrap, repoId) {
 }
 
 async function showCommit(repoId, sha) {
-  const d = await api(apiUrl(`/api/repo/${repoId}/commit/${sha}`))
-  const close = () => { ov.remove(); document.removeEventListener("keydown", onKey) }
-  const onKey = (e) => { if (e.key === "Escape") close() }
-  const patch = el("pre", { class: "code-pre" })
+  const d = await api(apiUrl(`/api/repo/${repoId}/commit/${sha}`)).catch(e => ({ ok: false, error: e.message }))
+  const opener = document.activeElement
+  const close = () => { ov.remove(); document.removeEventListener("keydown", onKey); opener?.focus?.() }
+  // Escape closes; Tab stays inside the dialog (it is modal).
+  const onKey = (e) => {
+    if (e.key === "Escape") return close()
+    if (e.key !== "Tab") return
+    const f = [...ov.querySelectorAll("button, [href], input, [tabindex]:not([tabindex='-1'])")].filter(x => !x.disabled)
+    if (!f.length) return
+    const first = f[0], last = f[f.length - 1]
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus() }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
+  }
+  const patch = el("pre", { class: "code-pre", tabindex: "0", "aria-label": "Patch" })
   for (const line of (d.patch || "").split("\n")) {
     const cls = line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "del" : line.startsWith("@@") ? "hunk" : line.startsWith("diff ") ? "file" : ""
     patch.append(el("div", { class: `dl ${cls}` }, line || " "))
   }
   const tag = el("button", { class: "btn" }, "Tag for chat")
   tag.onclick = () => { addTag(repoId, { type: "commit", id: d.sha, label: `${d.sha.slice(0, 8)} ${(d.message || "").split("\n")[0].slice(0, 40)}` }) }
+  const closeBtn = el("button", { class: "btn ghost", onclick: close }, "Close")
+  const titleId = `commit-title-${sha.slice(0, 10)}`
   const ov = el("div", { class: "overlay", onclick: (e) => { if (e.target === ov) close() } },
-    el("div", { class: "overlay-panel" },
-      el("div", { style: "display:flex;justify-content:space-between;gap:8px" },
-        el("h3", { style: "margin:0" }, d.ok ? d.sha.slice(0, 10) : "Commit"), el("div", { style: "display:flex;gap:6px" }, tag, el("button", { class: "btn ghost", onclick: close }, "Close"))),
+    el("div", { class: "overlay-panel", role: "dialog", "aria-modal": "true", "aria-labelledby": titleId },
+      el("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap" },
+        el("h3", { style: "margin:0", id: titleId }, d.ok ? `Commit ${d.sha.slice(0, 10)}` : "Commit"), el("div", { style: "display:flex;gap:6px" }, d.ok ? tag : null, closeBtn)),
       d.ok ? el("div", {},
         el("div", { class: "muted" }, `${d.author} · ${(d.date || "").slice(0, 10)}`),
         el("pre", { style: "white-space:pre-wrap;margin:8px 0" }, d.message),
@@ -423,22 +514,25 @@ async function showCommit(repoId, sha) {
         patch, d.truncated ? el("p", { class: "muted" }, "Patch truncated.") : null) : el("p", {}, d.error || "Not found")))
   document.addEventListener("keydown", onKey)
   document.body.append(ov)
+  closeBtn.focus()
 }
 
 // Files: a read-only tree plus a line-numbered viewer with find.
 async function renderFiles(wrap, repoId) {
-  const tree = el("div", { class: "tree" })
+  const tree = el("div", { class: "tree", role: "tree", "aria-label": "Repository files" }, loading())
   const viewer = el("div", { class: "viewer" }, el("p", { class: "muted", style: "padding:12px" }, "Pick a file."))
+  wrap.innerHTML = ""
   wrap.append(el("div", { class: "files" }, tree, viewer))
   const LH = 18
   const openFile = async (path) => {
-    const f = await api(apiUrl(`/api/repo/${repoId}/file?path=${encodeURIComponent(path)}`)).catch(() => ({ ok: false, error: "could not read file" }))
+    viewer.replaceChildren(loading(`Opening ${path}…`))
+    const f = await api(apiUrl(`/api/repo/${repoId}/file?path=${encodeURIComponent(path)}`)).catch((e) => ({ ok: false, error: e.status === 404 ? "file not found" : e.message }))
     viewer.innerHTML = ""
     const tag = el("button", { class: "btn ghost" }, "Tag for chat")
     tag.onclick = () => addTag(repoId, { type: "file", id: path, label: path.split("/").slice(-2).join("/") })
     const copy = el("button", { class: "btn ghost" }, "Copy path")
     copy.onclick = () => { navigator.clipboard?.writeText(path); toast("Path copied", "ok") }
-    const findIn = el("input", { placeholder: "Find…", style: "width:110px" })
+    const findIn = el("input", { placeholder: "Find…", "aria-label": "Find in file (Enter for next)", style: "width:110px" })
     const head = el("div", { class: "viewer-head" }, el("strong", { style: "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis" }, path), findIn, tag, copy)
     viewer.append(head)
     if (!f.ok) { viewer.append(el("p", { class: "muted", style: "padding:12px" }, f.error || "cannot show this file")); return }
@@ -446,7 +540,7 @@ async function renderFiles(wrap, repoId) {
     const gutter = el("pre", { class: "gutter" }, lines.map((_, i) => i + 1).join("\n"))
     const src = el("pre", { class: "src" }, f.content)
     const hl = el("div", { class: "hl", style: "display:none" })
-    const body = el("div", { class: "code-body" }, el("div", { class: "code-inner" }, gutter, src, hl))
+    const body = el("div", { class: "code-body", tabindex: "0", "aria-label": `Contents of ${path}` }, el("div", { class: "code-inner" }, gutter, src, hl))
     viewer.append(body, el("div", { class: "muted", style: "padding:4px 8px;font-size:12px" }, `${lines.length} lines`))
     let last = -1
     const find = () => {
@@ -461,49 +555,81 @@ async function renderFiles(wrap, repoId) {
     }
     findIn.addEventListener("keydown", (e) => { if (e.key === "Enter") find() })
   }
+  // Keyboard: Up/Down move, Right opens a folder, Left closes it, Enter/Space activates.
+  const rows = () => $$(".trow", tree).filter(r => r.offsetParent !== null)
+  const focusRow = (r) => { if (!r) return; $$(".trow", tree).forEach(x => x.tabIndex = -1); r.tabIndex = 0; r.focus() }
+  tree.addEventListener("keydown", (ev) => {
+    const row = ev.target.closest(".trow")
+    if (!row) return
+    const all = rows()
+    const i = all.indexOf(row)
+    const isDir = row.hasAttribute("aria-expanded")
+    const open = row.getAttribute("aria-expanded") === "true"
+    if (ev.key === "ArrowDown") focusRow(all[i + 1])
+    else if (ev.key === "ArrowUp") focusRow(all[i - 1])
+    else if (ev.key === "Home") focusRow(all[0])
+    else if (ev.key === "End") focusRow(all[all.length - 1])
+    else if (ev.key === "ArrowRight" && isDir && !open) row.click()
+    else if (ev.key === "ArrowLeft" && isDir && open) row.click()
+    else if (ev.key === "Enter" || ev.key === " ") row.click()
+    else return
+    ev.preventDefault()
+  })
   const loadDir = async (path, container, depth) => {
-    const res = await api(apiUrl(`/api/repo/${repoId}/tree?path=${encodeURIComponent(path)}`))
+    let res
+    try { res = await api(apiUrl(`/api/repo/${repoId}/tree?path=${encodeURIComponent(path)}`)) }
+    catch (e) { container.replaceChildren(el("div", { class: "muted", style: "padding:6px 8px" }, e.message)); return }
     container.innerHTML = ""
     for (const e of res.entries || []) {
-      const row = el("div", { class: "trow", style: `padding-left:${8 + depth * 14}px` }, e.type === "dir" ? "▸ " : "· ", e.name)
+      const row = el("div", { class: "trow", role: "treeitem", tabindex: "-1", "aria-level": String(depth + 1), style: `padding-left:${8 + depth * 14}px` }, e.type === "dir" ? "▸ " : "· ", e.name)
       container.append(row)
       if (e.type === "dir") {
-        const kids = el("div", { style: "display:none" })
+        const kids = el("div", { role: "group", hidden: "" })
+        row.setAttribute("aria-expanded", "false")
         container.append(kids)
-        let open = false
         row.onclick = async () => {
-          open = !open
+          const open = row.getAttribute("aria-expanded") !== "true"
+          row.setAttribute("aria-expanded", String(open))
           row.firstChild.textContent = open ? "▾ " : "▸ "
-          kids.style.display = open ? "" : "none"
-          if (open && !kids.children.length) await loadDir(e.path, kids, depth + 1)
+          kids.hidden = !open
+          if (open && !kids.children.length) { kids.replaceChildren(loading()); await loadDir(e.path, kids, depth + 1) }
         }
       } else {
-        row.onclick = () => { $$(".trow.sel", tree).forEach(r => r.classList.remove("sel")); row.classList.add("sel"); openFile(e.path) }
+        row.onclick = () => {
+          $$(".trow.sel", tree).forEach(r => { r.classList.remove("sel"); r.removeAttribute("aria-selected") })
+          row.classList.add("sel"); row.setAttribute("aria-selected", "true")
+          openFile(e.path)
+        }
       }
     }
   }
   await loadDir("", tree, 0)
+  const first = tree.querySelector(".trow")
+  if (first) first.tabIndex = 0
 }
 
 // Memory: what the assistant remembers about this repo (mem0). Search can span
 // every watched repo to find similar changes elsewhere.
 async function renderMemory(wrap, repoId) {
   wrap.innerHTML = ""
-  const head = el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:8px" }, el("h3", { style: "margin:0" }, "Memory"))
+  const head = el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap" }, el("h3", { style: "margin:0" }, "Memory"))
   const statusEl = el("div", { class: "muted", style: "margin-top:4px" }, "Loading…")
-  const qIn = el("input", { placeholder: "Search memories…", style: "flex:1;min-width:0" })
-  const scopeSel = el("select", {}, el("option", { value: "repo" }, "This repo"), el("option", { value: "all" }, "All repos"))
+  const qIn = el("input", { placeholder: "Search memories…", "aria-label": "Search memories", style: "flex:1;min-width:0" })
+  const scopeSel = el("select", { "aria-label": "Search scope" }, el("option", { value: "repo" }, "This repo"), el("option", { value: "all" }, "All repos"))
   const list = el("div", { class: "mem-list" })
   const load = async () => {
     const q = qIn.value.trim()
-    const res = await api(apiUrl(`/api/repo/${repoId}/memory?q=${encodeURIComponent(q)}&scope=${scopeSel.value}`))
+    list.replaceChildren(loading(q ? "Searching…" : "Loading…"))
+    let res
+    try { res = await api(apiUrl(`/api/repo/${repoId}/memory?q=${encodeURIComponent(q)}&scope=${scopeSel.value}`)) }
+    catch (e) { res = { ok: false, error: e.message, items: [] } }
     statusEl.textContent = !res.ok
       ? `Memory unavailable: ${res.error || "unknown error"}`
       : `${res.items.length} ${q ? "matches" : "memories"} · embeddings: ${res.embed_provider} ${res.embed_model} · auto-clean ${res.auto_cleanup ? "on" : "off"}`
     list.innerHTML = ""
     for (const m of res.items || []) {
-      const del = el("button", { class: "btn ghost mem-del", title: "Forget this" }, "×")
-      del.onclick = async () => { await api(apiUrl(`/api/memory/${m.id}`), { method: "DELETE" }); await load() }
+      const del = el("button", { class: "btn ghost mem-del", title: "Forget this", "aria-label": `Forget: ${m.memory.slice(0, 60)}` }, "×")
+      del.onclick = () => busy(del, null, async () => { await api(apiUrl(`/api/memory/${m.id}`), { method: "DELETE" }); await load() })
       list.append(el("div", { class: "mem" },
         el("div", {},
           el("span", { class: `badge kind-${m.kind}` }, m.kind),
@@ -515,30 +641,26 @@ async function renderMemory(wrap, repoId) {
   }
   qIn.addEventListener("keydown", (e) => { if (e.key === "Enter") load() })
   scopeSel.onchange = load
-  const noteIn = el("input", { placeholder: "Add a note to remember…", style: "flex:1;min-width:0" })
+  const noteIn = el("input", { placeholder: "Add a note to remember…", "aria-label": "Note to remember", style: "flex:1;min-width:0" })
   const noteBtn = el("button", { class: "btn ghost" }, "Remember")
-  noteBtn.onclick = async () => {
+  noteBtn.onclick = () => {
     if (!noteIn.value.trim()) return
-    await api(apiUrl(`/api/repo/${repoId}/memory`), { method: "POST", body: JSON.stringify({ text: noteIn.value.trim() }) })
-    noteIn.value = ""
-    await load()
+    return busy(noteBtn, "Saving…", async () => {
+      await api(apiUrl(`/api/repo/${repoId}/memory`), { method: "POST", body: JSON.stringify({ text: noteIn.value.trim() }) })
+      noteIn.value = ""
+      await load()
+    })
   }
+  noteIn.addEventListener("keydown", (e) => { if (e.key === "Enter") noteBtn.click() })
   const idxBtn = el("button", { class: "btn ghost", title: "Store the last 50 commits (subject + files) so related changes can be found by meaning" }, "Index commits")
-  idxBtn.onclick = async () => {
-    idxBtn.disabled = true
-    idxBtn.textContent = "Indexing…"
-    try {
-      const res = await api(apiUrl(`/api/repo/${repoId}/memory/index-commits`), { method: "POST", body: "{}" })
-      toast(res.ok ? `Indexed ${res.added} new commits (${res.total} total)` : "Indexing failed", res.ok ? "ok" : "error")
-    } catch (e) { toast(String(e), "error") }
-    idxBtn.disabled = false
-    idxBtn.textContent = "Index commits"
+  idxBtn.onclick = () => busy(idxBtn, "Indexing…", async () => {
+    const res = await api(apiUrl(`/api/repo/${repoId}/memory/index-commits`), { method: "POST", body: "{}" })
+    toast(`Indexed ${res.added} new commits (${res.total} total)`, "ok")
     await load()
-  }
+  })
   const cleanBtn = el("button", { class: "btn ghost", title: "Remove duplicates, junk and old events. Also runs automatically." }, "Clean up")
-  cleanBtn.onclick = async () => {
-    cleanBtn.disabled = true
-    try {
+  cleanBtn.onclick = () => busy(cleanBtn, "Checking…", async () => {
+    {
       // Preview first; deletion has no undo, so only the previewed ids are removed.
       const plan = await api(apiUrl(`/api/repo/${repoId}/memory/cleanup`), { method: "POST", body: JSON.stringify({ dry_run: true }) })
       if (!plan.items?.length) toast("Already clean", "ok")
@@ -550,11 +672,10 @@ async function renderMemory(wrap, repoId) {
           toast(`Removed ${res.removed}, ${res.kept} kept`, "ok")
         }
       }
-    } catch (e) { toast(String(e), "error") }
-    cleanBtn.disabled = false
+    }
     await load()
-  }
-  head.append(el("div", { style: "display:flex;gap:6px" }, cleanBtn, idxBtn))
+  })
+  head.append(el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" }, cleanBtn, idxBtn))
   wrap.append(head, statusEl,
     el("div", { style: "display:flex;gap:6px;margin-top:8px" }, qIn, scopeSel),
     el("div", { style: "display:flex;gap:6px;margin-top:6px" }, noteIn, noteBtn),
@@ -566,23 +687,22 @@ async function renderRequests() {
   const content = $("#content")
   content.innerHTML = ""
   content.append(el("h2", {}, "Approval Requests"))
-  const wrap = el("div")
+  const wrap = el("div", {}, loading())
   content.append(wrap)
   try {
     const reqs = (await api(apiUrl('/api/requests'))).slice().reverse()  // newest first
+    wrap.innerHTML = ""
     if (!reqs.length) { wrap.append(el("p", { class: "muted" }, "No requests. The daily check raises one when a merge needs your approval.")); return; }
     for (const r of reqs) {
       const pending = r.status === "pending"
-      const commentIn = el("input", { placeholder: "add a note…", style: "width:220px" })
-      const decide = async (decision, btn) => {
-        btn.disabled = true
-        if (decision === "approve") btn.textContent = "Merging…"
+      const commentIn = el("input", { placeholder: "add a note…", "aria-label": `Note for ${r.repo_name || r.repo_id}`, style: "width:220px" })
+      const decide = (decision, btn) => busy(btn, decision === "approve" ? "Merging…" : "Denying…", async () => {
         const res = await api(apiUrl(`/api/request/${encodeURIComponent(r.id)}/decide`), { method: "POST", body: JSON.stringify({ decision, comment: commentIn.value }) })
         const detail = (res.request?.result || []).map(o => `${o.upstream}: ${o.detail}`).join("; ")
         if (decision === "deny") toast("Denied", "info")
         else toast(res.ok ? `Merged. ${detail}` : `Not merged. ${res.error || detail}`, res.ok ? "ok" : "error")
         await renderRequests()
-      }
+      })
       const approveBtn = el("button", { class: "btn" }, "Approve and merge")
       approveBtn.onclick = () => decide("approve", approveBtn)
       const denyBtn = el("button", { class: "btn danger" }, "Deny")
@@ -607,25 +727,28 @@ async function renderRequests() {
           el("span", { class: "muted", style: "font-size:12px" }, "Approve merges into your local branch. Conflicts are never auto-resolved; the merge is aborted instead. Nothing is pushed.")) : null
       ))
     }
-  } catch (e) { toast(String(e), "error") }
+  } catch (e) { wrap.replaceChildren(el("p", { class: "muted" }, `Could not load requests: ${e.message}`)) }
 }
 
 async function renderSettings() {
   const content = $("#content")
   content.innerHTML = ""
   content.append(el("h2", {}, "LLM Settings"))
-  const card = el("div", { class: "repo-card", style: "margin-top:16px" })
+  const card = el("div", { class: "repo-card", style: "margin-top:16px" }, loading())
   content.append(card)
   try {
     const local = await api(apiUrl('/api/settings'))
+    card.innerHTML = ""
     const llm = local.llm || {}
     const urlIn = el("input", { value: llm.base_url || "http://127.0.0.1:8080/v1", placeholder: "http://host:8080/v1", style: "width:420px" })
-    const keyIn = el("input", { value: llm.api_key || "", type: "password", placeholder: "optional", style: "width:320px" })
+    // The server only ever sends a masked key ("••••1234"); sending it back unchanged keeps the saved key.
+    const keyIn = el("input", { value: llm.api_key || "", type: "password", autocomplete: "off", placeholder: "optional", style: "width:320px" })
     const modelSel = el("select", { style: "width:420px" })
     const modelStatus = el("div", { class: "muted" }, "")
     const loadModels = async () => {
+      modelStatus.textContent = "Loading models…"
       const q = `?base_url=${encodeURIComponent(urlIn.value)}&api_key=${encodeURIComponent(keyIn.value)}`
-      const r = await fetch(apiUrl('/api/models') + q).then(r => r.json().catch(() => ({ data: [], error: "bad response" })))
+      const r = await api(apiUrl('/api/models') + q).catch(e => ({ data: [], error: e.message }))
       const ids = (r.data || []).map(m => m.id)
       if (llm.model && !ids.includes(llm.model)) ids.unshift(llm.model)
       modelSel.innerHTML = ""
@@ -636,20 +759,21 @@ async function renderSettings() {
     let modelSelValue = llm.model
     modelSel.onchange = () => { modelSelValue = modelSel.value }
     const refreshBtn = el("button", { class: "btn ghost" }, "Refresh models")
-    refreshBtn.onclick = loadModels
-    const saveBtn = el("button", { class: "btn", style: "margin-top:8px" }, "Save")
-    saveBtn.onclick = async () => {
-      await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ llm: { model: modelSel.value, base_url: urlIn.value.trim(), api_key: keyIn.value } }) })
+    refreshBtn.onclick = () => busy(refreshBtn, "Loading…", loadModels)
+    const saveBtn = el("button", { class: "btn" }, "Save")
+    saveBtn.onclick = () => busy(saveBtn, "Saving…", async () => {
+      const res = await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ llm: { model: modelSel.value, base_url: urlIn.value.trim(), api_key: keyIn.value } }) })
+      keyIn.value = res.settings?.llm?.api_key || ""
       toast("Model connection saved", "ok")
-    }
+    })
     card.append(
       el("div", { style: "display:flex;flex-direction:column;gap:12px" },
         el("div", { class: "muted" }, "Any OpenAI-compatible server (llama-swap, llama-server, Argos). Independent of hermes-agent."),
-        el("label", {}, "Server URL", urlIn),
-        el("label", {}, "API key", keyIn),
-        el("label", {}, "Model", modelSel),
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Server URL", urlIn),
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "API key", keyIn),
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Model", modelSel),
         modelStatus,
-        el("div", { style: "display:flex;gap:8px" }, refreshBtn, saveBtn)
+        el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, refreshBtn, saveBtn)
       )
     )
     loadModels()
@@ -661,19 +785,19 @@ async function renderSettings() {
     const embUrlIn = el("input", { value: st.embed_base_url || "", placeholder: "http://host:8082/v1 (server only)", style: "width:420px" })
     const memSave = el("button", { class: "btn", style: "margin-top:8px" }, "Save & reload memory")
     const memStatus = el("div", { class: "muted" }, st.ok ? "Memory is running." : `Memory not running: ${st.error || "not started"}`)
-    memSave.onclick = async () => {
+    memSave.onclick = () => busy(memSave, "Reloading memory…", async () => {
       await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ memory: { ...mem, embed_provider: provSel.value, embed_model: embModelIn.value, embed_base_url: embUrlIn.value } }) })
       const r = await api(apiUrl("/api/memory/status"))
       memStatus.textContent = r.ok ? "Memory is running." : `Memory not running: ${r.error}`
       toast(r.ok ? "Memory reloaded" : "Memory failed to start", r.ok ? "ok" : "error")
-    }
+    })
     card.append(el("h4", { style: "margin-top:20px" }, "Memory embeddings (mem0)"),
       el("div", { style: "display:flex;flex-direction:column;gap:12px" },
-        el("label", {}, "Provider ", provSel),
-        el("label", {}, "Embedding model", embModelIn),
-        el("label", {}, "Embedding server URL", embUrlIn),
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Provider", provSel),
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Embedding model", embModelIn),
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Embedding server URL", embUrlIn),
         memStatus, memSave))
-  } catch (e) { toast(String(e), "error") }
+  } catch (e) { card.replaceChildren(el("p", { class: "muted" }, `Could not load settings: ${e.message}`)) }
 }
 
 function currentView() {

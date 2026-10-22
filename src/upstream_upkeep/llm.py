@@ -60,6 +60,7 @@ What you can and cannot do:
 - Use the memories when they help, and say so when you rely on one."""
 
 ATTACH_CHARS = 8000
+MAX_ATTACHMENTS = 6  # keep in step with MAX_TAGS in static/app.js
 
 
 def repo_facts(repo: dict) -> str:
@@ -113,7 +114,7 @@ def repo_facts(repo: dict) -> str:
 def attachments_block(repo: dict, attachments: list[dict]) -> str:
     """Expand the commits/files the user tagged into text the model can read."""
     parts = []
-    for a in attachments[:6]:
+    for a in attachments[:MAX_ATTACHMENTS]:
         try:
             if a.get("type") == "commit":
                 d = gitops.commit_detail(repo["path"], a["id"], ATTACH_CHARS)

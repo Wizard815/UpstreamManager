@@ -47,7 +47,8 @@ def main():
     )
     # debug=False so we don't get the reloader's extra fork loop; werkzeug
     # re-exec is not needed for a long-lived daemon.
-    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    # Local-only unless HOST says otherwise (the app has no login).
+    flask_app.run(host=os.environ.get("HOST", "127.0.0.1"), port=port, debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":

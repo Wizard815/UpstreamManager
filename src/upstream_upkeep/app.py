@@ -500,18 +500,41 @@ def api_memory_delete(memory_id):
     return jsonify({"ok": True})
 
 
+KEY_MASK = "••••"
+
+
+def _saved_key() -> str:
+    return (store.load_llm_config().get("api_key") or "")
+
+
+def _unmask(key: str | None) -> str | None:
+    """The page only ever sees a masked key; a masked value means "keep the saved one"."""
+    return _saved_key() if key and key.startswith(KEY_MASK) else key
+
+
+def _public_settings() -> dict:
+    """Settings for the page, with the API key masked (it is never sent back in full)."""
+    s = store.snapshot(get_settings())
+    llm = s.get("llm") or {}
+    if llm.get("api_key"):
+        llm["api_key"] = KEY_MASK + (llm["api_key"][-4:] if len(llm["api_key"]) > 8 else "")
+    return s
+
+
 @flask_app.route("/api/settings")
 def api_settings():
-    return jsonify(get_settings())
+    return jsonify(_public_settings())
 
 
 @flask_app.route("/api/settings", methods=["POST"])
 def api_save_settings():
     data = request.get_json(force=True) or {}
-    new = save_settings(data)
+    if isinstance(data.get("llm"), dict) and "api_key" in data["llm"]:
+        data["llm"]["api_key"] = _unmask(data["llm"]["api_key"]) or ""
+    save_settings(data)
     if "memory" in data or "llm" in data:  # mem0 bakes in the chat model for extraction
         memory.reload()
-    return jsonify({"ok": True, "settings": new})
+    return jsonify({"ok": True, "settings": _public_settings()})
 
 
 def _tracked(repo_id: str | None) -> dict:
@@ -584,7 +607,7 @@ def _branches(repo: dict):
 def api_models():
     """Models the server offers; ?base_url=&api_key= probe a server before saving."""
     from . import llm
-    models, error = llm.list_models(request.args.get("base_url"), request.args.get("api_key"))
+    models, error = llm.list_models(request.args.get("base_url"), _unmask(request.args.get("api_key")))
     return jsonify({"data": [{"id": m} for m in models], "error": error})
 
 
@@ -598,7 +621,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: #0f1115; color: #e6e6e6; }
-  header { background: #171a21; padding: 16px 24px; border-bottom: 1px solid #2a2f3a; display: flex; justify-content: space-between; align-items: center; }
+  header { background: #171a21; padding: 16px 24px; border-bottom: 1px solid #2a2f3a; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
   header h1 { margin: 0; font-size: 18px; }
   nav a { color: #9fb4ff; text-decoration: none; margin-left: 20px; font-size: 14px; }
   nav a:hover { color: #fff; }
@@ -612,16 +635,31 @@ TEMPLATE = r"""<!DOCTYPE html>
   .btn:hover { background: #4a70ff; }
   .btn.danger { background: #b33; }
   .btn.ghost { background: #232833; border: 1px solid #333a48; }
-  input, select, textarea { background: #0f1115; color: #e6e6e6; border: 1px solid #333a48; border-radius: 6px; padding: 8px; font-size: 13px; }
+  input, select, textarea { background: #0f1115; color: #e6e6e6; border: 1px solid #333a48; border-radius: 6px; padding: 8px; font-size: 13px; max-width: 100%; }
+  .btn:disabled { opacity: .6; cursor: progress; }
+  :focus-visible { outline: 2px solid #7fa0ff; outline-offset: 1px; }
+  .loading { color: #8892a0; font-size: 13px; padding: 8px; }
+  .loading::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 8px; border: 2px solid #4a5468; border-top-color: #9fb4ff; border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -1px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   .upstream { padding: 10px; border: 1px solid #2a2f3a; border-radius: 8px; margin-top: 8px; }
   .muted { color: #8892a0; font-size: 13px; }
-  .chat-box { height: 300px; overflow-y: auto; border: 1px solid #2a2f3a; border-radius: 8px; padding: 12px; background: #0f1115; }
+  .chat-box { height: min(420px, 60vh) !important; overflow-y: auto; border: 1px solid #2a2f3a; border-radius: 8px; padding: 12px; background: #0f1115; }
   .msg { margin-bottom: 10px; padding: 8px 12px; border-radius: 8px; max-width: 80%; }
   .msg.user { background: #2f5bff; margin-left: auto; }
-  .msg.bot { background: #232833; white-space: pre-wrap; }
+  .msg.bot { background: #232833; white-space: normal; overflow-wrap: anywhere; }
+  .msg.bot p, .msg.bot ul, .msg.bot ol, .msg.bot blockquote { margin: 0 0 8px; }
+  .msg.bot > :last-child { margin-bottom: 0; }
+  .msg.bot ul, .msg.bot ol { padding-left: 20px; }
+  .msg.bot h3, .msg.bot h4, .msg.bot h5, .msg.bot h6 { margin: 6px 0; font-size: 14px; }
+  .msg.bot code { background: #11141a; border: 1px solid #2a2f3a; border-radius: 4px; padding: 0 4px; font: 12px ui-monospace, Consolas, monospace; }
+  .msg.bot pre.md-code { background: #0f1115; border: 1px solid #2a2f3a; border-radius: 6px; padding: 8px; overflow: auto; margin: 0 0 8px; }
+  .msg.bot pre.md-code code { background: none; border: 0; padding: 0; white-space: pre; }
+  .msg.bot blockquote { border-left: 3px solid #3a4152; padding-left: 8px; color: #b8c0cc; }
+  .msg.bot a { color: #9fb4ff; }
   .msg.err { background: #3a1d1d; }
-  .msg { white-space: pre-wrap; }
+  .msg.user { white-space: pre-wrap; overflow-wrap: anywhere; }
   .mem-list { margin-top: 10px; max-height: 420px; overflow-y: auto; }
   .mem { display: flex; gap: 8px; align-items: flex-start; padding: 8px; border: 1px solid #2a2f3a; border-radius: 8px; margin-bottom: 6px; font-size: 13px; }
   .mem-del { padding: 2px 8px; }
@@ -631,13 +669,13 @@ TEMPLATE = r"""<!DOCTYPE html>
   .badge.kind-note { background: #14301f; border-color: #235a3a; }
   .badge.bad { background: #3a1d1d; border-color: #6a2d2d; }
   .repo-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); }
-  .tabs { display: flex; gap: 4px; margin-bottom: 10px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap; }
   .tab { background: #171a21; color: #cfd3dc; border: 1px solid #2a2f3a; border-radius: 6px 6px 0 0; padding: 6px 14px; cursor: pointer; }
   .tab.active { background: #232833; border-color: #3a4152; color: #fff; }
   .tray { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; font-size: 12px; }
   .chip { background: #1d2a40; border: 1px solid #2c4366; border-radius: 12px; padding: 2px 4px 2px 10px; }
   .chip-x { background: none; border: none; color: #9fb4ff; cursor: pointer; font-size: 14px; }
-  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 900; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 900; display: flex; align-items: center; justify-content: center; padding: 12px; }
   .overlay-panel { background: #171a21; border: 1px solid #2a2f3a; border-radius: 10px; padding: 16px; width: min(1100px, 100%); max-height: 90vh; overflow: auto; }
   .code-pre { margin: 8px 0 0; font: 12px/18px ui-monospace, Consolas, monospace; background: #0f1115; border: 1px solid #2a2f3a; border-radius: 6px; overflow: auto; max-height: 55vh; }
   .dl { white-space: pre; padding: 0 8px; }
@@ -645,13 +683,14 @@ TEMPLATE = r"""<!DOCTYPE html>
   .dl.del { background: #3a1d1d; color: #f0a0a0; }
   .dl.hunk { color: #7fb0ff; }
   .dl.file { color: #e0c070; font-weight: 600; }
-  .files { display: grid; grid-template-columns: 38% 62%; border: 1px solid #2a2f3a; border-radius: 8px; height: 560px; overflow: hidden; }
+  .files { display: grid; grid-template-columns: 38% 62%; border: 1px solid #2a2f3a; border-radius: 8px; height: min(560px, 75vh); overflow: hidden; }
   .tree { overflow: auto; border-right: 1px solid #2a2f3a; font-size: 13px; padding: 4px 0; background: #11141a; }
   .trow { cursor: pointer; padding: 2px 8px; white-space: nowrap; }
+  .trow:focus-visible { outline-offset: -2px; }
   .trow:hover { background: #1b2030; }
   .trow.sel { background: #25304a; }
   .viewer { display: flex; flex-direction: column; min-width: 0; background: #0f1115; }
-  .viewer-head { display: flex; gap: 6px; align-items: center; padding: 6px 8px; border-bottom: 1px solid #2a2f3a; font-size: 13px; }
+  .viewer-head { display: flex; gap: 6px; align-items: center; padding: 6px 8px; border-bottom: 1px solid #2a2f3a; font-size: 13px; flex-wrap: wrap; }
   .code-body { flex: 1; overflow: auto; position: relative; }
   .code-inner { display: flex; position: relative; min-width: max-content; padding: 8px 0; }
   .gutter, .src { margin: 0; font: 12px/18px ui-monospace, Consolas, monospace; }
@@ -659,12 +698,21 @@ TEMPLATE = r"""<!DOCTYPE html>
   .src { padding: 0 14px; tab-size: 4; }
   .hl { position: absolute; left: 0; right: 0; height: 18px; background: rgba(255, 210, 80, .18); pointer-events: none; }
   @media (max-width: 900px) { .grid, .repo-grid { grid-template-columns: 1fr; } }
+  @media (max-width: 700px) {
+    main { padding: 14px; }
+    header { padding: 12px 14px; }
+    nav a { margin-left: 0; margin-right: 14px; }
+    .files { grid-template-columns: 1fr; grid-template-rows: 40% 60%; }
+    .tree { border-right: 0; border-bottom: 1px solid #2a2f3a; }
+    .msg { max-width: 92%; }
+    .repo-card { padding: 12px; }
+  }
 </style>
 </head>
 <body>
 <header>
   <h1>🔗 Upstream Management</h1>
-  <nav>
+  <nav aria-label="Main">
     <a href="{{ base_url }}/repos">Repos</a>
     <a href="{{ base_url }}/requests">Requests</a>
     <a href="{{ base_url }}/settings">LLM Settings</a>
@@ -672,8 +720,9 @@ TEMPLATE = r"""<!DOCTYPE html>
 </header>
 <main>
   <h2 id="page-title">Watched Repositories</h2>
-  <div id="content">Loading…</div>
+  <div id="content" aria-live="polite"><div class="loading">Loading…</div></div>
 </main>
+<script src="{{ base_url }}/static/md.js"></script>
 <script src="{{ base_url }}/static/app.js"></script>
 </body>
 </html>
