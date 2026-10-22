@@ -249,19 +249,20 @@ def upstream_for_branch(repo: dict, upstream_url: str) -> dict | None:
 
 
 def repo_summary() -> list[dict]:
-    """Compact per-repo summary for the list view."""
+    """Per-repo summary for the list view, from refs already in each repo (no network)."""
     out = []
     for repo in store.all_repos():
+        ups, conflicts, error = [], [], None
         try:
             plan = upstream_check.build_merge_plan(
                 repo["path"], repo["id"], repo["name"], repo.get("upstreams", []),
                 focus_branch=repo.get("focus_branch"),
             )
-            total_behind = sum(u.behind for u in plan.upstreams)
+            ups = [u.to_dict() for u in plan.upstreams]
             conflicts = plan.conflicts
         except Exception as e:
-            total_behind = 0
-            conflicts = [f"error: {e}"]
+            error = str(e)
+        commits = gitops.recent_commits(repo["path"], 1)
         out.append({
             "id": repo["id"],
             "name": repo.get("name"),
@@ -269,9 +270,14 @@ def repo_summary() -> list[dict]:
             "kind": repo.get("kind"),
             "focus_branch": repo.get("focus_branch"),
             "watch": repo.get("watch", True),
-            "behind": total_behind,
+            "behind": sum(u["behind"] for u in ups),
+            "ahead": sum(u["ahead"] for u in ups),
             "conflicts": conflicts,
+            "upstream_details": ups,
             "upstreams": [u["name"] for u in repo.get("upstreams", [])],
+            "last_commit": commits[0] if commits else None,
+            "dirty": gitops.status_summary(repo["path"])["dirty"] if not error else 0,
+            "error": error,
         })
     return out
 

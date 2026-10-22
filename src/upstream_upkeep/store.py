@@ -2,8 +2,8 @@
 
 Single source of truth lives in `data/state.json` (override with the
 UPSTREAM_STATE_FILE env var). It holds tracked repos + their chat/upstream state,
-and the LLM/settings block that mirrors the hermes-agent config.yaml so the app
-shares the same backend as Studio.
+and the app's own settings, including its LLM connection (any OpenAI-compatible
+server: llama-swap, llama-server, Argos, ...). It never touches hermes config.
 """
 from __future__ import annotations
 
@@ -75,9 +75,14 @@ def remove_repo(repo_id: str) -> bool:
 
 
 def upsert_repo(repo: dict) -> dict:
-    """Add a new repo or replace an existing one with the same id."""
+    """Add a new repo or refresh an existing one with the same id.
+
+    Fields the caller does not set (chat sessions, indexed_commits, ...) are kept,
+    so re-adding a repo never wipes its history or re-indexes its commits.
+    """
     for i, existing in enumerate(_ensure()["repos"]):
         if existing.get("id") == repo.get("id"):
+            repo = {**existing, **repo}
             _ensure()["repos"][i] = repo
             save_state()
             return repo
@@ -99,13 +104,8 @@ def save_settings(patch: dict) -> dict:
 
 
 def load_llm_config() -> dict:
-    """Return the LLM/provider block that mirrors hermes config.yaml."""
-    return settings().get("llm", {
-        "provider": "custom:llama-swap",
-        "base_url": "http://192.168.20.5:8642/v1",
-        "model": "ornith-1.5-35b-q6_k",
-        "api_mode": "chat_completions",
-    })
+    """Return the app's own LLM connection: {base_url, model, api_key}."""
+    return {"base_url": "http://127.0.0.1:8080/v1", "model": "", "api_key": "", **settings().get("llm", {})}
 
 
 def save_llm_config(patch: dict) -> dict:
@@ -175,12 +175,28 @@ def list_sessions(repo_id: str) -> list[dict]:
 def new_session(repo_id: str) -> dict:
     repo = get_repo(repo_id)
     sessions = _sessions(repo)
+    # abandoned empty chats are clutter: drop them when starting another
+    sessions[:] = [s for s in sessions if s.get("messages")]
     sid = f"s-{uuid.uuid4().hex[:8]}"
     session = {"id": sid, "title": None, "created_at": config.now_iso(), "messages": []}
     sessions.append(session)
     repo["active_session"] = sid
     save_state()
     return session
+
+
+def delete_session(repo_id: str, session_id: str) -> bool:
+    """Delete one chat (its messages only; long-term memory is untouched)."""
+    repo = get_repo(repo_id)
+    sessions = _sessions(repo)
+    kept = [s for s in sessions if s["id"] != session_id]
+    if len(kept) == len(sessions):
+        return False
+    sessions[:] = kept
+    if repo.get("active_session") == session_id:
+        repo["active_session"] = kept[-1]["id"] if kept else None
+    save_state()
+    return True
 
 
 def get_session(repo_id: str, session_id: str | None = None) -> dict:
@@ -200,9 +216,12 @@ def set_active_session(repo_id: str, session_id: str) -> dict:
     return session
 
 
-def add_chat_message(repo_id: str, session_id: str, role: str, content: str, error: bool = False) -> dict:
+def add_chat_message(repo_id: str, session_id: str, role: str, content: str, error: bool = False,
+                     attachments: list | None = None) -> dict:
     session = get_session(repo_id, session_id)
     msg = {"role": role, "content": content, "timestamp": config.now_iso()}
+    if attachments:
+        msg["attachments"] = attachments
     if error:
         msg["error"] = True
     session["messages"].append(msg)
