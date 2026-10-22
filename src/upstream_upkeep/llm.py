@@ -20,7 +20,7 @@ import requests
 
 from pathlib import Path
 
-from . import gitops, memory, store, upstream_check
+from . import components, gitops, memory, store, upstream_check
 
 # Rough character budget for replayed session turns (~4 chars per token).
 HISTORY_CHARS = 24_000
@@ -99,6 +99,7 @@ def repo_facts(repo: dict) -> str:
             missing = gitops.list_commits(path, f"{focus}..refs/remotes/{c.name}/{c.branch}", 0, 8)
             if missing:
                 lines.append("  newest commits you are missing: " + "; ".join(f"{m['sha']} {m['subject']}" for m in missing))
+    lines += _component_facts(repo)
     try:
         top = sorted(p.name + ("/" if p.is_dir() else "") for p in Path(path).iterdir() if p.name != ".git")
         lines.append("Top-level files: " + ", ".join(top[:60]))
@@ -109,6 +110,51 @@ def repo_facts(repo: dict) -> str:
         lines.append("Recent commits on your branch:")
         lines += [f"  {c['sha']} {c['date'][:10]} {c['subject']}" for c in commits]
     return "\n".join(lines)
+
+
+def _component_facts(repo: dict) -> list[str]:
+    """One line per submodule component, so questions about the parts get real numbers."""
+    comps = repo.get("components") or []
+    if not comps:
+        return []
+    states = components.compare_all(repo)
+    # Name the exact set first: small models otherwise invent extra apps from commit subjects.
+    lagging = [s for s in states if s.get("behind")]
+    out = [f"Overall: the upstream lines above are about this repo's own code only. Of its {len(comps)} submodule "
+           f"components, {len(lagging)} are behind their upstreams ({sum(s['behind'] for s in lagging)} commits in total)"
+           + (", so the repo as a whole is NOT up to date." if lagging else "."),
+           f"Submodule components: exactly {len(comps)} ({', '.join(s['name'] for s in states)}). "
+           "Each is pinned to one commit and tracks its own upstream:"]
+    for s in states:
+        head = f"  {s['name']}" + (f" (path {s['path']})" if s["path"] != s["name"] else "") + f" <- {s['url']}"
+        if s["status"] == "disabled":
+            out.append(head + " (not tracked)")
+        elif s["status"] in ("not_checked_out", "not_fetched", "error"):
+            out.append(head + f" - {s['detail']}")
+        elif s["status"] == "up_to_date":
+            out.append(head + f" branch {s['branch']}: pinned {s['pin'][:8]}, up to date with upstream")
+        else:
+            out.append(head + f" branch {s['branch']}: pinned {s['pin'][:8]}, {s['behind']} commit(s) BEHIND upstream "
+                       f"{(s.get('upstream') or '')[:8]}"
+                       + (f"; WARNING: the pin also has {s['local']} commit(s) of the user's own that are not upstream"
+                          if s["local"] else "; no local changes in the pin, so it can move straight to upstream"))
+            if s["missing"]:
+                out.append("    example upstream changes not in the pin: " + "; ".join(m["subject"] for m in s["missing"][:3]))
+            if s["watched_changes"]:
+                out.append(f"    WARNING: upstream changed {len(s['watched_changes'])} file(s) this repo copies or depends on: "
+                           f"{', '.join(s['watched_changes'][:8])}. Bumping {s['name']} needs follow-up work"
+                           + (f": run `{s['after_update']}`" if s["after_update"] else "") + ".")
+    behind = [s for s in states if s.get("behind")]
+    if behind:
+        worst = max(behind, key=lambda s: s["behind"])
+        out.append(f"  Most behind: {worst['name']} ({worst['behind']}); least behind: "
+                   f"{min(behind, key=lambda s: s['behind'])['name']} ({min(s['behind'] for s in behind)}).")
+    out.append("  How updating works in this app: pins never move on their own. 'Request update' at the top of the "
+               "Components panel covers every component that is behind; the 'Request update' on one component's row covers "
+               "only that one. The user approves it on the Requests page, and the app moves those pins straight to their "
+               "upstream's latest commit in ONE local commit. Components whose pin has the user's own commits are skipped. "
+               "Nothing is pushed, and follow-up commands are only shown to the user, never run by the app.")
+    return out
 
 
 def attachments_block(repo: dict, attachments: list[dict]) -> str:
@@ -133,12 +179,24 @@ def attachments_block(repo: dict, attachments: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+# Cosine similarity cut-offs for memories put in the prompt. Measured with
+# bge-small: unrelated cross-repo items score 0.36-0.63, real matches 0.74+.
+OWN_MIN_SCORE = 0.3
+OTHER_REPO_MIN_SCORE = 0.7
+
+
+def _relevant(m: dict, minimum: float) -> bool:
+    return m.get("score") is None or m["score"] >= minimum
+
+
 def _memory_block(repo_id: str, message: str) -> str:
     # Commits are far more numerous than notes and preferences, so they would crowd
     # the latter out of one shared top-k. Search the two groups separately.
-    own = (memory.search(message, repo_id=repo_id, kind="commit", k=5)
-           + memory.search(message, repo_id=repo_id, exclude_kind="commit", k=5))
-    other = memory.search(message, exclude=repo_id, k=4)
+    own = [m for m in memory.search(message, repo_id=repo_id, kind="commit", k=5)
+           + memory.search(message, repo_id=repo_id, exclude_kind="commit", k=5) if _relevant(m, OWN_MIN_SCORE)]
+    # Other repos' memories only when they are clearly about the same thing;
+    # loosely similar ones (another repo's "commits behind" chat) mislead the model.
+    other = [m for m in memory.search(message, exclude=repo_id, k=4) if _relevant(m, OTHER_REPO_MIN_SCORE)]
     parts = []
     if own:
         parts.append("What you remember about this repo:\n" + "\n".join(f"- [{m['kind']}] {m['memory']}" for m in own))

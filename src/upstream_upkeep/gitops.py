@@ -159,12 +159,16 @@ def merge_check(path: str, local_ref: str, remote_ref: str) -> dict:
     return {"ok": False, "conflict": False, "files": [], "error": (res.stderr or res.stdout).strip()}
 
 
-def list_commits(path: str, rev: str, skip: int = 0, limit: int = 50, query: str = "") -> list[dict]:
+def list_commits(path: str, rev: str, skip: int = 0, limit: int = 50, query: str = "",
+                 no_merges: bool = False) -> list[dict]:
     """Commits for a rev expression (a ref or 'a..b'), newest first, paged."""
     sep = "\x1f"
-    args = ["log", f"--skip={skip}", f"-{limit}", f"--format=%H{sep}%h{sep}%aI{sep}%an{sep}%s", rev]
+    args = ["log", f"--skip={skip}", f"-{limit}", f"--format=%H{sep}%h{sep}%aI{sep}%an{sep}%s"]
     if query:
-        args = ["log", f"--skip={skip}", f"-{limit}", "-i", f"--grep={query}", f"--format=%H{sep}%h{sep}%aI{sep}%an{sep}%s", rev]
+        args += ["-i", f"--grep={query}"]
+    if no_merges:
+        args.append("--no-merges")
+    args.append(rev)
     res = _run(["git", *args], cwd=path)
     if res.returncode != 0:
         return []

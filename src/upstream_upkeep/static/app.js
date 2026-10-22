@@ -153,6 +153,14 @@ function upstreamBadges(u) {
   return out
 }
 
+// One compact badge per component for the repo list.
+function componentBadge(c) {
+  if (c.status === "disabled") return badge("", `${c.name}: off`)
+  if (c.status === "up_to_date") return badge("up", `${c.name} ✓`, "pin matches upstream")
+  if (["not_checked_out", "not_fetched", "error"].includes(c.status)) return badge("warn", `${c.name}: ?`, c.detail || "press Fetch")
+  return badge(c.local ? "bad" : "warn", `${c.name} ↓${c.behind}`, `${c.behind} upstream commits newer than the pin` + (c.local ? `; ${c.local} pinned commits not upstream` : ""))
+}
+
 async function repoCard(repo) {
   const ups = repo.upstream_details || []
   const lc = repo.last_commit
@@ -164,6 +172,9 @@ async function repoCard(repo) {
     lc ? el("div", { class: "muted" }, `last commit ${lc.sha} · ${(lc.date || "").slice(0, 10)} · ${lc.subject}`) : null,
     ...ups.map(u => el("div", { style: "margin-top:8px" }, el("strong", {}, `${u.name}/${u.branch} `), ...upstreamBadges(u))),
     !ups.length && !repo.error ? el("div", { class: "muted", style: "margin-top:8px" }, "No upstream configured.") : null,
+    (repo.components || []).length ? el("div", { style: "margin-top:8px" },
+      el("strong", {}, `components (${repo.components.length}) `),
+      ...repo.components.map(c => componentBadge(c))) : null,
     repo.dirty ? el("div", { style: "margin-top:6px" }, badge("warn", `${repo.dirty} uncommitted change${repo.dirty > 1 ? "s" : ""}`)) : null,
     repo.error ? el("div", { style: "color:#e08080;margin-top:6px" }, repo.error) : null
   )
@@ -220,6 +231,10 @@ async function renderRepoPage(repoId) {
   const upWrap = el("div", { style: "margin-top:20px" }, loading("Comparing upstreams…"))
   content.append(upWrap)
   await refreshUpstreams(upWrap, repoId).catch(e => upWrap.replaceChildren(el("p", { class: "muted" }, `Could not compare upstreams: ${e.message}`)))
+
+  const compWrap = el("div", { style: "margin-top:20px" })
+  content.append(compWrap)
+  renderComponents(compWrap, repoId).catch(e => compWrap.replaceChildren(el("p", { class: "muted" }, `Could not read components: ${e.message}`)))
 
   const chatWrap = el("div")
   const toolsWrap = el("div")
@@ -297,6 +312,81 @@ async function refreshUpstreams(wrap, repoId) {
     })
   }
   wrap.append(el("div", { style: "display:flex;gap:8px;margin-top:12px;flex-wrap:wrap" }, nameIn, urlIn, branchIn, addUpBtn))
+}
+
+// Components: the repo's git submodules. Each keeps its own upstream and is
+// fetched on its own; one approval moves every pin forward in a single commit.
+async function renderComponents(wrap, repoId) {
+  const res = await api(apiUrl(`/api/repo/${repoId}/components`))
+  wrap.innerHTML = ""
+  if (!res.items.length) return
+  const fetchAll = el("button", { class: "btn" }, "Fetch components")
+  fetchAll.onclick = () => busy(fetchAll, "Fetching…", async () => {
+    const r = await api(apiUrl(`/api/repo/${repoId}/components/fetch`), { method: "POST", body: "{}" })
+    const bad = r.items.filter(i => i.status === "error")
+    if (bad.length) toast(bad.map(i => `${i.name}: ${i.detail}`).join("\n"), "error")
+    await renderComponents(wrap, repoId); refreshCommits()
+  })
+  const behind = res.items.filter(i => i.behind)
+  const reqBtn = el("button", { class: "btn ghost", title: "Raise one approval request that moves every component that is behind to its upstream" }, "Request update")
+  reqBtn.disabled = !behind.length
+  // names: null for every component that is behind, or a list for just those
+  const raise = (btn, names) => busy(btn, "Raising…", async () => {
+    const r = await api(apiUrl(`/api/repo/${repoId}/components/request`), { method: "POST", body: JSON.stringify(names ? { names } : {}) })
+    if (!r.ok) return toast(r.error, "info")
+    toast("Update request raised. Review it on the Requests page.", "ok")
+    route("/requests")
+  })
+  reqBtn.textContent = "Request update (all)"
+  reqBtn.onclick = () => raise(reqBtn, null)
+  const total = behind.reduce((n, i) => n + i.behind, 0)
+  wrap.append(el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap" },
+    el("h3", { style: "margin:0" }, `Components (${res.items.length})`),
+    el("div", { class: "muted" }, behind.length ? `${behind.length} behind · ${total} upstream commits in total` : "all pins checked are current"),
+    el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" }, reqBtn, fetchAll)))
+  for (const c of res.items) {
+    const fetchBtn = el("button", { class: "btn ghost", "aria-label": `Fetch ${c.name}` }, "Fetch")
+    fetchBtn.onclick = () => busy(fetchBtn, "Fetching…", async () => {
+      const r = await api(apiUrl(`/api/repo/${repoId}/components/fetch`), { method: "POST", body: JSON.stringify({ name: c.name }) })
+      const it = r.items[0]
+      if (it?.status === "error") toast(`${c.name}: ${it.detail}`, "error")
+      await renderComponents(wrap, repoId); refreshCommits()
+    })
+    // settings: tracked branch, watched paths and the follow-up command
+    const branchIn = el("input", { value: c.branch && c.status !== "not_fetched" ? c.branch : "", placeholder: "default branch", "aria-label": `${c.name} branch`, style: "width:150px" })
+    const watchIn = el("input", { value: (c.watch_paths || []).join(", "), placeholder: "watched paths, comma separated", "aria-label": `${c.name} watched paths`, style: "width:320px" })
+    const hintIn = el("input", { value: c.after_update || "", placeholder: "command to run after bumping (shown, never run)", "aria-label": `${c.name} follow-up command`, style: "width:360px" })
+    const enabledIn = el("input", { type: "checkbox", "aria-label": `Track ${c.name}` })
+    enabledIn.checked = c.enabled !== false
+    const saveBtn = el("button", { class: "btn ghost" }, "Save")
+    saveBtn.onclick = () => busy(saveBtn, "Saving…", async () => {
+      await api(apiUrl(`/api/repo/${repoId}/components/${encodeURIComponent(c.name)}`), { method: "POST", body: JSON.stringify({
+        branch: branchIn.value.trim(), watch_paths: watchIn.value, after_update: hintIn.value.trim(), enabled: enabledIn.checked }) })
+      toast(`${c.name} settings saved`, "ok")
+      await renderComponents(wrap, repoId)
+    })
+    const status = c.status === "disabled" ? [badge("", "not tracked")]
+      : ["not_checked_out", "not_fetched", "error"].includes(c.status) ? [badge(c.status === "error" ? "bad" : "warn", c.status.replace(/_/g, " "), c.detail)]
+      : [c.behind ? badge("warn", `↓ ${c.behind} behind`, "upstream commits newer than the pin") : badge("up", "up to date"),
+         c.local ? badge("bad", `${c.local} pinned commits not upstream`, "your own commits inside the submodule; bump needs a merge there first") : null,
+         c.moved ? badge("warn", "checked out ≠ pin") : null,
+         c.dirty ? badge("warn", `${c.dirty} uncommitted`) : null,
+         (c.watched_changes || []).length ? badge("bad", `⚠ ${c.watched_changes.length} watched files changed`, c.watched_changes.join("\n")) : null]
+    wrap.append(el("div", { class: "upstream" },
+      el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap" },
+        el("div", {}, el("strong", {}, `${c.name} `), el("span", { class: "muted" }, `${c.path} · ${c.branch || "?"} `), ...status),
+        el("div", { style: "display:flex;gap:6px" },
+          c.behind ? (() => { const b = el("button", { class: "btn ghost", "aria-label": `Request update for ${c.name}` }, "Request update"); b.onclick = () => raise(b, [c.name]); return b })() : null,
+          fetchBtn)),
+      el("div", { class: "muted" }, `${c.url}` + (c.pin ? ` · pinned ${c.pin.slice(0, 8)}` : "") + (c.upstream ? ` · upstream ${c.upstream.slice(0, 8)}` : "")),
+      (c.watched_changes || []).length ? el("div", { style: "color:#e0a060;font-size:13px;margin-top:4px" },
+        `Upstream changed files this repo depends on: ${c.watched_changes.slice(0, 8).join(", ")}${c.watched_changes.length > 8 ? " …" : ""}`,
+        c.after_update ? el("div", {}, "After bumping, run: ", el("code", {}, c.after_update)) : null) : null,
+      el("details", { style: "margin-top:6px" }, el("summary", { class: "muted" }, "Settings"),
+        el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px" },
+          el("label", { class: "muted" }, enabledIn, " track"), branchIn, watchIn, hintIn, saveBtn))
+    ))
+  }
 }
 
 // Chat: one conversation per session. "New chat" resets what the model sees of
@@ -438,11 +528,16 @@ async function renderCommits(wrap, repoId) {
     el("option", { value: "behind" }, "Missing from upstream (behind)"),
     el("option", { value: "ahead" }, "Only on my branch (ahead)"),
     el("option", { value: "all" }, "All commits"))
-  const upSel = el("select", { "aria-label": "Upstream" }, ...(repo.upstreams || []).map(u => el("option", { value: u.name }, u.name)))
+  // Source: one of the repo's upstreams, or a component (its submodule history).
+  const upSel = el("select", { "aria-label": "Source" },
+    ...(repo.upstreams || []).map(u => el("option", { value: `up:${u.name}` }, u.name)),
+    ...(repo.components || []).map(c => el("option", { value: `comp:${c.name}` }, `component: ${c.name}`)))
   // open on the upstream that has the most commits you are missing
   const cmp = await api(apiUrl(`/api/repo/${repoId}/compare`)).catch(() => ({}))
-  const worst = [...(cmp.plan?.upstreams || [])].sort((a, b) => b.behind - a.behind)[0]
-  if (worst && worst.behind) upSel.value = worst.name
+  const comps = await api(apiUrl(`/api/repo/${repoId}/components`)).catch(() => ({ items: [] }))
+  const worst = [...(cmp.plan?.upstreams || []).map(u => ({ key: `up:${u.name}`, behind: u.behind })),
+                 ...comps.items.map(c => ({ key: `comp:${c.name}`, behind: c.behind || 0 }))].sort((a, b) => b.behind - a.behind)[0]
+  if (worst && worst.behind) upSel.value = worst.key
   const qIn = el("input", { placeholder: "Search commit messages…", "aria-label": "Search commit messages", style: "flex:1;min-width:120px" })
   const list = el("div", { class: "mem-list", style: "max-height:520px" })
   const more = el("button", { class: "btn ghost", style: "margin-top:6px;display:none" }, "Load more")
@@ -450,7 +545,9 @@ async function renderCommits(wrap, repoId) {
   let skip = 0
   const load = async (reset) => {
     if (reset) { skip = 0; list.replaceChildren(loading()) }
-    const q = `view=${viewSel.value}&upstream=${encodeURIComponent(upSel.value)}&skip=${skip}&limit=50&q=${encodeURIComponent(qIn.value.trim())}`
+    const [kind, name] = upSel.value.split(/:(.*)/s)
+    const src = kind === "comp" ? `component=${encodeURIComponent(name)}` : `upstream=${encodeURIComponent(name || "")}`
+    const q = `view=${viewSel.value}&${src}&skip=${skip}&limit=50&q=${encodeURIComponent(qIn.value.trim())}`
     let res
     try { res = await api(apiUrl(`/api/repo/${repoId}/commits?${q}`)) }
     catch (e) { res = { ok: false, error: e.message } }
@@ -459,9 +556,11 @@ async function renderCommits(wrap, repoId) {
     info.textContent = ""
     for (const c of res.items) {
       const tag = el("button", { class: "btn ghost", title: "Attach to the chat", "aria-label": `Tag commit ${c.sha} for the chat` }, "Tag")
-      tag.onclick = () => addTag(repoId, { type: "commit", id: c.full, label: `${c.sha} ${c.subject.slice(0, 40)}` })
+      const comp = upSel.value.startsWith("comp:") ? upSel.value.slice(5) : null
+      tag.onclick = () => comp ? toast("Tagging component commits isn't supported yet; tag the files instead.", "info")
+        : addTag(repoId, { type: "commit", id: c.full, label: `${c.sha} ${c.subject.slice(0, 40)}` })
       const view = el("button", { class: "btn ghost", "aria-label": `View commit ${c.sha}` }, "View")
-      view.onclick = () => busy(view, null, () => showCommit(repoId, c.full))
+      view.onclick = () => busy(view, null, () => showCommit(repoId, c.full, comp))
       list.append(el("div", { class: "mem" },
         el("code", { style: "color:#9fb4ff" }, c.sha),
         el("div", { style: "flex:1;min-width:0" }, el("div", {}, c.subject), el("div", { class: "muted", style: "font-size:12px" }, `${c.author} · ${c.date.slice(0, 10)}`)),
@@ -477,11 +576,13 @@ async function renderCommits(wrap, repoId) {
   upSel.onchange = () => load(true)
   qIn.addEventListener("keydown", (e) => { if (e.key === "Enter") load(true) })
   wrap.append(el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" }, viewSel, upSel.options.length > 1 ? upSel : "", qIn), info, list, more)
+  if (!upSel.options.length) info.textContent = "No upstream or component to compare against."
   await load(true)
 }
 
-async function showCommit(repoId, sha) {
-  const d = await api(apiUrl(`/api/repo/${repoId}/commit/${sha}`)).catch(e => ({ ok: false, error: e.message }))
+async function showCommit(repoId, sha, component = null) {
+  const qs = component ? `?component=${encodeURIComponent(component)}` : ""
+  const d = await api(apiUrl(`/api/repo/${repoId}/commit/${sha}${qs}`)).catch(e => ({ ok: false, error: e.message }))
   const opener = document.activeElement
   const close = () => { ov.remove(); document.removeEventListener("keydown", onKey); opener?.focus?.() }
   // Escape closes; Tab stays inside the dialog (it is modal).
@@ -501,6 +602,7 @@ async function showCommit(repoId, sha) {
   }
   const tag = el("button", { class: "btn" }, "Tag for chat")
   tag.onclick = () => { addTag(repoId, { type: "commit", id: d.sha, label: `${d.sha.slice(0, 8)} ${(d.message || "").split("\n")[0].slice(0, 40)}` }) }
+  if (component) tag.hidden = true
   const closeBtn = el("button", { class: "btn ghost", onclick: close }, "Close")
   const titleId = `commit-title-${sha.slice(0, 10)}`
   const ov = el("div", { class: "overlay", onclick: (e) => { if (e.target === ov) close() } },
@@ -696,25 +798,37 @@ async function renderRequests() {
     for (const r of reqs) {
       const pending = r.status === "pending"
       const commentIn = el("input", { placeholder: "add a note…", "aria-label": `Note for ${r.repo_name || r.repo_id}`, style: "width:220px" })
-      const decide = (decision, btn) => busy(btn, decision === "approve" ? "Merging…" : "Denying…", async () => {
+      const decide = (decision, btn) => busy(btn, decision === "approve" ? (r.type === "components" ? "Bumping…" : "Merging…") : "Denying…", async () => {
         const res = await api(apiUrl(`/api/request/${encodeURIComponent(r.id)}/decide`), { method: "POST", body: JSON.stringify({ decision, comment: commentIn.value }) })
         const detail = (res.request?.result || []).map(o => `${o.upstream}: ${o.detail}`).join("; ")
         if (decision === "deny") toast("Denied", "info")
+        else if (r.type === "components") toast(res.ok ? `Pins bumped. ${detail}` : `Not bumped. ${res.error || detail}`, res.ok ? "ok" : "error")
         else toast(res.ok ? `Merged. ${detail}` : `Not merged. ${res.error || detail}`, res.ok ? "ok" : "error")
         await renderRequests()
       })
-      const approveBtn = el("button", { class: "btn" }, "Approve and merge")
+      const isComp = r.type === "components"
+      const approveBtn = el("button", { class: "btn" }, isComp ? "Approve and bump pins" : "Approve and merge")
       approveBtn.onclick = () => decide("approve", approveBtn)
       const denyBtn = el("button", { class: "btn danger" }, "Deny")
       denyBtn.onclick = () => decide("deny", denyBtn)
       wrap.append(el("div", { class: "repo-card", id: `req-${r.id}` },
         el("h3", {}, r.repo_name || r.repo_id, " ",
-          el("span", { class: `badge ${r.safe === false ? "bad" : ""}` }, r.safe === false ? "conflicts" : "needs a merge commit"),
+          isComp ? badge(r.safe === false ? "bad" : "", r.safe === false ? "has pinned commits not upstream" : "submodule pins")
+            : el("span", { class: `badge ${r.safe === false ? "bad" : ""}` }, r.safe === false ? "conflicts" : "needs a merge commit"),
           el("span", { class: `badge ${pending ? "warn" : r.status === "approved" ? "up" : ""}` }, r.status)
         ),
         el("div", { class: "muted" }, `focus: ${r.focus_branch} · raised ${(r.created_at || "").slice(0, 16).replace("T", " ")}`
           + (r.decided_at ? ` · decided ${r.decided_at.slice(0, 16).replace("T", " ")}` : "")),
-        el("div", { style: "margin:8px 0" }, ...(r.upstreams || []).map(u =>
+        isComp ? el("div", { style: "margin:8px 0" }, ...(r.components || []).map(c =>
+          el("div", { class: "upstream" },
+            el("div", {}, `${c.name} (${c.path}): ↓ ${c.behind} upstream commits · pinned ${(c.pin || "").slice(0, 8)} → ${(c.upstream || "").slice(0, 8)}`),
+            (c.missing || []).length ? el("div", { class: "muted", style: "font-size:12px" }, "newest: " + c.missing.slice(0, 3).map(m => `${m.sha} ${m.subject}`).join(" · ")) : null,
+            c.local ? el("div", { class: "muted", style: "color:#e08080" }, `${c.local} pinned commit(s) are not upstream: this one will be skipped`) : null,
+            (c.watched_changes || []).length ? el("div", { style: "color:#e0a060;font-size:13px" },
+              `⚠ upstream changed ${c.watched_changes.length} watched file(s): ${c.watched_changes.slice(0, 6).join(", ")}`,
+              c.after_update ? el("div", {}, "After bumping, run: ", el("code", {}, c.after_update)) : null) : null
+          ))) : null,
+        isComp ? null : el("div", { style: "margin:8px 0" }, ...(r.upstreams || []).map(u =>
           el("div", { class: "upstream" },
             el("div", {}, `${u.name} / ${u.branch}: ↓ ${u.behind} behind · ↑ ${u.ahead} ahead`),
             u.reason ? el("div", { class: "muted", style: "color:#e0a060" }, u.reason) : null,
@@ -722,9 +836,12 @@ async function renderRequests() {
           )
         )),
         (r.result || []).length ? el("div", { class: "muted" }, "Result: " + r.result.map(o => `${o.upstream}: ${o.detail}`).join("; ")) : null,
+        (r.result || []).filter(o => o.after_update).map(o => el("div", { style: "color:#e0a060;font-size:13px" }, `Now run for ${o.name}: `, el("code", {}, o.after_update))),
         r.comment ? el("div", { class: "muted" }, `Note: ${r.comment}`) : null,
         pending ? el("div", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px" }, approveBtn, denyBtn, commentIn,
-          el("span", { class: "muted", style: "font-size:12px" }, "Approve merges into your local branch. Conflicts are never auto-resolved; the merge is aborted instead. Nothing is pushed.")) : null
+          el("span", { class: "muted", style: "font-size:12px" }, isComp
+            ? "Approve moves each pin to its upstream in one commit on your local branch. Nothing is pushed."
+            : "Approve merges into your local branch. Conflicts are never auto-resolved; the merge is aborted instead. Nothing is pushed.")) : null
       ))
     }
   } catch (e) { wrap.replaceChildren(el("p", { class: "muted" }, `Could not load requests: ${e.message}`)) }

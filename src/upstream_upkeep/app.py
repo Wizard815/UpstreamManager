@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, render_template_string, abort
 
-from . import config, registry, store, upstream_check, daily_check, gitops, memory
+from . import components, config, registry, store, upstream_check, daily_check, gitops, memory
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -160,6 +160,68 @@ def api_compare(repo_id):
     return jsonify({"ok": True, "plan": plan.to_dict(), "git": gitops.status_summary(repo["path"])})
 
 
+@flask_app.route("/api/repo/<repo_id>/components")
+def api_components(repo_id):
+    """Every submodule component and its drift, from what is already fetched."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    with store.lock:
+        repo["components"] = components.sync(repo)
+        store.save_repo(repo)
+    return jsonify({"ok": True, "items": components.compare_all(repo)})
+
+
+@flask_app.route("/api/repo/<repo_id>/components/fetch", methods=["POST"])
+def api_components_fetch(repo_id):
+    """Fetch one component ({"name": ...}) or all of them, then compare."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    name = (request.get_json(silent=True) or {}).get("name")
+    with store.lock:
+        repo["components"] = components.sync(repo)
+        store.save_repo(repo)
+    items = [components.compare(repo["path"], c, do_fetch=True) for c in repo["components"]
+             if (name in (None, c["name"])) and c.get("enabled", True)]
+    return jsonify({"ok": all(i["status"] != "error" for i in items), "items": items})
+
+
+@flask_app.route("/api/repo/<repo_id>/components/<path:name>", methods=["POST"])
+def api_component_settings(repo_id, name):
+    """Edit a component's enabled / branch / watch_paths / after_update.
+
+    Submodule names are usually paths (apps/dayglance), hence <path:name>; the
+    fixed routes /components/fetch and /components/request still win.
+    """
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    patch = request.get_json(force=True) or {}
+    with store.lock:
+        comp = next((c for c in repo.get("components") or [] if c["name"] == name), None)
+        if not comp:
+            abort(404)
+        components.update_settings(comp, patch)
+        store.save_repo(repo)
+    return jsonify({"ok": True, "item": components.compare(repo["path"], comp)})
+
+
+@flask_app.route("/api/repo/<repo_id>/components/request", methods=["POST"])
+def api_components_request(repo_id):
+    """Raise the one approval request that would bump every component that is behind."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    focus = repo.get("focus_branch") or gitops.current_branch(repo["path"]) or "main"
+    names = (request.get_json(silent=True) or {}).get("names")  # omit for "every component that is behind"
+    states = [s for s in components.compare_all(repo) if not names or s["name"] in names]
+    req = _component_request(repo, focus, states)
+    if not req:
+        return jsonify({"ok": False, "error": "nothing to update (press Fetch first to check)"})
+    return jsonify({"ok": True, "request": store.snapshot(req)})
+
+
 @flask_app.route("/api/repo/<repo_id>/commits")
 def api_commits(repo_id):
     """Commits, paged. view=all (focus branch) | behind (upstream has, you lack) | ahead (only yours)."""
@@ -167,6 +229,23 @@ def api_commits(repo_id):
     if not repo:
         abort(404)
     view = request.args.get("view", "all")
+    skip = max(0, int(request.args.get("skip", 0)))
+    limit = min(200, max(1, int(request.args.get("limit", 50))))
+    q = request.args.get("q", "").strip()
+    comp_name = request.args.get("component")
+    if comp_name:
+        # A component's own history, read inside the submodule.
+        comp = next((c for c in repo.get("components") or [] if c["name"] == comp_name), None)
+        if not comp:
+            abort(404)
+        st = components.compare(repo["path"], comp)
+        if st["status"] in ("not_checked_out", "not_fetched", "error"):
+            return jsonify({"ok": False, "error": st["detail"], "items": []})
+        sub = str(Path(repo["path"]) / comp["path"])
+        ref = f"refs/remotes/origin/{st['branch']}"
+        rev = {"behind": f"{st['pin']}..{ref}", "ahead": f"{ref}..{st['pin']}"}.get(view, st["pin"])
+        items = gitops.list_commits(sub, rev, skip, limit, q)
+        return jsonify({"ok": True, "items": items, "more": len(items) == limit})
     focus = repo.get("focus_branch") or "HEAD"
     ups = {u["name"]: u for u in repo.get("upstreams", [])}
     up = ups.get(request.args.get("upstream", "")) or next(iter(ups.values()), None)
@@ -174,9 +253,7 @@ def api_commits(repo_id):
     if view in ("behind", "ahead") and not (upref and gitops.ref_exists(repo["path"], upref)):
         return jsonify({"ok": False, "error": "upstream not fetched yet - press Fetch", "items": []})
     rev = {"all": focus, "behind": f"{focus}..{upref}", "ahead": f"{upref}..{focus}"}.get(view, focus)
-    skip = max(0, int(request.args.get("skip", 0)))
-    limit = min(200, max(1, int(request.args.get("limit", 50))))
-    items = gitops.list_commits(repo["path"], rev, skip, limit, request.args.get("q", "").strip())
+    items = gitops.list_commits(repo["path"], rev, skip, limit, q)
     return jsonify({"ok": True, "items": items, "more": len(items) == limit})
 
 
@@ -185,8 +262,15 @@ def api_commit(repo_id, sha):
     repo = registry.get_repo(repo_id)
     if not repo:
         abort(404)
+    path = repo["path"]
+    comp_name = request.args.get("component")
+    if comp_name:
+        comp = next((c for c in repo.get("components") or [] if c["name"] == comp_name), None)
+        if not comp:
+            abort(404)
+        path = str(Path(repo["path"]) / comp["path"])
     try:
-        return jsonify({"ok": True, **gitops.commit_detail(repo["path"], sha)})
+        return jsonify({"ok": True, **gitops.commit_detail(path, sha)})
     except gitops.GitError as e:
         return jsonify({"ok": False, "error": str(e)}), 404
 
@@ -289,6 +373,7 @@ def api_run_daily():
                         reason = (f"{len(up.conflict_files)} conflicting file(s)" if up.conflict
                                   else f"needs a merge commit ({up.ahead} commit(s) of yours)")
                     pending.append({**up.to_dict(), "reason": reason})
+                _check_components(repo, focus, results)
                 if pending:
                     store.record_request({
                         "id": f"{repo['id']}:{focus}",
@@ -311,6 +396,45 @@ def api_run_daily():
     for r in results:
         _remember_daily(r)
     return jsonify({"ok": True, "results": results})
+
+
+def _component_request(repo: dict, focus: str, states: list[dict]) -> dict | None:
+    """Raise (or refresh) the single "bump pins" request for a hub, if anything is behind."""
+    behind = [s for s in states if s.get("enabled", True) and s.get("behind")]
+    if not behind:
+        return None
+    rec = {
+        "id": f"{repo['id']}:components",
+        "type": "components",
+        "repo_id": repo["id"],
+        "repo_name": repo["name"],
+        "focus_branch": focus,
+        "components": [{k: s.get(k) for k in ("name", "path", "url", "branch", "pin", "upstream", "behind", "local",
+                                               "missing", "watched_changes", "after_update", "conflict", "conflict_files")}
+                       for s in behind],
+        "safe": not any(s.get("local") for s in behind),
+        "status": "pending",
+        "created_at": config.now_iso(),
+        "comment": None,
+        "decided_at": None,
+    }
+    return store.record_request(rec)
+
+
+def _check_components(repo: dict, focus: str, results: list) -> None:
+    with store.lock:
+        repo["components"] = components.sync(repo)
+        store.save_repo(repo)
+    if not repo["components"]:
+        return
+    states = components.compare_all(repo, do_fetch=True)
+    req = _component_request(repo, focus, states)
+    if req:
+        results.append({"repo_id": repo["id"], "repo_name": repo["name"], "status": "request_raised",
+                        "conflicts": [], "reasons": [f"{c['name']} is {c['behind']} commit(s) behind" for c in req["components"]]})
+    for s in states:
+        if s.get("status") == "error":
+            results.append({"repo_id": repo["id"], "status": "error", "error": f"{s['name']}: {s['detail']}"})
 
 
 def _remember_daily(r: dict) -> None:
@@ -353,6 +477,15 @@ def api_decide(req_id):
         repo = registry.get_repo(req["repo_id"])
         if not repo:
             abort(404)
+        if req.get("type") == "components":
+            with _run_lock:
+                bumped = components.bump(repo, [c["name"] for c in req.get("components", [])], req["focus_branch"])
+            outcome = [{"upstream": r["name"], **r} for r in bumped["results"]] or [{"upstream": "components", "ok": False, "detail": bumped["detail"]}]
+            if bumped.get("commit"):
+                outcome.append({"upstream": "commit", "ok": True, "detail": f"{bumped['commit'][:10]}: {bumped['detail']}"})
+            failed = not bumped["ok"]
+            result = store.decide_request(req_id, decision, comment, outcome, failed)
+            return jsonify({"ok": not failed, "request": store.snapshot(result)})
         with _run_lock:
             outcome = [{"upstream": u["name"], **daily_check.merge_upstream(repo["path"], u, req["focus_branch"],
                                                                             allow_merge_commit=True)}
