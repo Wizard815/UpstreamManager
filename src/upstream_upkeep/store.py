@@ -7,15 +7,32 @@ server: llama-swap, llama-server, Argos, ...). It never touches hermes config.
 """
 from __future__ import annotations
 
-import json
-import os
+import copy
+import functools
 import uuid
-from pathlib import Path
 from typing import Any
 
 from . import config
 
 _STATE: dict | None = None
+# One lock for all state: Waitress serves requests on several threads, and a save
+# (json.dumps of the whole state) must never run while another thread mutates it.
+# Code outside this module that changes a repo dict takes it too (`with store.lock`).
+lock = config._lock
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        with lock:
+            return fn(*a, **kw)
+    return wrapper
+
+
+def snapshot(obj):
+    """A deep copy taken under the lock, safe to serialise while others write."""
+    with lock:
+        return copy.deepcopy(obj)
 
 def _ensure() -> dict:
     global _STATE
@@ -44,6 +61,7 @@ def get_repo(repo_id: str) -> dict | None:
     return None
 
 
+@_locked
 def add_repo(repo: dict) -> dict:
     repos = _ensure()["repos"]
     repos.append(repo)
@@ -51,6 +69,7 @@ def add_repo(repo: dict) -> dict:
     return repo
 
 
+@_locked
 def save_repo(repo: dict) -> dict:
     repos = _ensure()["repos"]
     if repo.get("deleted") or repo.get("id") in {r.get("id") for r in repos if r.get("deleted")}:
@@ -67,6 +86,7 @@ def save_repo(repo: dict) -> dict:
     return repo
 
 
+@_locked
 def remove_repo(repo_id: str) -> bool:
     repos = _ensure()["repos"]
     _ensure()["repos"] = [r for r in repos if r.get("id") != repo_id]
@@ -74,6 +94,7 @@ def remove_repo(repo_id: str) -> bool:
     return True
 
 
+@_locked
 def upsert_repo(repo: dict) -> dict:
     """Add a new repo or refresh an existing one with the same id.
 
@@ -96,6 +117,7 @@ def settings() -> dict:
     return _ensure().setdefault("settings", {})
 
 
+@_locked
 def save_settings(patch: dict) -> dict:
     s = settings()
     s.update(patch)
@@ -108,6 +130,7 @@ def load_llm_config() -> dict:
     return {"base_url": "http://127.0.0.1:8080/v1", "model": "", "api_key": "", **settings().get("llm", {})}
 
 
+@_locked
 def save_llm_config(patch: dict) -> dict:
     s = settings()
     s.setdefault("llm", {}).update(patch)
@@ -124,8 +147,12 @@ def get_requests() -> list[dict]:
     return requests_store()
 
 
+@_locked
 def record_request(rec: dict) -> dict:
-    requests_store().append(rec)
+    """Add a request, replacing an earlier one with the same id (one per repo + branch)."""
+    reqs = requests_store()
+    reqs[:] = [r for r in reqs if r.get("id") != rec["id"]]
+    reqs.append(rec)
     save_state()
     return rec
 
@@ -137,11 +164,14 @@ def get_request(req_id: str) -> dict | None:
     return None
 
 
-def decide_request(req_id: str, decision: str, comment: str | None = None) -> dict | None:
+@_locked
+def decide_request(req_id: str, decision: str, comment: str | None = None, result: list | None = None,
+                   failed: bool = False) -> dict | None:
     for r in requests_store():
         if r.get("id") == req_id:
-            r["status"] = "approved" if decision == "approve" else "denied"
+            r["status"] = "denied" if decision != "approve" else ("failed" if failed else "approved")
             r["comment"] = comment
+            r["result"] = result
             r["decided_at"] = config.now_iso()
             save_state()
             return r
@@ -162,6 +192,7 @@ def _sessions(repo: dict) -> list[dict]:
     return sessions
 
 
+@_locked
 def list_sessions(repo_id: str) -> list[dict]:
     repo = get_repo(repo_id)
     if not repo:
@@ -172,6 +203,7 @@ def list_sessions(repo_id: str) -> list[dict]:
             for s in _sessions(repo)]
 
 
+@_locked
 def new_session(repo_id: str) -> dict:
     repo = get_repo(repo_id)
     sessions = _sessions(repo)
@@ -185,6 +217,7 @@ def new_session(repo_id: str) -> dict:
     return session
 
 
+@_locked
 def delete_session(repo_id: str, session_id: str) -> bool:
     """Delete one chat (its messages only; long-term memory is untouched)."""
     repo = get_repo(repo_id)
@@ -199,6 +232,7 @@ def delete_session(repo_id: str, session_id: str) -> bool:
     return True
 
 
+@_locked
 def get_session(repo_id: str, session_id: str | None = None) -> dict:
     """The requested session, else the active one, else a fresh one."""
     repo = get_repo(repo_id)
@@ -209,6 +243,7 @@ def get_session(repo_id: str, session_id: str | None = None) -> dict:
     return new_session(repo_id)
 
 
+@_locked
 def set_active_session(repo_id: str, session_id: str) -> dict:
     session = get_session(repo_id, session_id)
     get_repo(repo_id)["active_session"] = session["id"]
@@ -216,6 +251,7 @@ def set_active_session(repo_id: str, session_id: str) -> dict:
     return session
 
 
+@_locked
 def add_chat_message(repo_id: str, session_id: str, role: str, content: str, error: bool = False,
                      attachments: list | None = None) -> dict:
     session = get_session(repo_id, session_id)

@@ -1,175 +1,51 @@
-"""Daily check engine: detect -> optionally commit -> record -> optionally push.
+"""Bring a focus branch up to date with an upstream, safely.
 
-The approval gate is the safety core of this app. The daily run is fully
-automated for *detecting* and *committing locally*, but pushing is gated: it
-only happens when the user has approved that specific commit in the UI.
-
-Flow:
-  1. snapshot the repo
-  2. if there are changes and we haven't already committed today, commit locally
-     (staging + commit). We NEVER merge upstream into the branch automatically.
-  3. store the proposed commit (sha + message + what changed) in repo.pending_pushes
-  4. the UI presents it; on approval we run the merge + push and clear the pending entry.
+The daily check only ever fast-forwards on its own: no merge commit, nothing
+of yours is rewritten, and only when the focus branch is checked out with a
+clean working tree. Anything that needs a real merge (both sides moved, or
+conflicts) becomes an approval request; approving it runs the merge here, and
+a failed merge is aborted so the working tree is left as it was. Nothing is
+ever pushed.
 """
 from __future__ import annotations
 
-import json
-from datetime import datetime, timezone
-from pathlib import Path
-
 from . import gitops
-from .change_engine import build_commit_message
-from .config import now_iso
-from .types import DailyRunResult
 
 
-def _prepare_branch(path: str, remote: str | None) -> bool:
-    """Bring local branch up to date with upstream (no fast-forwarding issues),
-    then ensure it's ahead of upstream by rebasing. Returns True on success."""
-    if remote is None:
-        return True
-    base = f"refs/remotes/{remote}/HEAD"
-    try:
-        out = gitops._git(["rev-list", "--count", f"HEAD..{base}"], path)
-    except Exception:
-        out = "0"
-    if not out or int(out) == 0:
-        return True
-    # fetch latest upstream
-    gitops._git(["fetch", remote], path)
-    # merge upstream into local branch (user can amend/cancel)
-    res = gitops._run(["git", "merge", "--ff-only", base], cwd=path, check=False)
-    if res.returncode != 0:
-        # fall back to a merge commit
-        gitops._run(["git", "merge", base], cwd=path, check=False)
-    return True
+def blocker(path: str, focus: str) -> str | None:
+    """Why the working tree can't be touched right now, or None if it can."""
+    current = gitops.current_branch(path)
+    if current != focus:
+        return f"the checked-out branch is {current}, not the focus branch {focus}"
+    if gitops.status_summary(path)["dirty"]:
+        return "the working tree has uncommitted changes"
+    return None
 
 
-def run_daily_check(
-    path: str,
-    remote: str | None,
-    window_days: int = 2,
-    commit: bool = True,
-    commit_message_override: str | None = None,
-) -> DailyRunResult:
-    result: DailyRunResult = {
-        "path": path,
-        "timestamp": now_iso(),
-        "status": "ok",
-        "error": None,
-        "upstream_count": 0,
-        "recent_count": 0,
-        "dirty": False,
-        "has_local_changes": False,
-        "committed_sha": None,
-        "commit_message": None,
-        "committed": False,
-        "ready_to_push": False,
-        "pushed": False,
-        "merge_conflict": False,
-        "push_output": None,
-    }
+def merge_upstream(path: str, upstream: dict, focus: str, allow_merge_commit: bool = False) -> dict:
+    """Merge refs/remotes/<name>/<branch> into `focus`. Returns {ok, action, detail}.
 
-    if not gitops.is_git_repo(path):
-        result["status"] = "error"
-        result["error"] = "not a git repo"
-        return result
-
-    snapshot = None
-    try:
-        snapshot = snapshot_repo(path, remote, window_days)
-    except Exception as e:
-        result["status"] = "error"
-        result["error"] = str(e)
-        return result
-    result["upstream_count"] = snapshot.upstream_count
-    result["recent_count"] = snapshot.recent_count
-    result["dirty"] = snapshot.dirty
-
-    if snapshot.dirty:
-        result["has_local_changes"] = True
-
-    # 1. prepare the branch to be pushable (merge upstream first)
-    if not _prepare_branch(path, remote):
-        result["status"] = "error"
-        result["error"] = "failed to prepare branch"
-        return result
-
-    # 2. stage + commit local changes
-    if commit and snapshot.dirty:
-        gitops.stage_all(path)
-        try:
-            msg = commit_message_override or build_commit_message(snapshot, snapshot.repo_name or "repo")
-            sha = gitops.commit(path, msg)
-            if sha:
-                result["committed_sha"] = sha
-                result["commit_message"] = msg
-                result["committed"] = True
-                result["ready_to_push"] = True
-                result["merge_conflict"] = False
-            else:
-                result["status"] = "error"
-                result["error"] = "commit failed (nothing staged or author identity missing)"
-        except Exception as e:
-            result["status"] = "error"
-            result["error"] = str(e)
-
-    return result
-
-
-def run_push(path: str, remote: str | None, branch: str | None, message: str) -> DailyRunResult:
-    """Merge upstream into the branch then push. Returns the push result."""
-    result: DailyRunResult = {
-        "path": path,
-        "timestamp": now_iso(),
-        "status": "ok",
-        "error": None,
-        "pushed": False,
-        "push_output": None,
-        "message": message,
-    }
-    if remote is None:
-        result["error"] = "no upstream remote configured"
-        result["status"] = "error"
-        return result
-    try:
-        base = f"refs/remotes/{remote}/HEAD"
-        gitops._git(["fetch", remote], path)
-        res = gitops._run(["git", "merge", "--ff-only", base], cwd=path, check=False)
-        if res.returncode != 0:
-            res = gitops._run(["git", "merge", base], cwd=path, check=False)
-        if res.returncode != 0:
-            result["status"] = "error"
-            result["error"] = f"merge failed: {res.stderr.strip()}"
-            return result
-        push = gitops.push(path, remote, branch, message)
-        result["push_output"] = push["output"]
-        result["pushed"] = push["ok"]
-        result["status"] = "ok" if push["ok"] else "error"
-        if not push["ok"]:
-            result["error"] = push["output"] or "push failed"
-    except Exception as e:
-        result["status"] = "error"
-        result["error"] = str(e)
-    return result
-
-
-def merge_upstream(path: str, upstream: dict) -> dict:
-    """Merge a single upstream into the focus branch. Returns {ok, detail}.
-    This is the auto-merge step (safe plans only) after approval."""
-    remote = upstream["name"]
-    branch = upstream.get("branch") or "main"
-    base = f"refs/remotes/{remote}/{branch}"
-    try:
-        res = gitops._git(["rev-list", "--count", f"{base}..HEAD"], path)
-        ahead = int(res or 0)
-    except Exception:
-        ahead = 0
+    Fast-forwards when the focus branch has no commits of its own. A merge
+    commit is only made with allow_merge_commit (an approved request).
+    """
+    ref = f"refs/remotes/{upstream['name']}/{upstream.get('branch') or focus}"
+    if not gitops.ref_exists(path, ref):
+        return {"ok": False, "action": "none", "detail": f"{ref} not fetched"}
+    behind, ahead = gitops.behind_ahead(path, focus, ref)
+    if behind == 0:
+        return {"ok": True, "action": "none", "detail": "already up to date"}
+    reason = blocker(path, focus)
+    if reason:
+        return {"ok": False, "action": "none", "detail": reason}
     if ahead == 0:
-        return {"ok": True, "detail": "nothing to merge"}
-    gitops._git(["fetch", "-f", remote, f"+refs/heads/*:refs/remotes/{remote}/*"], path)
-    res = gitops._run(["git", "merge", "--no-ff", base], cwd=path, check=False)
+        res = gitops._run(["git", "merge", "--ff-only", ref], cwd=path)
+        if res.returncode != 0:
+            return {"ok": False, "action": "none", "detail": (res.stderr or res.stdout).strip()}
+        return {"ok": True, "action": "fast-forward", "detail": f"fast-forwarded {behind} commit(s) from {ref}"}
+    if not allow_merge_commit:
+        return {"ok": False, "action": "none", "detail": f"both sides moved ({behind} behind, {ahead} ahead): needs approval"}
+    res = gitops._run(["git", "merge", "--no-ff", "--no-edit", ref], cwd=path)
     if res.returncode != 0:
         gitops._run(["git", "merge", "--abort"], cwd=path)
-        return {"ok": False, "detail": res.stderr.strip() or res.stdout.strip()}
-    return {"ok": True, "detail": f"merged {ahead} commit(s) from {remote}/{branch}"}
+        return {"ok": False, "action": "aborted", "detail": "merge failed and was aborted: " + ((res.stdout or res.stderr).strip()[-500:])}
+    return {"ok": True, "action": "merge", "detail": f"merged {behind} commit(s) from {ref}"}

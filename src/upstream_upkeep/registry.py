@@ -165,6 +165,8 @@ def add_url(repo_id: str, remote_name: str, remote_url: str,
     repo = _get_repo(repo_id)
     if not repo:
         return None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", remote_name or ""):
+        raise ValueError("remote name may only use letters, digits, '.', '_' and '-'")
     remotes = gitops.remotes(repo["path"])
     remote_url = remote_url.replace(" (fetch)", "").replace(" (push)", "")
     focus = focus_branch or repo.get("focus_branch") or gitops.current_branch(repo["path"])
@@ -173,11 +175,9 @@ def add_url(repo_id: str, remote_name: str, remote_url: str,
         gitops._run(["git", "remote", "add", remote_name, remote_url], cwd=repo["path"])
         remotes[remote_name] = remote_url
     up = {"name": remote_name, "url": remote_url, "branch": focus, "enabled": True}
-    if existing:
+    with store.lock:
         repo["upstreams"] = [u for u in repo.get("upstreams", []) if u.get("name") != remote_name] + [up]
-    else:
-        repo["upstreams"].append(up)
-    _save_repo(repo)
+        _save_repo(repo)
     return repo
 
 
@@ -186,21 +186,23 @@ def remove_upstream(repo_id: str, remote_name: str) -> dict | None:
     repo = _get_repo(repo_id)
     if not repo:
         return None
+    if remote_name not in {u.get("name") for u in repo.get("upstreams", [])}:
+        return None
     gitops._run(["git", "remote", "remove", remote_name], cwd=repo["path"])
-    repo["upstreams"] = [u for u in repo.get("upstreams", []) if u.get("name") != remote_name]
-    _save_repo(repo)
+    with store.lock:
+        repo["upstreams"] = [u for u in repo.get("upstreams", []) if u.get("name") != remote_name]
+        _save_repo(repo)
     return repo
 
 
 def set_focus_branch(repo_id: str, branch: str) -> dict | None:
-    """Set the branch the chat UI is focusing on (and used for upstream comparison)."""
-    repo = _get_repo(repo_id)
-    if not repo:
-        return None
-    repo["focus_branch"] = branch
-    for up in repo.get("upstreams", []):
-        up["branch"] = branch
-    _save_repo(repo)
+    """Set the branch you work on. Each upstream keeps its own branch to compare against."""
+    with store.lock:
+        repo = _get_repo(repo_id)
+        if not repo:
+            return None
+        repo["focus_branch"] = branch
+        _save_repo(repo)
     return repo
 
 
@@ -216,8 +218,9 @@ def set_watch(repo_id: str, enabled: bool) -> dict | None:
     repo = _get_repo(repo_id)
     if not repo:
         return None
-    repo["watch"] = enabled
-    _save_repo(repo)
+    with store.lock:
+        repo["watch"] = enabled
+        _save_repo(repo)
     return repo
 
 
@@ -280,6 +283,18 @@ def repo_summary() -> list[dict]:
             "error": error,
         })
     return out
+
+
+def repo_by_path(path: str) -> dict | None:
+    """The tracked repo at `path`, if any (so path-taking endpoints stay inside tracked repos)."""
+    try:
+        want = Path(path).resolve()
+    except (OSError, ValueError):
+        return None
+    for r in store.all_repos():
+        if Path(r["path"]).resolve() == want:
+            return r
+    return None
 
 
 def get_watching_repos() -> list[dict]:

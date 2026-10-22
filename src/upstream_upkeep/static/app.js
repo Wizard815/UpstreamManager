@@ -17,7 +17,8 @@ const route = (path) => { history.pushState({}, '', `${BASE}/${path.replace(/^\/
 const $ = (sel, root = document) => root.querySelector(sel)
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)]
 const api = (path, opts = {}) => {
-  const url = /^https?:\/\//.test(path) ? path : `${BASE}${path}`
+  // callers usually pass apiUrl(...), which already carries BASE; never add it twice
+  const url = /^https?:\/\//.test(path) || (BASE && path.startsWith(`${BASE}/`)) ? path : `${BASE}${path}`
   return fetch(url, { headers: { "Content-Type": "application/json", ...opts.headers }, ...opts }).then(r => r.json())
 }
 const apiUrl = (p) => `${BASE}${p}`
@@ -157,7 +158,7 @@ async function renderRepoPage(repoId) {
   content.append(el("a", { href: `${BASE}/repos`, style: "color:#9fb4ff", onclick: (e) => { e.preventDefault(); route('/repos') } }, "← All repos"))
 
   const focusSel = el("select")
-  const branches = await repoBranches(repo.path)
+  const branches = await repoBranches(repoId)
   for (const b of branches) focusSel.append(el("option", { value: b }, b))
   focusSel.value = repo.focus_branch
   focusSel.onchange = async () => {
@@ -183,9 +184,9 @@ async function renderRepoPage(repoId) {
   await Promise.all([renderChat(chatWrap, repoId, repo.focus_branch), renderTools(toolsWrap, repoId)])
 }
 
-async function repoBranches(path) {
+async function repoBranches(repoId) {
   try {
-    const res = await api(apiUrl(`/api/branches?repo=${encodeURIComponent(path)}`))
+    const res = await api(apiUrl(`/api/repo/${repoId}/branches`))
     return res.branches || []
   } catch { return []; }
 }
@@ -242,15 +243,17 @@ async function refreshUpstreams(wrap, repoId) {
   }
   const nameIn = el("input", { placeholder: "remote name (e.g. upstream)", style: "width:180px" })
   const urlIn = el("input", { placeholder: "https://github.com/org/repo.git", style: "width:320px" })
+  const branchIn = el("input", { placeholder: "its branch (default: focus)", style: "width:170px", title: "The upstream's branch to compare against, e.g. main or master" })
   const addUpBtn = el("button", { class: "btn", style: "align-self:flex-end" }, "Add upstream")
   addUpBtn.onclick = async () => {
     try {
-      await api(apiUrl(`/api/repo/${repoId}/upstream`), { method: "POST", body: JSON.stringify({ name: nameIn.value.trim(), url: urlIn.value.trim() }) })
+      const res = await api(apiUrl(`/api/repo/${repoId}/upstream`), { method: "POST", body: JSON.stringify({ name: nameIn.value.trim(), url: urlIn.value.trim(), branch: branchIn.value.trim() || null }) })
+      if (res.ok === false) return toast(res.error || "Could not add upstream", "error")
       toast("Upstream added. Press Fetch to compare.", "ok")
       await refreshUpstreams(wrap, repoId)
     } catch (e) { toast(String(e), "error") }
   }
-  wrap.append(el("div", { style: "display:flex;gap:8px;margin-top:12px;flex-wrap:wrap" }, nameIn, urlIn, addUpBtn))
+  wrap.append(el("div", { style: "display:flex;gap:8px;margin-top:12px;flex-wrap:wrap" }, nameIn, urlIn, branchIn, addUpBtn))
 }
 
 // Chat: one conversation per session. "New chat" resets what the model sees of
@@ -536,9 +539,17 @@ async function renderMemory(wrap, repoId) {
   cleanBtn.onclick = async () => {
     cleanBtn.disabled = true
     try {
-      const res = await api(apiUrl(`/api/repo/${repoId}/memory/cleanup`), { method: "POST", body: "{}" })
-      const why = Object.entries(res.reasons || {}).map(([k, v]) => `${v} ${k}`).join(", ")
-      toast(res.removed ? `Removed ${res.removed} (${why}), ${res.kept} kept` : "Already clean", "ok")
+      // Preview first; deletion has no undo, so only the previewed ids are removed.
+      const plan = await api(apiUrl(`/api/repo/${repoId}/memory/cleanup`), { method: "POST", body: JSON.stringify({ dry_run: true }) })
+      if (!plan.items?.length) toast("Already clean", "ok")
+      else {
+        const shown = plan.items.slice(0, 12).map(i => `• [${i.reason}] ${i.memory.slice(0, 90)}`).join("\n")
+        const more = plan.items.length > 12 ? `\n…and ${plan.items.length - 12} more` : ""
+        if (confirm(`Remove ${plan.items.length} memories? This can't be undone.\n\n${shown}${more}`)) {
+          const res = await api(apiUrl(`/api/repo/${repoId}/memory/cleanup`), { method: "POST", body: JSON.stringify({ ids: plan.items.map(i => i.id) }) })
+          toast(`Removed ${res.removed}, ${res.kept} kept`, "ok")
+        }
+      }
     } catch (e) { toast(String(e), "error") }
     cleanBtn.disabled = false
     await load()
@@ -558,34 +569,42 @@ async function renderRequests() {
   const wrap = el("div")
   content.append(wrap)
   try {
-    const reqs = await api(apiUrl('/api/requests'))
-    if (!reqs.length) { wrap.append(el("p", { class: "muted" }, "No pending requests.")); return; }
+    const reqs = (await api(apiUrl('/api/requests'))).slice().reverse()  // newest first
+    if (!reqs.length) { wrap.append(el("p", { class: "muted" }, "No requests. The daily check raises one when a merge needs your approval.")); return; }
     for (const r of reqs) {
+      const pending = r.status === "pending"
       const commentIn = el("input", { placeholder: "add a note…", style: "width:220px" })
+      const decide = async (decision, btn) => {
+        btn.disabled = true
+        if (decision === "approve") btn.textContent = "Merging…"
+        const res = await api(apiUrl(`/api/request/${encodeURIComponent(r.id)}/decide`), { method: "POST", body: JSON.stringify({ decision, comment: commentIn.value }) })
+        const detail = (res.request?.result || []).map(o => `${o.upstream}: ${o.detail}`).join("; ")
+        if (decision === "deny") toast("Denied", "info")
+        else toast(res.ok ? `Merged. ${detail}` : `Not merged. ${res.error || detail}`, res.ok ? "ok" : "error")
+        await renderRequests()
+      }
+      const approveBtn = el("button", { class: "btn" }, "Approve and merge")
+      approveBtn.onclick = () => decide("approve", approveBtn)
+      const denyBtn = el("button", { class: "btn danger" }, "Deny")
+      denyBtn.onclick = () => decide("deny", denyBtn)
       wrap.append(el("div", { class: "repo-card", id: `req-${r.id}` },
-        el("h3", {}, r.repo_name || r.repo_id,
-          el("span", { class: `badge ${r.safe === false ? "warn" : ""}` }, r.safe === false ? "CONFLICT" : "merge-ready")
+        el("h3", {}, r.repo_name || r.repo_id, " ",
+          el("span", { class: `badge ${r.safe === false ? "bad" : ""}` }, r.safe === false ? "conflicts" : "needs a merge commit"),
+          el("span", { class: `badge ${pending ? "warn" : r.status === "approved" ? "up" : ""}` }, r.status)
         ),
-        el("div", { class: "muted" }, `focus: ${r.focus_branch} · created ${r.created_at || "n/a"}`),
+        el("div", { class: "muted" }, `focus: ${r.focus_branch} · raised ${(r.created_at || "").slice(0, 16).replace("T", " ")}`
+          + (r.decided_at ? ` · decided ${r.decided_at.slice(0, 16).replace("T", " ")}` : "")),
         el("div", { style: "margin:8px 0" }, ...(r.upstreams || []).map(u =>
           el("div", { class: "upstream" },
-            el("div", {}, `↑ ${u.name} / ${u.branch}: behind ${u.behind} / ahead ${u.ahead}`),
-            u.conflict ? el("div", { class: "muted", style: "color:#e0a060" }, u.conflict_detail || "conflict") : null
+            el("div", {}, `${u.name} / ${u.branch}: ↓ ${u.behind} behind · ↑ ${u.ahead} ahead`),
+            u.reason ? el("div", { class: "muted", style: "color:#e0a060" }, u.reason) : null,
+            (u.conflict_files || []).length ? el("div", { class: "muted", style: "font-family:monospace;font-size:12px" }, u.conflict_files.slice(0, 20).join(", ")) : null
           )
         )),
-        el("div", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
-          el("button", { class: "btn", onclick: async () => {
-            const res = await api(apiUrl(`/api/request/${r.id}/decide`), { method: "POST", body: JSON.stringify({ decision: "approve", comment: commentIn.value }) })
-            if (res.ok) { toast("Approved — executing", "ok"); await renderRequests(); }
-            else toast("Failed", "error")
-          } }, "Approve"),
-          el("button", { class: "btn danger", onclick: async () => {
-            await api(apiUrl(`/api/request/${r.id}/decide`), { method: "POST", body: JSON.stringify({ decision: "deny", comment: commentIn.value }) })
-            toast("Denied", "info")
-            await renderRequests()
-          } }, "Deny"),
-          commentIn
-        )
+        (r.result || []).length ? el("div", { class: "muted" }, "Result: " + r.result.map(o => `${o.upstream}: ${o.detail}`).join("; ")) : null,
+        r.comment ? el("div", { class: "muted" }, `Note: ${r.comment}`) : null,
+        pending ? el("div", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px" }, approveBtn, denyBtn, commentIn,
+          el("span", { class: "muted", style: "font-size:12px" }, "Approve merges into your local branch. Conflicts are never auto-resolved; the merge is aborted instead. Nothing is pushed.")) : null
       ))
     }
   } catch (e) { toast(String(e), "error") }

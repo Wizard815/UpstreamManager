@@ -20,6 +20,7 @@ Config (env wins over settings["memory"]):
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -156,30 +157,52 @@ def remember(repo_id: str, text: str, kind: str, extra: dict | None = None) -> l
     return [_fmt(r) for r in res.get("results", [])]
 
 
-def learn_from_chat(repo_id: str, user_msg: str, reply: str) -> None:
-    """Let mem0 pull durable facts out of a chat turn, in the background.
+EXTRACT_PROMPT = """You pick out long-term memories from a developer's chat message about a git repository.
+Keep only durable facts about the user: preferences, rules, decisions, plans and constraints.
+Ignore questions, greetings, and anything about specific commits, files or counts (the app tracks those itself).
+Write each fact as one short sentence starting with "User".
+Reply with JSON only: {"facts": ["..."]}, or {"facts": []} when there is nothing durable."""
 
-    It is one more LLM call, so it must not hold up the chat reply. Only the
-    user's message is extracted from: the reply restates repo facts (commits
-    the index already holds) and would be saved back as duplicate memories.
+
+def _extract_facts(user_msg: str) -> list[str]:
+    """Ask the chat model for durable facts in one message. Runs without any lock held."""
+    import requests
+    from . import llm
+    cfg = llm.config()
+    resp = requests.post(
+        f"{cfg['base_url']}/chat/completions", headers=llm._headers(cfg["api_key"]), timeout=180,
+        json={"model": cfg["model"], "temperature": 0.1, "max_tokens": 400,
+              "chat_template_kwargs": {"enable_thinking": False},
+              "messages": [{"role": "system", "content": EXTRACT_PROMPT}, {"role": "user", "content": user_msg}]},
+    )
+    resp.raise_for_status()
+    text = resp.json()["choices"][0]["message"].get("content") or ""
+    found = re.search(r"\{.*\}", text, re.S)
+    facts = json.loads(found.group(0)).get("facts", []) if found else []
+    return [f.strip() for f in facts if isinstance(f, str) and len(f.strip()) >= 8][:5]
+
+
+def learn_from_chat(repo_id: str, user_msg: str, reply: str) -> None:
+    """Pull durable facts out of the user's message, in the background.
+
+    The model call happens outside the memory lock, so chat and the Memory panel
+    are never stuck behind it; only the short writes take the lock. Only the
+    user's message is used: replies restate repo facts the commit index already
+    holds. Facts that still mention a commit id are dropped for the same reason.
     """
     def run():
-        m = get()
-        if m is None:
+        if get() is None:
             return
         try:
-            with _io:
-                res = m.add([{"role": "user", "content": user_msg}],
-                            user_id=USER, metadata={"repo": repo_id, "kind": "chat"})
-                # Small models still restate commits they were shown; the commit index
-                # already holds those, so drop any such fact instead of keeping a duplicate.
-                for r in res.get("results", []):
-                    if r.get("id") and _COMMIT_FACT.search(r.get("memory") or ""):
-                        m.delete(r["id"])
-            if _settings()["auto_cleanup"]:
-                cleanup(repo_id)
+            facts = _extract_facts(user_msg)
         except Exception as e:
             log.warning("memory extraction failed for %s: %s", repo_id, e)
+            return
+        for fact in facts:
+            if not _COMMIT_FACT.search(fact):
+                remember(repo_id, fact, kind="chat")
+        if facts and _settings()["auto_cleanup"]:
+            cleanup(repo_id)
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -228,23 +251,29 @@ def _similar(a: set, b: set) -> bool:
     return bool(a and b) and len(a & b) / len(a | b) >= 0.8
 
 
-def cleanup(repo_id: str) -> dict:
-    """Prune a repo's memories: junk, exact and near duplicates, stale events.
+def cleanup(repo_id: str, dry_run: bool = False, thorough: bool = False, only_ids: list[str] | None = None) -> dict:
+    """Prune a repo's memories: junk, duplicates and stale events.
 
-    Oldest copy wins, so a memory keeps its original date. Safe to run any time;
-    it runs automatically after chat extraction and commit indexing.
+    The automatic pass (after chat extraction and commit indexing) only removes
+    things that are certainly redundant: empty items, exact duplicates, repeated
+    commits, facts that restate a commit, and events beyond the newest 50.
+    `thorough` also removes near-duplicate wording; it is only used from the
+    Clean up button, which previews first (dry_run) and then deletes exactly the
+    previewed ids (only_ids). The oldest copy of a memory is the one kept.
     """
     if get() is None:
-        return {"removed": 0, "kept": 0, "reasons": {}}
+        return {"removed": 0, "kept": 0, "reasons": {}, "items": []}
     items = sorted(list_repo(repo_id, k=2000), key=lambda r: r.get("created_at") or "")  # oldest first
     drop: dict[str, str] = {}
     seen_sha: set[str] = set()
+    seen_text: set[tuple[str, str]] = set()
     kept_words: dict[str, list[set]] = {}
     events: list[dict] = []
     for it in items:
         text = (it.get("memory") or "").strip()
         kind = it.get("kind") or "chat"
         words = set(_WORDS.findall(text.lower()))
+        key = (kind, " ".join(sorted(words)))
         if len(text) < 8:
             drop[it["id"]] = "empty"
         elif kind == "chat" and _COMMIT_FACT.search(text):
@@ -253,18 +282,26 @@ def cleanup(repo_id: str) -> dict:
             if m.group(1) in seen_sha:
                 drop[it["id"]] = "duplicate commit"
             seen_sha.add(m.group(1))
+        elif key in seen_text:
+            drop[it["id"]] = "duplicate"
         elif kind == "event":
             events.append(it)
-        elif kind != "commit":
-            if any(_similar(words, w) for w in kept_words.get(kind, [])):
-                drop[it["id"]] = "duplicate"
-            else:
-                kept_words.setdefault(kind, []).append(words)
+        elif thorough and kind != "commit" and any(_similar(words, w) for w in kept_words.get(kind, [])):
+            drop[it["id"]] = "near-duplicate"
+        else:
+            kept_words.setdefault(kind, []).append(words)
+        seen_text.add(key)
     for it in events[:-MAX_EVENTS]:  # keep only the newest events
         drop[it["id"]] = "old event"
-    for mid in drop:
-        forget(mid)
+    if only_ids is not None:
+        drop = {i: r for i, r in drop.items() if i in set(only_ids)}
+    by_id = {it["id"]: it for it in items}
+    preview = [{"id": i, "memory": by_id[i]["memory"], "kind": by_id[i]["kind"], "reason": r} for i, r in drop.items()]
+    if not dry_run:
+        for mid in drop:
+            forget(mid)
     reasons: dict[str, int] = {}
     for r in drop.values():
         reasons[r] = reasons.get(r, 0) + 1
-    return {"removed": len(drop), "kept": len(items) - len(drop), "reasons": reasons}
+    return {"removed": 0 if dry_run else len(drop), "would_remove": len(drop), "kept": len(items) - len(drop),
+            "reasons": reasons, "items": preview}
