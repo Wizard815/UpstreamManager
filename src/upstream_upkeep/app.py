@@ -25,15 +25,14 @@ Endpoints:
 """
 from __future__ import annotations
 
-import json
 import os
 import threading
 from pathlib import Path
+from urllib.parse import urlparse
 
-import requests
 from flask import Flask, jsonify, request, render_template_string, abort
 
-from . import config, registry, store, upstream_check, change_engine, daily_check, gitops, memory
+from . import config, registry, store, upstream_check, daily_check, gitops, memory
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -41,6 +40,30 @@ flask_app.config["JSON_SORT_KEYS"] = False
 
 # background lock so concurrent daily-checks don't race
 _run_lock = threading.Lock()
+
+# Extra hosts (host:port) allowed to send changes, e.g. a proxy in front of the app.
+_ALLOWED_HOSTS = {h.strip() for h in os.environ.get("UPSTREAM_ALLOWED_HOSTS", "").split(",") if h.strip()}
+
+
+@flask_app.before_request
+def _refuse_cross_site_writes():
+    """Refuse state-changing requests that another web page could forge.
+
+    Any site can make your browser send a "simple" cross-origin POST (text/plain
+    or a form) to localhost without asking. Requiring a JSON body type forces a
+    CORS preflight, which this app never approves, and a foreign Origin header
+    is rejected outright. Reads are unaffected.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    if request.mimetype != "application/json":
+        return jsonify({"ok": False, "error": "send requests as application/json"}), 415
+    origin = request.headers.get("Origin")
+    if origin and origin != "null":
+        allowed = {request.host, request.headers.get("X-Forwarded-Host", "")} | _ALLOWED_HOSTS
+        if urlparse(origin).netloc not in allowed:
+            return jsonify({"ok": False, "error": "cross-site request refused"}), 403
+    return None
 
 
 @flask_app.route("/")
@@ -65,7 +88,7 @@ def api_repo(repo_id):
     repo = registry.get_repo(repo_id)
     if not repo:
         abort(404)
-    return jsonify(repo)
+    return jsonify(store.snapshot(repo))
 
 
 @flask_app.route("/api/add", methods=["POST"])
@@ -104,7 +127,10 @@ def api_add_upstream(repo_id):
     branch = data.get("branch")
     if not name or not url:
         abort(400)
-    repo = registry.add_url(repo_id, name, url, branch)
+    try:
+        repo = registry.add_url(repo_id, name, url, branch)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     if not repo:
         abort(404)
     return jsonify({"ok": True, "repo": repo})
@@ -142,8 +168,9 @@ def api_commits(repo_id):
         abort(404)
     view = request.args.get("view", "all")
     focus = repo.get("focus_branch") or "HEAD"
-    up = request.args.get("upstream") or (repo["upstreams"][0]["name"] if repo.get("upstreams") else None)
-    upref = f"refs/remotes/{up}/{focus}" if up else None
+    ups = {u["name"]: u for u in repo.get("upstreams", [])}
+    up = ups.get(request.args.get("upstream", "")) or next(iter(ups.values()), None)
+    upref = f"refs/remotes/{up['name']}/{up.get('branch') or focus}" if up else None
     if view in ("behind", "ahead") and not (upref and gitops.ref_exists(repo["path"], upref)):
         return jsonify({"ok": False, "error": "upstream not fetched yet - press Fetch", "items": []})
     rev = {"all": focus, "behind": f"{focus}..{upref}", "ahead": f"{upref}..{focus}"}.get(view, focus)
@@ -216,11 +243,12 @@ def api_enable_upstream(repo_id, name):
     repo = registry.get_repo(repo_id)
     if not repo:
         abort(404)
-    for up in repo.get("upstreams", []):
-        if up.get("name") == name:
-            up["enabled"] = bool(enabled)
-    store.save_repo(repo)
-    return jsonify({"ok": True, "repo": repo})
+    with store.lock:
+        for up in repo.get("upstreams", []):
+            if up.get("name") == name:
+                up["enabled"] = bool(enabled)
+        store.save_repo(repo)
+    return jsonify({"ok": True, "repo": store.snapshot(repo)})
 
 
 @flask_app.route("/api/repo/<repo_id>/upstream/<name>", methods=["DELETE"])
@@ -233,56 +261,51 @@ def api_remove_upstream(repo_id, name):
 
 @flask_app.route("/api/run-daily", methods=["POST"])
 def api_run_daily():
+    """Fetch every watched repo and bring it up to date where that is risk-free.
+
+    Fast-forwards happen automatically (clean tree, focus branch checked out, no
+    commits of yours to merge). Anything else (both sides moved, conflicts, a
+    dirty tree) raises one approval request per repo and branch. Nothing is pushed.
+    """
+    results = []
     with _run_lock:
-        repos = registry.get_watching_repos()
-        results = []
-        for repo in repos:
+        for repo in registry.get_watching_repos():
+            focus = repo.get("focus_branch") or gitops.current_branch(repo["path"]) or "main"
             try:
-                plan = upstream_check.build_merge_plan(
-                    repo["path"], repo["id"], repo["name"], repo["upstreams"],
-                    focus_branch=repo.get("focus_branch"), fetch=True,
-                )
-                # decide auto-merge vs request
-                if plan.safe:
-                    # attempt auto-merge + push for each safe upstream
-                    for up in plan.upstreams:
-                        if up.conflict or up.up_to_date:
+                plan = upstream_check.build_merge_plan(repo["path"], repo["id"], repo["name"], repo["upstreams"],
+                                                       focus_branch=focus, fetch=True)
+                pending = []
+                for up in plan.upstreams:
+                    if up.missing_ref or up.behind == 0:
+                        continue
+                    if up.ahead == 0 and not up.conflict:
+                        r = daily_check.merge_upstream(repo["path"], up.to_dict(), focus)
+                        if r["ok"]:
+                            results.append({"repo_id": repo["id"], "repo_name": repo["name"], "upstream": up.name,
+                                            "status": "merged", "behind": up.behind, "detail": r["detail"]})
                             continue
-                        # merge upstream into focus branch
-                        merge = daily_check.merge_upstream(repo["path"], up)
-                        if merge["ok"]:
-                            results.append({
-                                "repo_id": repo["id"],
-                                "repo_name": repo["name"],
-                                "upstream": up.name,
-                                "status": "merged",
-                                "ahead": up.ahead,
-                                "behind": up.behind,
-                                "push": merge,
-                            })
-                else:
-                    # conflict -> raise a request
-                    request_rec = {
-                        "id": f"{repo['id']}:{plan.focus_branch}",
+                        reason = r["detail"]
+                    else:
+                        reason = (f"{len(up.conflict_files)} conflicting file(s)" if up.conflict
+                                  else f"needs a merge commit ({up.ahead} commit(s) of yours)")
+                    pending.append({**up.to_dict(), "reason": reason})
+                if pending:
+                    store.record_request({
+                        "id": f"{repo['id']}:{focus}",
                         "repo_id": repo["id"],
                         "repo_name": repo["name"],
-                        "focus_branch": plan.focus_branch,
-                        "conflicts": plan.conflicts,
-                        "upstreams": [u.to_dict() for u in plan.upstreams],
-                        "actions": plan.actions,
-                        "safe": plan.safe,
+                        "focus_branch": focus,
+                        "conflicts": [f"{u['name']}/{u['branch']}" for u in pending if u["conflict"]],
+                        "upstreams": pending,
+                        "safe": not any(u["conflict"] for u in pending),
                         "status": "pending",
                         "created_at": config.now_iso(),
                         "comment": None,
                         "decided_at": None,
-                    }
-                    store.record_request(request_rec)
-                    results.append({
-                        "repo_id": repo["id"],
-                        "repo_name": repo["name"],
-                        "status": "request_raised",
-                        "conflicts": plan.conflicts,
                     })
+                    results.append({"repo_id": repo["id"], "repo_name": repo["name"], "status": "request_raised",
+                                    "conflicts": [u["name"] for u in pending if u["conflict"]],
+                                    "reasons": [u["reason"] for u in pending]})
             except Exception as e:
                 results.append({"repo_id": repo["id"], "status": "error", "error": str(e)})
     for r in results:
@@ -293,9 +316,9 @@ def api_run_daily():
 def _remember_daily(r: dict) -> None:
     status = r.get("status")
     if status == "merged":
-        text = f"Daily check merged upstream {r.get('upstream')} ({r.get('behind')} commits behind, {r.get('ahead')} ahead)."
+        text = f"Daily check brought in {r.get('behind')} commit(s) from upstream {r.get('upstream')} ({r.get('detail')})."
     elif status == "request_raised":
-        text = f"Daily check found conflicts and raised an approval request: {', '.join(map(str, r.get('conflicts') or [])) or 'see request'}."
+        text = f"Daily check raised an approval request: {'; '.join(r.get('reasons') or []) or 'see request'}."
     elif status == "error":
         text = f"Daily check failed: {r.get('error')}"
     else:
@@ -318,17 +341,33 @@ def api_decide(req_id):
     comment = data.get("comment")
     if decision not in ("approve", "deny"):
         abort(400)
-    result = store.decide_request(req_id, decision, comment)
-    if not result:
+    req = store.get_request(req_id)
+    if not req:
         abort(404)
+    if req.get("status") != "pending":
+        return jsonify({"ok": False, "error": f"request is already {req.get('status')}"}), 409
+    outcome, failed = None, False
+    if decision == "approve":
+        # Approval runs the merge. Conflicts can't be resolved here: the merge is
+        # aborted and reported, and the working tree is left untouched.
+        repo = registry.get_repo(req["repo_id"])
+        if not repo:
+            abort(404)
+        with _run_lock:
+            outcome = [{"upstream": u["name"], **daily_check.merge_upstream(repo["path"], u, req["focus_branch"],
+                                                                            allow_merge_commit=True)}
+                       for u in req.get("upstreams", [])]
+        failed = not all(o["ok"] for o in outcome)
+    result = store.decide_request(req_id, decision, comment, outcome, failed)
     try:
         memory.remember(result["repo_id"], (
-            f"{config.now_iso()[:10]}: You {result['status']} the merge request for branch "
-            f"{result.get('focus_branch')} (conflicts: {', '.join(map(str, result.get('conflicts') or [])) or 'none'})"
+            f"{config.now_iso()[:10]}: Merge request for branch {result.get('focus_branch')} was {result['status']}"
+            f" ({'; '.join(o['detail'] for o in result.get('result') or []) or 'no merge run'}; "
+            f"conflicts: {', '.join(map(str, result.get('conflicts') or [])) or 'none'})"
             + (f". Comment: {comment}" if comment else ".")), kind="decision")
     except Exception:
         pass
-    return jsonify({"ok": True, "request": result})
+    return jsonify({"ok": not failed, "request": store.snapshot(result)})
 
 
 @flask_app.route("/api/repo/<repo_id>/chat", methods=["POST"])
@@ -350,7 +389,7 @@ def api_chat_history(repo_id):
     """Messages of one session (?session=<id>, default: the active one)."""
     if not registry.get_repo(repo_id):
         abort(404)
-    session = store.get_session(repo_id, request.args.get("session"))
+    session = store.snapshot(store.get_session(repo_id, request.args.get("session")))
     return jsonify({"session": session["id"], "title": session.get("title"), "messages": session["messages"]})
 
 
@@ -437,17 +476,22 @@ def api_memory_index_commits(repo_id):
                         kind="commit", extra={"sha": c["sha"]})
         done.add(c["sha"])
         added += 1
-    repo["indexed_commits"] = sorted(done)
-    store.save_repo(repo)
+    with store.lock:
+        repo["indexed_commits"] = sorted(done)
+        store.save_repo(repo)
     cleaned = memory.cleanup(repo_id) if memory._settings()["auto_cleanup"] else None
     return jsonify({"ok": True, "added": added, "total": len(done), "cleaned": cleaned})
 
 
 @flask_app.route("/api/repo/<repo_id>/memory/cleanup", methods=["POST"])
 def api_memory_cleanup(repo_id):
+    """Clean up: {"dry_run": true} previews (thorough), {"ids": [...]} deletes exactly those."""
     if not registry.get_repo(repo_id):
         abort(404)
-    return jsonify({"ok": True, **memory.cleanup(repo_id)})
+    data = request.get_json(silent=True) or {}
+    ids = data.get("ids")
+    return jsonify({"ok": True, **memory.cleanup(repo_id, dry_run=bool(data.get("dry_run")), thorough=True,
+                                                  only_ids=ids if isinstance(ids, list) else None)})
 
 
 @flask_app.route("/api/memory/<memory_id>", methods=["DELETE"])
@@ -470,41 +514,33 @@ def api_save_settings():
     return jsonify({"ok": True, "settings": new})
 
 
+def _tracked(repo_id: str | None) -> dict:
+    repo = registry.get_repo(repo_id) if repo_id else None
+    if not repo:
+        abort(404)
+    return repo
+
+
 @flask_app.route("/api/files", methods=["GET"])
 def api_files():
-    repo_id = request.args.get("repo")
-    path = request.args.get("path", "")
-    repo = registry.get_repo(repo_id) if repo_id else None
-    base = repo["path"] if repo else os.getcwd()
-    if path:
-        base = os.path.normpath(os.path.join(base, path))
-    p = Path(base)
-    if not p.exists() or not p.is_dir():
+    """Legacy directory listing; limited to a tracked repo (prefer /api/repo/<id>/tree)."""
+    repo = _tracked(request.args.get("repo"))
+    d = _repo_file(repo, request.args.get("path", ""))
+    if d is None or not d.is_dir():
         abort(400)
-    entries = []
-    for child in p.iterdir():
-        entries.append({
-            "name": child.name,
-            "type": "dir" if child.is_dir() else "file",
-            "modified": child.stat().st_mtime,
-        })
-    return jsonify({"path": str(base), "entries": entries})
+    entries = [{"name": c.name, "type": "dir" if c.is_dir() else "file", "modified": c.stat().st_mtime}
+               for c in d.iterdir()]
+    return jsonify({"path": str(d), "entries": entries})
 
 
 @flask_app.route("/api/files/contents", methods=["GET"])
 def api_file_contents():
-    repo_id = request.args.get("repo")
-    path = request.args.get("path", "")
-    repo = registry.get_repo(repo_id) if repo_id else None
-    base = repo["path"] if repo else os.getcwd()
-    full = os.path.normpath(os.path.join(base, path))
-    if Path(base).resolve() not in Path(full).resolve().parents:
-        abort(400)
-    p = Path(full)
-    if not p.is_file():
+    repo = _tracked(request.args.get("repo"))
+    p = _repo_file(repo, request.args.get("path", ""))
+    if p is None or not p.is_file():
         abort(404)
     try:
-        content = p.read_text()
+        content = p.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return jsonify({"error": "binary file"}), 400
     return jsonify({"path": str(p), "content": content})
@@ -513,29 +549,35 @@ def api_file_contents():
 @flask_app.route("/api/files/contents", methods=["POST"])
 def api_file_write():
     data = request.get_json(force=True) or {}
-    repo_id = data.get("repo")
-    path = data.get("path")
-    content = data.get("content", "")
-    repo = registry.get_repo(repo_id) if repo_id else None
-    base = repo["path"] if repo else os.getcwd()
-    full = os.path.normpath(os.path.join(base, path))
-    if Path(base).resolve() not in Path(full).resolve().parents:
+    repo = _tracked(data.get("repo"))
+    p = _repo_file(repo, data.get("path") or "")
+    if p is None or p == Path(repo["path"]).resolve() or ".git" in p.relative_to(Path(repo["path"]).resolve()).parts:
         abort(400)
-    p = Path(full)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content)
+    p.write_text(data.get("content", ""), encoding="utf-8")
     return jsonify({"ok": True, "path": str(p)})
+
+
+@flask_app.route("/api/repo/<repo_id>/branches")
+def api_repo_branches(repo_id):
+    return _branches(_tracked(repo_id))
 
 
 @flask_app.route("/api/branches")
 def api_branches():
-    path = request.args.get("repo", "")
+    """Legacy: ?repo=<path>, accepted only for a tracked repo's path."""
+    repo = registry.repo_by_path(request.args.get("repo", ""))
+    if not repo:
+        abort(404)
+    return _branches(repo)
+
+
+def _branches(repo: dict):
     try:
-        out = gitops._git(["branch", "-a"], path)
-    except Exception:
+        out = gitops._git(["branch", "--format=%(refname:short)"], repo["path"])
+    except gitops.GitError:
         return jsonify({"branches": []})
-    branches = [l.strip().lstrip("* ").strip() for l in out.splitlines() if l.strip()]
-    return jsonify({"branches": branches})
+    return jsonify({"branches": [l.strip() for l in out.splitlines() if l.strip()]})
 
 
 @flask_app.route("/api/models")
