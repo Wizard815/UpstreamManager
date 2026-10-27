@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -254,38 +255,45 @@ def upstream_for_branch(repo: dict, upstream_url: str) -> dict | None:
 
 
 def repo_summary() -> list[dict]:
-    """Per-repo summary for the list view, from refs already in each repo (no network)."""
-    out = []
-    for repo in store.all_repos():
-        ups, conflicts, error = [], [], None
-        try:
-            plan = upstream_check.build_merge_plan(
-                repo["path"], repo["id"], repo["name"], repo.get("upstreams", []),
-                focus_branch=repo.get("focus_branch"),
-            )
-            ups = [u.to_dict() for u in plan.upstreams]
-            conflicts = plan.conflicts
-        except Exception as e:
-            error = str(e)
-        commits = gitops.recent_commits(repo["path"], 1)
-        out.append({
-            "id": repo["id"],
-            "name": repo.get("name"),
-            "path": repo.get("path"),
-            "kind": repo.get("kind"),
-            "focus_branch": repo.get("focus_branch"),
-            "watch": repo.get("watch", True),
-            "behind": sum(u["behind"] for u in ups),
-            "ahead": sum(u["ahead"] for u in ups),
-            "conflicts": conflicts,
-            "upstream_details": ups,
-            "components": _component_summary(repo),
-            "upstreams": [u["name"] for u in repo.get("upstreams", [])],
-            "last_commit": commits[0] if commits else None,
-            "dirty": gitops.status_summary(repo["path"])["dirty"] if not error else 0,
-            "error": error,
-        })
-    return out
+    """Per-repo summary for the list view, from refs already in each repo (no network).
+
+    Repos are summarised in parallel: it is all read-only git, and each git call
+    costs ~0.4s on Windows, so going one repo at a time took many seconds.
+    """
+    repos = store.snapshot(store.all_repos())
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(repos)))) as pool:
+        return list(pool.map(_summary, repos))
+
+
+def _summary(repo: dict) -> dict:
+    ups, conflicts, error = [], [], None
+    try:
+        plan = upstream_check.build_merge_plan(
+            repo["path"], repo["id"], repo["name"], repo.get("upstreams", []),
+            focus_branch=repo.get("focus_branch"),
+        )
+        ups = [u.to_dict() for u in plan.upstreams]
+        conflicts = plan.conflicts
+    except Exception as e:
+        error = str(e)
+    commits = gitops.recent_commits(repo["path"], 1)
+    return {
+        "id": repo["id"],
+        "name": repo.get("name"),
+        "path": repo.get("path"),
+        "kind": repo.get("kind"),
+        "focus_branch": repo.get("focus_branch"),
+        "watch": repo.get("watch", True),
+        "behind": sum(u["behind"] for u in ups),
+        "ahead": sum(u["ahead"] for u in ups),
+        "conflicts": conflicts,
+        "upstream_details": ups,
+        "components": _component_summary(repo),
+        "upstreams": [u["name"] for u in repo.get("upstreams", [])],
+        "last_commit": commits[0] if commits else None,
+        "dirty": gitops.status_summary(repo["path"])["dirty"] if not error else 0,
+        "error": error,
+    }
 
 
 def repo_by_path(path: str) -> dict | None:
@@ -304,7 +312,7 @@ def _component_summary(repo: dict) -> list[dict]:
     """Per-component drift for the repo list (no network)."""
     try:
         return [{k: c.get(k) for k in ("name", "path", "status", "behind", "local", "enabled", "watched_changes")}
-                for c in components.compare_all(repo)]
+                for c in components.compare_all(repo, light=True)]
     except Exception as e:  # never break the list over one hub
         return [{"name": "components", "status": "error", "detail": str(e)}]
 

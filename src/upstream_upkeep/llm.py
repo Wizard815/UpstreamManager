@@ -194,7 +194,13 @@ def _relevant(m: dict, minimum: float) -> bool:
     return m.get("score") is None or m["score"] >= minimum
 
 
-def _memory_block(repo_id: str, message: str) -> str:
+# Memories that describe the user (preferences, rules, decisions, notes) as
+# opposed to the repo's history (commits, daily-check events).
+USER_KINDS = {"chat", "note", "decision"}
+
+
+def _memories(repo_id: str, message: str) -> tuple[list[dict], list[dict], list[dict]]:
+    """(about the user, about the repo, from other repos) relevant to `message`."""
     # Commits are far more numerous than notes and preferences, so they would crowd
     # the latter out of one shared top-k. Search the two groups separately.
     own = [m for m in memory.search(message, repo_id=repo_id, kind="commit", k=5)
@@ -202,13 +208,29 @@ def _memory_block(repo_id: str, message: str) -> str:
     # Other repos' memories only when they are clearly about the same thing;
     # loosely similar ones (another repo's "commits behind" chat) mislead the model.
     other = [m for m in memory.search(message, exclude=repo_id, k=4) if _relevant(m, OTHER_REPO_MIN_SCORE)]
+    user = [m for m in own if m["kind"] in USER_KINDS]
+    return user, [m for m in own if m["kind"] not in USER_KINDS], other
+
+
+def _memory_block(repo_mem: list[dict], other: list[dict]) -> str:
+    """Repo-history memories for the system prompt (user preferences go next to the question)."""
     parts = []
-    if own:
-        parts.append("What you remember about this repo:\n" + "\n".join(f"- [{m['kind']}] {m['memory']}" for m in own))
+    if repo_mem:
+        parts.append("What you remember about this repo:\n" + "\n".join(f"- [{m['kind']}] {m['memory']}" for m in repo_mem))
     if other:
         parts.append("Possibly related, from other watched repos:\n" + "\n".join(
             f"- ({m['repo']}, {m['kind']}) {m['memory']}" for m in other))
     return "\n\n".join(parts)
+
+
+def _preferences_block(user: list[dict]) -> str:
+    """The user's own preferences and notes that bear on this message."""
+    seen, lines = set(), []
+    for m in user:
+        if m["memory"] not in seen:
+            seen.add(m["memory"])
+            lines.append(f"- {m['memory']}")
+    return ("What you know about me (follow these in your answer):\n" + "\n".join(lines)) if lines else ""
 
 
 def _history(session: dict) -> list[dict]:
@@ -226,14 +248,22 @@ def _history(session: dict) -> list[dict]:
 
 def build_messages(repo: dict, session: dict, message: str, attachments: list[dict] | None = None) -> list[dict]:
     system = SYSTEM_PROMPT + "\n\n" + repo_facts(repo)
-    mem = _memory_block(repo["id"], message)
+    user_mem, repo_mem, other_mem = _memories(repo["id"], message)  # one search per message
+    mem = _memory_block(repo_mem, other_mem)
     if mem:
         system += "\n\n" + mem
     # Attachments go in the user's turn, right before the request: small models
     # ground on the latest user message far better than on a long system prompt.
+    # Preferences go there too, for the same reason: a 4B model ignored "User
+    # prefers small PRs" when it sat in the system prompt.
     att = attachments_block(repo, attachments or [])
-    user = (f"Attached files and commits (current contents, exactly as they are on disk):\n\n{att}\n\n---\n\n{message}"
-            if att else message)
+    prefs = _preferences_block(user_mem)
+    head = []
+    if att:
+        head.append(f"Attached files and commits (current contents, exactly as they are on disk):\n\n{att}")
+    if prefs:
+        head.append(prefs)
+    user = "\n\n".join(head) + f"\n\n---\n\n{message}" if head else message
     return [{"role": "system", "content": system}, *_history(session), {"role": "user", "content": user}]
 
 
