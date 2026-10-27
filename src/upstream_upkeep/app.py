@@ -32,8 +32,8 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, render_template_string, abort
 
-from . import (components, config, credentials, daily_check, edits, github, gitops, memory, pull_report, registry,
-               store, upstream_check, workflows)
+from . import (actions, components, config, credentials, daily_check, edits, github, gitops, memory, pull_report,
+               registry, store, upstream_check, workflows)
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -360,6 +360,84 @@ def api_github_secrets(repo_id):
     except github.GitHubError as e:
         return jsonify({"ok": False, "error": str(e)})
     return jsonify({"ok": True, "repo": f"{rem['owner']}/{rem['repo']}", "secrets": names})
+
+
+# ------------------------------------------------------------ github actions
+@flask_app.route("/api/repo/<repo_id>/actions")
+def api_actions(repo_id):
+    """Workflows of a GitHub remote with run stats, triggers and fork suggestions."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    if request.args.get("refresh"):
+        actions.clear_cache()
+    try:
+        data = actions.overview(repo, request.args.get("remote") or "origin")
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    if data.get("ok") and not repo.get("known_workflows"):
+        # First look: today's set is the baseline; later additions get flagged as new.
+        with store.lock:
+            repo["known_workflows"] = actions.local_files(repo["path"])
+            store.save_repo(repo)
+    return jsonify(data)
+
+
+@flask_app.route("/api/repo/<repo_id>/actions/reviewed", methods=["POST"])
+def api_actions_reviewed(repo_id):
+    """Mark the current workflow files as reviewed (clears the "new" flags)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    with store.lock:
+        repo["known_workflows"] = actions.local_files(repo["path"])
+        store.save_repo(repo)
+    return jsonify({"ok": True, "count": len(repo["known_workflows"])})
+
+
+@flask_app.route("/api/repo/<repo_id>/actions/request", methods=["POST"])
+def api_actions_request(repo_id):
+    """Raise an approval request to disable and/or enable workflows on GitHub."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    data = request.get_json(force=True) or {}
+    try:
+        info = actions.overview(repo, data.get("remote") or "origin")
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    if not info.get("ok"):
+        return jsonify(info)
+    by_id = {w["id"]: w for w in info["workflows"]}
+    pick = lambda ids, want: [{"id": w["id"], "name": w["name"], "path": w["path"], "reasons": w["reasons"],
+                               "stats": w["stats"]} for i in ids if (w := by_id.get(int(i))) and w["state"] in want]
+    disable = pick(data.get("disable") or [], {"active"})
+    enable = pick(data.get("enable") or [], {"disabled_manually", "disabled_inactivity"})
+    if not disable and not enable:
+        return jsonify({"ok": False, "error": "nothing to change (pick active workflows to disable or disabled ones to enable)"})
+    rec = store.record_request({
+        "id": f"{repo['id']}:actions", "type": "actions", "repo_id": repo["id"], "repo_name": repo["name"],
+        "focus_branch": repo.get("focus_branch"), "owner": info["owner"], "github_repo": info["repo"],
+        "fork": info["fork"], "parent": info["parent"], "disable": disable, "enable": enable,
+        "safe": True, "status": "pending", "created_at": config.now_iso(), "comment": None, "decided_at": None,
+        "upstreams": [], "conflicts": [],
+    })
+    return jsonify({"ok": True, "request": store.snapshot(rec)})
+
+
+def _do_actions(req: dict) -> list[dict]:
+    """Run an approved actions request: one API call per workflow."""
+    out = []
+    for enable, items in ((False, req.get("disable") or []), (True, req.get("enable") or [])):
+        for w in items:
+            try:
+                actions.set_state(req["owner"], req["github_repo"], w["id"], enable)
+                out.append({"upstream": w["name"], "ok": True, "detail": "enabled" if enable else "disabled"})
+            except github.GitHubError as e:
+                out.append({"upstream": w["name"], "ok": False, "detail": str(e)})
+                if "no GitHub token" in str(e) or "401" in str(e) or "403" in str(e):
+                    break  # the rest would fail the same way
+    return out
 
 
 # ------------------------------------------------------------ pull reports
@@ -714,6 +792,11 @@ def api_decide(req_id):
         repo = registry.get_repo(req["repo_id"])
         if not repo:
             abort(404)
+        if req.get("type") == "actions":
+            outcome = _do_actions(req)
+            failed = not all(o["ok"] for o in outcome)
+            result = store.decide_request(req_id, decision, comment, outcome, failed)
+            return jsonify({"ok": not failed, "request": store.snapshot(result)})
         if req.get("type") == "push":
             with _run_lock:
                 outcome, failed = _do_push(repo, req), False

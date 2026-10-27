@@ -631,14 +631,80 @@ async function renderPublish(wrap, repoId) {
   wrap.append(accountLine, pushCard, dockerCard, secCard)
 }
 
-// Right-hand tools: commits, files, memory, publish.
+// Actions: the repo's GitHub workflows with recent failures and triggers. In a
+// fork it suggests disabling upstream's release/deploy/scheduled jobs (disabling
+// is a GitHub setting, so the files stay identical to upstream). Changes go
+// through an approval request. Flags workflows the next upstream pull would add
+// and ones added since you last reviewed the list.
+async function renderActions(wrap, repoId, refresh = false) {
+  const info = await api(apiUrl(`/api/repo/${repoId}/actions${refresh ? "?refresh=1" : ""}`))
+  wrap.innerHTML = ""
+  if (!info.ok) { wrap.append(el("p", { class: "muted" }, info.error)); return }
+  const s = info.summary
+  const picks = new Map()  // workflow id -> checkbox
+  const head = el("div", { class: "muted" },
+    `${info.owner}/${info.repo}` + (info.fork ? ` · fork of ${info.parent}` : "") +
+    ` · ${s.active} of ${s.total} active · ${s.failed_runs} failed runs in the last 100 · ${s.suggested} suggested to disable` +
+    (info.token ? "" : " · no GitHub token: you can review, but changing workflows needs one (Settings → Accounts)"))
+  const row = (w) => {
+    const box = el("input", { type: "checkbox", "aria-label": `Select ${w.name}` })
+    picks.set(w.id, box)
+    const st = w.stats
+    return el("div", { class: "mem", style: "align-items:center" }, box,
+      el("div", { style: "flex:1;min-width:0" },
+        el("div", {}, el("strong", {}, w.name), " ",
+          w.state === "active" ? null : badge("", w.state.replace(/_/g, " ")),
+          w.new_since_review ? badge("warn", "new since review") : null,
+          st.runs ? badge(st.failed ? "bad" : "up", `${st.failed}/${st.runs} failed`) : badge("", "no recent runs")),
+        el("div", { class: "muted", style: "font-size:12px" }, `${w.path} · on: ${(w.triggers || []).join(", ") || "?"}` +
+          (w.secrets?.length ? ` · secrets: ${w.secrets.slice(0, 5).join(", ")}${w.secrets.length > 5 ? " …" : ""}` : "")),
+        w.reasons.length ? el("div", { style: "color:#e0a060;font-size:12px" }, "Suggest disabling: " + w.reasons.join("; ")) : null))
+  }
+  const list = el("div", { class: "mem-list", style: "max-height:520px" }, ...info.workflows.map(row))
+  const select = (pred) => { for (const w of info.workflows) picks.get(w.id).checked = pred(w) }
+  const sugBtn = el("button", { class: "btn ghost" }, `Select suggested (${s.suggested})`)
+  sugBtn.onclick = () => select(w => w.reasons.length > 0)
+  const noneBtn = el("button", { class: "btn ghost" }, "Clear")
+  noneBtn.onclick = () => select(() => false)
+  const raise = (kind, btn) => busy(btn, "Raising…", async () => {
+    const ids = info.workflows.filter(w => picks.get(w.id).checked).map(w => w.id)
+    if (!ids.length) return toast("Select workflows first", "info")
+    const r = await api(apiUrl(`/api/repo/${repoId}/actions/request`), { method: "POST", body: JSON.stringify({ [kind]: ids }) })
+    if (!r.ok) return toast(r.error, "info")
+    toast(`Request raised to ${kind} ${(r.request[kind] || []).length} workflow(s). Approve it on the Requests page.`, "ok")
+    route("/requests")
+  })
+  const disBtn = el("button", { class: "btn" }, "Request: disable selected")
+  disBtn.onclick = () => raise("disable", disBtn)
+  const enBtn = el("button", { class: "btn ghost" }, "Request: enable selected")
+  enBtn.onclick = () => raise("enable", enBtn)
+  const refBtn = el("button", { class: "btn ghost" }, "Refresh")
+  refBtn.onclick = () => busy(refBtn, "Loading…", () => renderActions(wrap, repoId, true))
+  const newOnes = info.workflows.filter(w => w.new_since_review)
+  const reviewBtn = el("button", { class: "btn ghost" }, `Mark ${newOnes.length} new as reviewed`)
+  reviewBtn.onclick = () => busy(reviewBtn, "Saving…", async () => {
+    await api(apiUrl(`/api/repo/${repoId}/actions/reviewed`), { method: "POST", body: "{}" }); await renderActions(wrap, repoId)
+  })
+  wrap.append(head,
+    info.incoming.length ? el("div", { class: "upstream", style: "border-color:#5a4a23" },
+      el("strong", {}, `${info.incoming.length} workflow(s) arrive with the next pull from upstream`),
+      el("div", { class: "muted", style: "font-size:12px" }, "They start active after the pull. Review them here once they land."),
+      ...info.incoming.map(w => el("div", { style: "font-size:12px" }, el("code", {}, w.path), ` from ${w.upstream} · on: ${w.triggers.join(", ")}` + (w.schedule ? " · scheduled" : "")))) : null,
+    newOnes.length ? el("div", { class: "upstream", style: "border-color:#5a4a23" },
+      el("strong", {}, `${newOnes.length} workflow(s) added since you last reviewed`), " ", reviewBtn) : null,
+    el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;margin-top:8px" }, sugBtn, noneBtn, disBtn, enBtn, refBtn),
+    list,
+    el("p", { class: "muted", style: "font-size:12px" }, "Disabling is a GitHub setting: the workflow files stay as they are, so pulling from upstream never conflicts. Re-enable any time."))
+}
+
+// Right-hand tools: commits, files, memory, publish, actions.
 function renderTools(wrap, repoId) {
-  const names = ["Commits", "Files", "Memory", "Publish"]
+  const names = ["Commits", "Files", "Memory", "Publish", "Actions"]
   const bar = el("div", { class: "tabs", role: "tablist", "aria-label": "Repo tools" })
   const panes = {}
   const tabs = {}
   const built = {}
-  const builders = { Commits: renderCommits, Files: renderFiles, Memory: renderMemory, Publish: renderPublish }
+  const builders = { Commits: renderCommits, Files: renderFiles, Memory: renderMemory, Publish: renderPublish, Actions: renderActions }
   const show = async (n, focus = false) => {
     for (const k of names) {
       const on = k === n
@@ -1030,6 +1096,7 @@ async function renderRequests() {
         const res = await api(apiUrl(`/api/request/${encodeURIComponent(r.id)}/decide`), { method: "POST", body: JSON.stringify({ decision, comment: commentIn.value }) })
         const detail = (res.request?.result || []).map(o => `${o.upstream}: ${o.detail}`).join("; ")
         if (decision === "deny") toast("Denied", "info")
+        else if (isActions) toast(res.ok ? `Workflows updated. ${detail}` : `Some changes failed. ${res.error || detail}`, res.ok ? "ok" : "error")
         else if (isPush) toast(res.ok ? `Pushed. ${detail}` : `Not pushed. ${res.error || detail}`, res.ok ? "ok" : "error")
         else if (r.type === "components") toast(res.ok ? `Pins bumped. ${detail}` : `Not bumped. ${res.error || detail}`, res.ok ? "ok" : "error")
         else toast(res.ok ? `Merged. ${detail}` : `Not merged. ${res.error || detail}`, res.ok ? "ok" : "error")
@@ -1037,19 +1104,25 @@ async function renderRequests() {
       })
       const isComp = r.type === "components"
       const isPush = r.type === "push"
-      const approveBtn = el("button", { class: "btn" }, isPush ? (r.open_pr ? "Approve, push and open PR" : "Approve and push") : isComp ? "Approve and bump pins" : "Approve and merge")
+      const isActions = r.type === "actions"
+      const approveBtn = el("button", { class: "btn" }, isActions ? "Approve and apply on GitHub" : isPush ? (r.open_pr ? "Approve, push and open PR" : "Approve and push") : isComp ? "Approve and bump pins" : "Approve and merge")
       approveBtn.onclick = () => decide("approve", approveBtn)
       const denyBtn = el("button", { class: "btn danger" }, "Deny")
       denyBtn.onclick = () => decide("deny", denyBtn)
       wrap.append(el("div", { class: "repo-card", id: `req-${r.id}` },
         el("h3", {}, r.repo_name || r.repo_id, " ",
-          isPush ? badge("", r.open_pr ? `push + PR into ${r.base}` : "push")
+          isActions ? badge("", `GitHub Actions: ${(r.disable || []).length} off, ${(r.enable || []).length} on`)
+          : isPush ? badge("", r.open_pr ? `push + PR into ${r.base}` : "push")
           : isComp ? badge(r.safe === false ? "bad" : "", r.safe === false ? "has pinned commits not upstream" : "submodule pins")
             : el("span", { class: `badge ${r.safe === false ? "bad" : ""}` }, r.safe === false ? "conflicts" : "needs a merge commit"),
           el("span", { class: `badge ${pending ? "warn" : r.status === "approved" ? "up" : ""}` }, r.status)
         ),
         el("div", { class: "muted" }, `focus: ${r.focus_branch} · raised ${(r.created_at || "").slice(0, 16).replace("T", " ")}`
           + (r.decided_at ? ` · decided ${r.decided_at.slice(0, 16).replace("T", " ")}` : "")),
+        isActions ? el("div", { class: "upstream", style: "margin:8px 0" },
+          el("div", {}, `${r.owner}/${r.github_repo}` + (r.fork ? ` (fork of ${r.parent})` : "")),
+          ...(r.disable || []).map(w => el("div", { style: "font-size:12px" }, "disable ", el("strong", {}, w.name), w.reasons?.length ? el("span", { class: "muted" }, ` — ${w.reasons.join("; ")}`) : null)),
+          ...(r.enable || []).map(w => el("div", { style: "font-size:12px" }, "enable ", el("strong", {}, w.name)))) : null,
         isPush ? el("div", { class: "upstream", style: "margin:8px 0" },
           el("div", {}, `${r.branch} → ${r.remote} (${r.remote_url})`),
           el("div", { class: "muted", style: "font-size:12px" }, `${(r.commits || []).length}${(r.commits || []).length === 20 ? "+" : ""} commit(s): ` + (r.commits || []).slice(0, 5).map(c => `${c.sha} ${c.subject}`).join(" · "))) : null,
@@ -1062,7 +1135,7 @@ async function renderRequests() {
               `⚠ upstream changed ${c.watched_changes.length} watched file(s): ${c.watched_changes.slice(0, 6).join(", ")}`,
               c.after_update ? el("div", {}, "After bumping, run: ", el("code", {}, c.after_update)) : null) : null
           ))) : null,
-        isComp || isPush ? null : el("div", { style: "margin:8px 0" }, ...(r.upstreams || []).map(u =>
+        isComp || isPush || isActions ? null : el("div", { style: "margin:8px 0" }, ...(r.upstreams || []).map(u =>
           el("div", { class: "upstream" },
             el("div", {}, `${u.name} / ${u.branch}: ↓ ${u.behind} behind · ↑ ${u.ahead} ahead`),
             u.reason ? el("div", { class: "muted", style: "color:#e0a060" }, u.reason) : null,
@@ -1074,7 +1147,9 @@ async function renderRequests() {
         (r.result || []).filter(o => o.after_update).map(o => el("div", { style: "color:#e0a060;font-size:13px" }, `Now run for ${o.name}: `, el("code", {}, o.after_update))),
         r.comment ? el("div", { class: "muted" }, `Note: ${r.comment}`) : null,
         pending ? el("div", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px" }, approveBtn, denyBtn, commentIn,
-          el("span", { class: "muted", style: "font-size:12px" }, isPush
+          el("span", { class: "muted", style: "font-size:12px" }, isActions
+            ? "Approve changes these workflows on GitHub (needs a token with Actions: read/write). Files are not touched."
+            : isPush
             ? "Approve pushes this branch (never forced). A PR is opened if you asked for one."
             : isComp
             ? "Approve moves each pin to its upstream in one commit on your local branch. Nothing is pushed."
@@ -1140,7 +1215,7 @@ async function renderSettings() {
       return { key, input, row: el("label", { style: "display:flex;flex-direction:column;gap:4px" }, label, input) }
     }
     const accRows = [
-      accRow("github_token", "GitHub token (fine-grained: Contents, Pull requests, Secrets, Workflows read/write)", "password", "github_pat_…"),
+      accRow("github_token", "GitHub token (fine-grained: Contents, Pull requests, Secrets, Workflows, Actions read/write)", "password", "github_pat_…"),
       accRow("dockerhub_username", "Docker Hub username", "text", "username"),
       accRow("dockerhub_token", "Docker Hub access token (Account settings → Personal access tokens)", "password", "dckr_pat_…"),
     ]

@@ -10,7 +10,7 @@ The GitHub token (credentials.github_token) is used two ways:
     secrets (encrypted with the repo's public key, as GitHub requires).
 
 Recommended token: fine-grained, limited to the repos you manage, with
-Contents: read/write, Pull requests: read/write, Secrets: read/write and
+Contents, Pull requests, Secrets and Actions: read/write, and
 Workflows: read/write (needed to push changes under .github/workflows).
 """
 from __future__ import annotations
