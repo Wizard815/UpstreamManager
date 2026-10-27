@@ -529,14 +529,116 @@ function editCard(repoId, session, index, m) {
   return box
 }
 
-// Right-hand tools: commits, files, memory.
+// Publish: push the branch (optionally opening a PR), build a GitHub Actions
+// workflow that publishes Docker images, and copy the Docker Hub login into the
+// repo's Actions secrets. Pushes go through an approval request like merges.
+async function renderPublish(wrap, repoId) {
+  const info = await api(apiUrl(`/api/repo/${repoId}/publish`))
+  wrap.innerHTML = ""
+  const acc = info.accounts
+  const accountLine = el("div", { class: "muted" },
+    `GitHub token: ${acc.github_token.set ? `set (${acc.github_token.source})` : "not set: pushes use this machine's git login"} · `,
+    `Docker Hub: ${acc.dockerhub_username.set && acc.dockerhub_token.set ? acc.dockerhub_username.hint : "not set"} · `,
+    el("a", { href: `${BASE}/settings`, style: "color:#9fb4ff" }, "Accounts"))
+
+  // --- push
+  const remSel = el("select", { "aria-label": "Remote" }, ...info.remotes.map(r => el("option", { value: r.name }, `${r.name}${r.owner ? ` (${r.owner}/${r.repo})` : ""}`)))
+  const ahead = () => { const r = info.remotes.find(x => x.name === remSel.value); return r?.ahead == null ? "new branch on the remote" : `${r.ahead} commit(s) to push` }
+  const aheadEl = el("span", { class: "muted" }, ahead())
+  remSel.onchange = () => { aheadEl.textContent = ahead() }
+  const prIn = el("input", { type: "checkbox", "aria-label": "Open a pull request" })
+  const baseIn = el("input", { value: "main", "aria-label": "Pull request base branch", style: "width:110px" })
+  const pushBtn = el("button", { class: "btn" }, "Request push")
+  pushBtn.onclick = () => busy(pushBtn, "Raising…", async () => {
+    await api(apiUrl(`/api/repo/${repoId}/push/request`), { method: "POST", body: JSON.stringify({ remote: remSel.value, open_pr: prIn.checked, base: baseIn.value.trim() }) })
+    toast("Push request raised. Approve it on the Requests page.", "ok"); route("/requests")
+  })
+  const pushCard = el("div", { class: "upstream" },
+    el("strong", {}, `Push ${info.branch}`), " ", aheadEl,
+    el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px" },
+      el("label", { class: "muted" }, "to ", remSel),
+      el("label", { class: "muted" }, prIn, " open a pull request into ", baseIn), pushBtn),
+    el("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, "Never force-pushes. A remote that has moved on is refused: fetch and merge first."))
+
+  // --- docker workflow builder
+  const rows = info.dockerfiles.map(d => {
+    const use = el("input", { type: "checkbox", "aria-label": `Build ${d.dockerfile}` }); use.checked = true
+    const name = el("input", { value: d.image, "aria-label": `Image name for ${d.dockerfile}`, style: "width:220px" })
+    return { d, use, name, row: el("div", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0" },
+      use, el("code", {}, d.dockerfile), el("span", { class: "muted" }, "→ image"), name) }
+  })
+  const chk = (label, on) => { const i = el("input", { type: "checkbox" }); i.checked = on; return [i, el("label", { class: "muted" }, i, " " + label)] }
+  const [ghcr, ghcrL] = chk("GHCR (ghcr.io)", !!info.owner)
+  const [hub, hubL] = chk("Docker Hub", acc.dockerhub_username.set)
+  const [arm, armL] = chk("also arm64", false)
+  const [onBranch, onBranchL] = chk("push to main", true)
+  const [onTags, onTagsL] = chk("v* tags", true)
+  const [onRel, onRelL] = chk("releases", false)
+  const [onPr, onPrL] = chk("build PRs (no push)", true)
+  const fileIn = el("input", { value: "docker-images.yml", "aria-label": "Workflow file name", style: "width:180px" })
+  const removes = info.workflows.filter(w => w.file !== `.github/workflows/${fileIn.value}`).map(w => {
+    const i = el("input", { type: "checkbox", "aria-label": `Remove ${w.file}` })
+    return { w, i, row: el("label", { class: "muted", style: "display:block" }, i, ` remove ${w.file} — "${w.name}" (on: ${w.triggers.join(", ") || "?"})`) }
+  })
+  const spec = () => ({
+    images: rows.filter(r => r.use.checked).map(r => ({ image: r.name.value.trim(), context: r.d.context, dockerfile: r.d.dockerfile })),
+    owner: info.owner, ghcr: ghcr.checked, dockerhub: hub.checked, arm64: arm.checked, branch: "main",
+    on_branch: onBranch.checked, on_tags: onTags.checked, on_release: onRel.checked, on_pr: onPr.checked, filename: fileIn.value.trim(),
+  })
+  const preview = el("pre", { class: "code-pre", style: "display:none;max-height:360px" })
+  const errs = el("div", { style: "color:#e08080;font-size:13px" })
+  const show = async () => {
+    const r = await api(apiUrl(`/api/repo/${repoId}/docker/workflow`), { method: "POST", body: JSON.stringify({ spec: spec() }) })
+    errs.textContent = r.ok ? "" : r.errors.join("; ")
+    preview.style.display = r.ok ? "" : "none"
+    preview.textContent = r.ok ? r.yaml : ""
+    return r.ok
+  }
+  const prevBtn = el("button", { class: "btn ghost" }, "Preview")
+  prevBtn.onclick = () => busy(prevBtn, "Rendering…", show)
+  const commitBtn = el("button", { class: "btn" }, "Commit workflow")
+  commitBtn.onclick = () => busy(commitBtn, "Committing…", async () => {
+    if (!(await show())) return
+    const remove = removes.filter(x => x.i.checked).map(x => x.w.file)
+    if (!confirm(`Commit .github/workflows/${fileIn.value} to ${info.branch}` + (remove.length ? ` and remove ${remove.length} workflow(s)` : "") + "? Nothing is pushed.")) return
+    const r = await api(apiUrl(`/api/repo/${repoId}/docker/workflow`), { method: "POST", body: JSON.stringify({ spec: spec(), remove, commit: true }) })
+    toast(r.ok ? `Committed ${r.commit}: ${r.detail}` : r.detail, r.ok ? "ok" : "error")
+    if (r.ok) await renderPublish(wrap, repoId)
+  })
+  const dockerCard = el("div", { class: "upstream" },
+    el("strong", {}, "Docker images on GitHub Actions"),
+    info.dockerfiles.length ? el("div", {}, ...rows.map(r => r.row)) : el("p", { class: "muted" }, "No Dockerfile found in this repo's own code."),
+    el("div", { style: "display:flex;gap:12px;flex-wrap:wrap;margin-top:6px" }, el("span", { class: "muted" }, "Publish to:"), ghcrL, hubL, armL),
+    el("div", { style: "display:flex;gap:12px;flex-wrap:wrap;margin-top:4px" }, el("span", { class: "muted" }, "Run on:"), onBranchL, onTagsL, onRelL, onPrL),
+    el("div", { style: "display:flex;gap:8px;align-items:center;margin-top:6px" }, el("span", { class: "muted" }, "File .github/workflows/"), fileIn),
+    removes.length ? el("details", { style: "margin-top:6px" }, el("summary", { class: "muted" }, `Existing workflows (${removes.length})`), ...removes.map(x => x.row)) : null,
+    errs,
+    el("div", { style: "display:flex;gap:6px;margin-top:6px" }, prevBtn, commitBtn),
+    preview)
+
+  // --- actions secrets
+  const secBtn = el("button", { class: "btn ghost" }, "Copy Docker Hub login to GitHub secrets")
+  secBtn.disabled = !(acc.github_token.set && acc.dockerhub_username.set && acc.dockerhub_token.set && info.owner)
+  secBtn.onclick = () => busy(secBtn, "Saving secrets…", async () => {
+    const r = await api(apiUrl(`/api/repo/${repoId}/github/secrets`), { method: "POST", body: "{}" })
+    toast(r.ok ? `Saved DOCKERHUB_USERNAME and DOCKERHUB_TOKEN in ${r.repo}` : r.error, r.ok ? "ok" : "error")
+  })
+  const secCard = el("div", { class: "upstream" },
+    el("strong", {}, "GitHub Actions secrets"),
+    el("div", { class: "muted" }, info.owner ? `Sets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN on ${info.owner}/${info.github_repo} (encrypted with the repo's key). GHCR needs no secret.` : "This repo has no github.com remote."),
+    el("div", { style: "margin-top:6px" }, secBtn))
+
+  wrap.append(accountLine, pushCard, dockerCard, secCard)
+}
+
+// Right-hand tools: commits, files, memory, publish.
 function renderTools(wrap, repoId) {
-  const names = ["Commits", "Files", "Memory"]
+  const names = ["Commits", "Files", "Memory", "Publish"]
   const bar = el("div", { class: "tabs", role: "tablist", "aria-label": "Repo tools" })
   const panes = {}
   const tabs = {}
   const built = {}
-  const builders = { Commits: renderCommits, Files: renderFiles, Memory: renderMemory }
+  const builders = { Commits: renderCommits, Files: renderFiles, Memory: renderMemory, Publish: renderPublish }
   const show = async (n, focus = false) => {
     for (const k of names) {
       const on = k === n
@@ -924,27 +1026,33 @@ async function renderRequests() {
     for (const r of reqs) {
       const pending = r.status === "pending"
       const commentIn = el("input", { placeholder: "add a note…", "aria-label": `Note for ${r.repo_name || r.repo_id}`, style: "width:220px" })
-      const decide = (decision, btn) => busy(btn, decision === "approve" ? (r.type === "components" ? "Bumping…" : "Merging…") : "Denying…", async () => {
+      const decide = (decision, btn) => busy(btn, decision === "approve" ? (isPush ? "Pushing…" : r.type === "components" ? "Bumping…" : "Merging…") : "Denying…", async () => {
         const res = await api(apiUrl(`/api/request/${encodeURIComponent(r.id)}/decide`), { method: "POST", body: JSON.stringify({ decision, comment: commentIn.value }) })
         const detail = (res.request?.result || []).map(o => `${o.upstream}: ${o.detail}`).join("; ")
         if (decision === "deny") toast("Denied", "info")
+        else if (isPush) toast(res.ok ? `Pushed. ${detail}` : `Not pushed. ${res.error || detail}`, res.ok ? "ok" : "error")
         else if (r.type === "components") toast(res.ok ? `Pins bumped. ${detail}` : `Not bumped. ${res.error || detail}`, res.ok ? "ok" : "error")
         else toast(res.ok ? `Merged. ${detail}` : `Not merged. ${res.error || detail}`, res.ok ? "ok" : "error")
         await renderRequests()
       })
       const isComp = r.type === "components"
-      const approveBtn = el("button", { class: "btn" }, isComp ? "Approve and bump pins" : "Approve and merge")
+      const isPush = r.type === "push"
+      const approveBtn = el("button", { class: "btn" }, isPush ? (r.open_pr ? "Approve, push and open PR" : "Approve and push") : isComp ? "Approve and bump pins" : "Approve and merge")
       approveBtn.onclick = () => decide("approve", approveBtn)
       const denyBtn = el("button", { class: "btn danger" }, "Deny")
       denyBtn.onclick = () => decide("deny", denyBtn)
       wrap.append(el("div", { class: "repo-card", id: `req-${r.id}` },
         el("h3", {}, r.repo_name || r.repo_id, " ",
-          isComp ? badge(r.safe === false ? "bad" : "", r.safe === false ? "has pinned commits not upstream" : "submodule pins")
+          isPush ? badge("", r.open_pr ? `push + PR into ${r.base}` : "push")
+          : isComp ? badge(r.safe === false ? "bad" : "", r.safe === false ? "has pinned commits not upstream" : "submodule pins")
             : el("span", { class: `badge ${r.safe === false ? "bad" : ""}` }, r.safe === false ? "conflicts" : "needs a merge commit"),
           el("span", { class: `badge ${pending ? "warn" : r.status === "approved" ? "up" : ""}` }, r.status)
         ),
         el("div", { class: "muted" }, `focus: ${r.focus_branch} · raised ${(r.created_at || "").slice(0, 16).replace("T", " ")}`
           + (r.decided_at ? ` · decided ${r.decided_at.slice(0, 16).replace("T", " ")}` : "")),
+        isPush ? el("div", { class: "upstream", style: "margin:8px 0" },
+          el("div", {}, `${r.branch} → ${r.remote} (${r.remote_url})`),
+          el("div", { class: "muted", style: "font-size:12px" }, `${(r.commits || []).length}${(r.commits || []).length === 20 ? "+" : ""} commit(s): ` + (r.commits || []).slice(0, 5).map(c => `${c.sha} ${c.subject}`).join(" · "))) : null,
         isComp ? el("div", { style: "margin:8px 0" }, ...(r.components || []).map(c =>
           el("div", { class: "upstream" },
             el("div", {}, `${c.name} (${c.path}): ↓ ${c.behind} upstream commits · pinned ${(c.pin || "").slice(0, 8)} → ${(c.upstream || "").slice(0, 8)}`),
@@ -954,7 +1062,7 @@ async function renderRequests() {
               `⚠ upstream changed ${c.watched_changes.length} watched file(s): ${c.watched_changes.slice(0, 6).join(", ")}`,
               c.after_update ? el("div", {}, "After bumping, run: ", el("code", {}, c.after_update)) : null) : null
           ))) : null,
-        isComp ? null : el("div", { style: "margin:8px 0" }, ...(r.upstreams || []).map(u =>
+        isComp || isPush ? null : el("div", { style: "margin:8px 0" }, ...(r.upstreams || []).map(u =>
           el("div", { class: "upstream" },
             el("div", {}, `${u.name} / ${u.branch}: ↓ ${u.behind} behind · ↑ ${u.ahead} ahead`),
             u.reason ? el("div", { class: "muted", style: "color:#e0a060" }, u.reason) : null,
@@ -962,10 +1070,13 @@ async function renderRequests() {
           )
         )),
         (r.result || []).length ? el("div", { class: "muted" }, "Result: " + r.result.map(o => `${o.upstream}: ${o.detail}`).join("; ")) : null,
+        (r.result || []).filter(o => o.url).map(o => el("div", {}, el("a", { href: o.url, target: "_blank", rel: "noopener", style: "color:#9fb4ff" }, `Open the pull request: ${o.url}`))),
         (r.result || []).filter(o => o.after_update).map(o => el("div", { style: "color:#e0a060;font-size:13px" }, `Now run for ${o.name}: `, el("code", {}, o.after_update))),
         r.comment ? el("div", { class: "muted" }, `Note: ${r.comment}`) : null,
         pending ? el("div", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px" }, approveBtn, denyBtn, commentIn,
-          el("span", { class: "muted", style: "font-size:12px" }, isComp
+          el("span", { class: "muted", style: "font-size:12px" }, isPush
+            ? "Approve pushes this branch (never forced). A PR is opened if you asked for one."
+            : isComp
             ? "Approve moves each pin to its upstream in one commit on your local branch. Nothing is pushed."
             : "Approve merges into your local branch. Conflicts are never auto-resolved; the merge is aborted instead. Nothing is pushed.")) : null
       ))
@@ -1020,6 +1131,46 @@ async function renderSettings() {
       )
     )
     loadModels()
+    // Accounts: GitHub token and Docker Hub login, stored in the OS keychain
+    // (or env vars / a private file on servers), never shown again in full.
+    const accounts = await api(apiUrl('/api/credentials'))
+    const accRow = (key, label, type, placeholder) => {
+      const info = accounts[key]
+      const input = el("input", { type, value: "", placeholder: info.set ? `${info.hint} (saved in ${info.source})` : placeholder, autocomplete: "off", style: "width:320px" })
+      return { key, input, row: el("label", { style: "display:flex;flex-direction:column;gap:4px" }, label, input) }
+    }
+    const accRows = [
+      accRow("github_token", "GitHub token (fine-grained: Contents, Pull requests, Secrets, Workflows read/write)", "password", "github_pat_…"),
+      accRow("dockerhub_username", "Docker Hub username", "text", "username"),
+      accRow("dockerhub_token", "Docker Hub access token (Account settings → Personal access tokens)", "password", "dckr_pat_…"),
+    ]
+    const accSave = el("button", { class: "btn" }, "Save accounts")
+    accSave.onclick = () => busy(accSave, "Saving…", async () => {
+      const body = Object.fromEntries(accRows.filter(r => r.input.value.trim()).map(r => [r.key, r.input.value.trim()]))
+      if (!Object.keys(body).length) return toast("Type a value to save", "info")
+      await api(apiUrl('/api/credentials'), { method: "POST", body: JSON.stringify(body) })
+      toast("Saved", "ok"); await renderSettings()
+    })
+    const testBtn = (which, label) => {
+      const b = el("button", { class: "btn ghost" }, label)
+      b.onclick = () => busy(b, "Checking…", async () => {
+        const r = await api(apiUrl('/api/credentials/test'), { method: "POST", body: JSON.stringify({ which }) })
+        toast(r.ok ? `Works: signed in as ${r.login}${r.scopes ? ` (scopes: ${r.scopes})` : ""}` : r.error, r.ok ? "ok" : "error")
+      })
+      return b
+    }
+    const removeBtn = el("button", { class: "btn ghost" }, "Remove all")
+    removeBtn.onclick = () => {
+      if (!confirm("Remove the saved GitHub token and Docker Hub login? (Environment variables are not affected.)")) return
+      return busy(removeBtn, "Removing…", async () => {
+        await api(apiUrl('/api/credentials'), { method: "POST", body: JSON.stringify({ github_token: "", dockerhub_username: "", dockerhub_token: "" }) })
+        toast("Removed", "ok"); await renderSettings()
+      })
+    }
+    card.append(el("h4", { style: "margin-top:20px" }, "Accounts"),
+      el("div", { class: "muted" }, "Used to push branches, open pull requests and set Actions secrets. Environment variables UPSTREAM_GITHUB_TOKEN, UPSTREAM_DOCKERHUB_USERNAME and UPSTREAM_DOCKERHUB_TOKEN override these."),
+      el("div", { style: "display:flex;flex-direction:column;gap:12px;margin-top:8px" }, ...accRows.map(r => r.row),
+        el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, accSave, testBtn("github", "Test GitHub"), testBtn("dockerhub", "Test Docker Hub"), removeBtn)))
     const mem = local.memory || {}
     const st = await api(apiUrl('/api/memory/status'))
     const provSel = el("select", {}, el("option", { value: "fastembed" }, "fastembed (in-process, CPU)"), el("option", { value: "openai" }, "OpenAI-compatible server"))
