@@ -19,6 +19,7 @@ watch_paths, after_update. Everything else is re-read from git every time.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import gitops
@@ -133,8 +134,12 @@ def fetch(repo_path: str, comp: dict) -> tuple[bool, str]:
     return True, ""
 
 
-def compare(repo_path: str, comp: dict, do_fetch: bool = False) -> dict:
-    """State of one component, from what is already fetched unless do_fetch."""
+def compare(repo_path: str, comp: dict, do_fetch: bool = False, light: bool = False) -> dict:
+    """State of one component, from what is already fetched unless do_fetch.
+
+    light skips what only the detailed views show (the submodule's own working-tree
+    status and the newest missing commits): each git call costs ~0.4s on Windows.
+    """
     out = {"name": comp["name"], "path": comp["path"], "url": comp["url"], "enabled": comp.get("enabled", True),
            "watch_paths": comp.get("watch_paths") or [], "after_update": comp.get("after_update") or "",
            "pin": pin(repo_path, comp), "status": "ok", "detail": None, "behind": 0, "local": 0,
@@ -153,7 +158,7 @@ def compare(repo_path: str, comp: dict, do_fetch: bool = False) -> dict:
     checked_out = _out(sub, "rev-parse", "HEAD")
     out["checked_out"] = checked_out
     out["moved"] = bool(checked_out and out["pin"] and checked_out != out["pin"])
-    out["dirty"] = len([l for l in (_out(sub, "status", "--porcelain") or "").splitlines() if l.strip()])
+    out["dirty"] = 0 if light else len([l for l in (_out(sub, "status", "--porcelain") or "").splitlines() if l.strip()])
     if not out["pin"]:
         out.update(status="error", detail="the hub's HEAD has no pin for this path")
         return out
@@ -164,7 +169,8 @@ def compare(repo_path: str, comp: dict, do_fetch: bool = False) -> dict:
     out["behind"], out["local"] = gitops.behind_ahead(sub, out["pin"], ref)
     if out["behind"]:
         # Real changes, not "Merge pull request ..." lines, which say little.
-        out["missing"] = gitops.list_commits(sub, f"{out['pin']}..{ref}", 0, 5, no_merges=True)
+        if not light:
+            out["missing"] = gitops.list_commits(sub, f"{out['pin']}..{ref}", 0, 5, no_merges=True)
         if out["watch_paths"]:
             names = _out(sub, "diff", "--name-only", out["pin"], ref, "--", *out["watch_paths"]) or ""
             out["watched_changes"] = [n for n in names.splitlines() if n.strip()]
@@ -176,11 +182,22 @@ def compare(repo_path: str, comp: dict, do_fetch: bool = False) -> dict:
     return out
 
 
-def compare_all(repo: dict, do_fetch: bool = False) -> list[dict]:
-    return [compare(repo["path"], c, do_fetch) if c.get("enabled", True) else
+def compare_all(repo: dict, do_fetch: bool = False, light: bool = False) -> list[dict]:
+    """Every component, compared in parallel (each one is its own git repo, all read-only)."""
+    comps = repo.get("components") or []
+    if do_fetch:
+        # First-time checkouts write the hub's .git/config and index: one at a time.
+        for c in comps:
+            if c.get("enabled", True) and not initialized(repo["path"], c):
+                _git(repo["path"], "submodule", "update", "--init", "--filter=blob:none", "--", c["path"])
+    with ThreadPoolExecutor(max_workers=max(1, min(6, len(comps)))) as pool:
+        return list(pool.map(lambda c: _compare_one(repo, c, do_fetch, light), comps))
+
+
+def _compare_one(repo: dict, c: dict, do_fetch: bool, light: bool) -> dict:
+    return (compare(repo["path"], c, do_fetch, light) if c.get("enabled", True) else
             {"name": c["name"], "path": c["path"], "url": c["url"], "enabled": False, "status": "disabled",
-             "behind": 0, "local": 0, "watched_changes": [], "missing": []}
-            for c in repo.get("components") or []]
+             "behind": 0, "local": 0, "watched_changes": [], "missing": []})
 
 
 def blocker(repo_path: str, focus: str, comp_paths: list[str]) -> str | None:
