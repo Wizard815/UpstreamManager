@@ -27,8 +27,8 @@ def daemonize():
     os.dup2(devnull, 0)
 
     log = open("/tmp/upkeep-daemon.log", "a")
-    os.dup2(log.f, 1)
-    os.dup2(log.file, 2)
+    os.dup2(log.fileno(), 1)
+    os.dup2(log.fileno(), 2)
     return log
 
 
