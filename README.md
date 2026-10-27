@@ -42,7 +42,7 @@ are never sent back to the page in full. On a server, set
 `UPSTREAM_DOCKERHUB_TOKEN` instead; they take priority.
 
 GitHub token: a fine-grained token limited to your repos, with Contents,
-Pull requests, Secrets and Workflows set to read/write. Docker Hub: a
+Pull requests, Secrets, Workflows and Actions set to read/write. Docker Hub: a
 personal access token, not your password.
 
 Each repo's **Publish** tab:
@@ -58,3 +58,17 @@ Each repo's **Publish** tab:
   until the repo has `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets.
 - **Copy Docker Hub login to GitHub secrets** sets those two secrets on the
   repo, encrypted with the repo's public key.
+
+## Actions (forks)
+
+A fork runs every workflow it inherits, and upstream's release, deploy and
+scheduled jobs fail there (they need upstream's secrets and infrastructure),
+emailing you on every run. Each repo's **Actions** tab lists its workflows with
+their triggers, the secrets they read and their last runs, and in a fork
+suggests which to disable, with the reasons. **Request: disable selected**
+raises an approval; approving it disables them on GitHub. Disabling is a
+GitHub setting, so the files stay identical to upstream and pulls never
+conflict; re-enable any time. The tab also flags workflows the next upstream
+pull would add (they arrive active) and ones added since you last reviewed.
+Reading works without a token for public repos; changing needs the token's
+Actions permission.
