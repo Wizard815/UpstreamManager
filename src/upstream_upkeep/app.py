@@ -32,7 +32,8 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, render_template_string, abort
 
-from . import components, config, edits, pull_report, registry, store, upstream_check, daily_check, gitops, memory
+from . import (components, config, credentials, daily_check, edits, github, gitops, memory, pull_report, registry,
+               store, upstream_check, workflows)
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -220,6 +221,145 @@ def api_components_request(repo_id):
     if not req:
         return jsonify({"ok": False, "error": "nothing to update (press Fetch first to check)"})
     return jsonify({"ok": True, "request": store.snapshot(req)})
+
+
+# ------------------------------------------------------------ accounts
+@flask_app.route("/api/credentials")
+def api_credentials():
+    """Which accounts are set up (never the values themselves)."""
+    return jsonify({"ok": True, **credentials.public()})
+
+
+@flask_app.route("/api/credentials", methods=["POST"])
+def api_credentials_save():
+    """Save any of github_token / dockerhub_username / dockerhub_token ("" removes it)."""
+    data = request.get_json(force=True) or {}
+    where = {k: credentials.set(k, str(v).strip()) for k, v in data.items() if k in credentials.FIELDS}
+    return jsonify({"ok": True, "stored": where, **credentials.public()})
+
+
+@flask_app.route("/api/credentials/test", methods=["POST"])
+def api_credentials_test():
+    which = (request.get_json(silent=True) or {}).get("which")
+    try:
+        info = github.whoami() if which == "github" else github.dockerhub_check()
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({"ok": True, **info})
+
+
+# ------------------------------------------------------------ publish
+def _github_remotes(repo: dict) -> list[dict]:
+    out = []
+    for name, url in gitops.remotes(repo["path"]).items():
+        gh = github.parse_remote(url)
+        out.append({"name": name, "url": url, "owner": gh[0] if gh else None, "repo": gh[1] if gh else None})
+    return out
+
+
+@flask_app.route("/api/repo/<repo_id>/publish")
+def api_publish_info(repo_id):
+    """Everything the Publish tab needs: remotes, branch, what would be pushed, Dockerfiles, workflows."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    branch = gitops.current_branch(repo["path"])
+    remotes = _github_remotes(repo)
+    for r in remotes:
+        ref = f"refs/remotes/{r['name']}/{branch}"
+        r["ahead"] = gitops.behind_ahead(repo["path"], branch, ref)[1] if gitops.ref_exists(repo["path"], ref) else None
+    origin = next((r for r in remotes if r["name"] == "origin" and r["owner"]), next((r for r in remotes if r["owner"]), None))
+    return jsonify({"ok": True, "branch": branch, "remotes": remotes, "owner": origin and origin["owner"],
+                    "github_repo": origin and origin["repo"], "accounts": credentials.public(),
+                    "dockerfiles": workflows.detect(repo), "workflows": workflows.existing(repo)})
+
+
+@flask_app.route("/api/repo/<repo_id>/push/request", methods=["POST"])
+def api_push_request(repo_id):
+    """Raise an approval request to push the current branch (and optionally open a PR)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    data = request.get_json(force=True) or {}
+    remote = data.get("remote") or "origin"
+    branch = gitops.current_branch(repo["path"])
+    rem = next((r for r in _github_remotes(repo) if r["name"] == remote), None)
+    if not rem:
+        return jsonify({"ok": False, "error": f"no remote named {remote}"}), 400
+    ref = f"refs/remotes/{remote}/{branch}"
+    commits = gitops.list_commits(repo["path"], f"{ref}..{branch}" if gitops.ref_exists(repo["path"], ref) else branch, 0, 20)
+    pr = bool(data.get("open_pr")) and bool(rem["owner"])
+    base = data.get("base") or "main"
+    if pr and base == branch:
+        return jsonify({"ok": False, "error": "a pull request needs a different base branch"}), 400
+    rec = store.record_request({
+        "id": f"{repo['id']}:push:{branch}", "type": "push", "repo_id": repo["id"], "repo_name": repo["name"],
+        "focus_branch": branch, "remote": remote, "remote_url": rem["url"], "branch": branch,
+        "open_pr": pr, "base": base, "owner": rem["owner"], "github_repo": rem["repo"],
+        "commits": commits, "safe": True, "status": "pending", "created_at": config.now_iso(),
+        "comment": None, "decided_at": None, "upstreams": [], "conflicts": [],
+    })
+    return jsonify({"ok": True, "request": store.snapshot(rec)})
+
+
+def _do_push(repo: dict, req: dict) -> list[dict]:
+    """Run an approved push request: push, then (optionally) open the PR."""
+    try:
+        res = github.push(repo["path"], req["remote"], req["branch"])
+    except github.GitHubError as e:
+        return [{"upstream": req["remote"], "ok": False, "detail": str(e)}]
+    out = [{"upstream": req["remote"], "ok": True, "detail": f"{res['detail']} (using {res['auth']})"}]
+    if req.get("open_pr"):
+        subjects = "\n".join(f"- {c['subject']}" for c in (req.get("commits") or [])[:20])
+        try:
+            pr = github.open_pr(req["owner"], req["github_repo"], req["branch"], req["base"],
+                                (req.get("commits") or [{}])[0].get("subject") or req["branch"],
+                                f"Commits:\n{subjects}\n\nOpened from Upstream Manager.")
+            out.append({"upstream": "pull request", "ok": True, "url": pr["url"],
+                        "detail": f"{'existing' if pr['existing'] else 'opened'} PR #{pr['number']}: {pr['url']}"})
+        except github.GitHubError as e:
+            out.append({"upstream": "pull request", "ok": False, "detail": str(e)})
+    return out
+
+
+@flask_app.route("/api/repo/<repo_id>/docker/workflow", methods=["POST"])
+def api_docker_workflow(repo_id):
+    """Preview ({"commit": false}) or commit the Docker image workflow for a spec."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    data = request.get_json(force=True) or {}
+    spec = data.get("spec") or {}
+    errors = workflows.validate(spec)
+    if errors:
+        return jsonify({"ok": False, "errors": errors})
+    if not data.get("commit"):
+        return jsonify({"ok": True, "yaml": workflows.render(spec), "file": f".github/workflows/{spec['filename']}"})
+    focus = repo.get("focus_branch") or gitops.current_branch(repo["path"])
+    with _run_lock:
+        result = workflows.commit(repo, spec, data.get("remove") or [], focus)
+    return jsonify(result)
+
+
+@flask_app.route("/api/repo/<repo_id>/github/secrets", methods=["POST"])
+def api_github_secrets(repo_id):
+    """Copy the saved Docker Hub login into the GitHub repo's Actions secrets."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    rem = next((r for r in _github_remotes(repo) if r["name"] == ((request.get_json(silent=True) or {}).get("remote") or "origin")), None)
+    if not rem or not rem["owner"]:
+        return jsonify({"ok": False, "error": "this repo has no github.com remote"})
+    values = {"DOCKERHUB_USERNAME": credentials.get("dockerhub_username"), "DOCKERHUB_TOKEN": credentials.get("dockerhub_token")}
+    if not all(values.values()):
+        return jsonify({"ok": False, "error": "save your Docker Hub username and access token first (Settings -> Accounts)"})
+    try:
+        for name, value in values.items():
+            github.set_secret(rem["owner"], rem["repo"], name, value)
+        names = github.secret_names(rem["owner"], rem["repo"])
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({"ok": True, "repo": f"{rem['owner']}/{rem['repo']}", "secrets": names})
 
 
 # ------------------------------------------------------------ pull reports
@@ -574,6 +714,12 @@ def api_decide(req_id):
         repo = registry.get_repo(req["repo_id"])
         if not repo:
             abort(404)
+        if req.get("type") == "push":
+            with _run_lock:
+                outcome, failed = _do_push(repo, req), False
+            failed = not all(o["ok"] for o in outcome)
+            result = store.decide_request(req_id, decision, comment, outcome, failed)
+            return jsonify({"ok": not failed, "request": store.snapshot(result)})
         if req.get("type") == "components":
             with _run_lock:
                 bumped = components.bump(repo, [c["name"] for c in req.get("components", [])], req["focus_branch"])

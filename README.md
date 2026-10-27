@@ -31,3 +31,30 @@ ALLGlance with dayglance, lastglance, lifeglance and vikunja) gets a
   `:(exclude)*.test.js` all work.
 - The daily check fetches components and raises the same request; it never
   moves a pin by itself.
+
+## Accounts and publishing
+
+**Settings → Accounts** holds a GitHub token and a Docker Hub login. They are
+kept in the OS keychain (Windows Credential Manager, macOS Keychain), or in a
+private `secrets.json` next to the state file when there is no keychain, and
+are never sent back to the page in full. On a server, set
+`UPSTREAM_GITHUB_TOKEN`, `UPSTREAM_DOCKERHUB_USERNAME` and
+`UPSTREAM_DOCKERHUB_TOKEN` instead; they take priority.
+
+GitHub token: a fine-grained token limited to your repos, with Contents,
+Pull requests, Secrets and Workflows set to read/write. Docker Hub: a
+personal access token, not your password.
+
+Each repo's **Publish** tab:
+
+- **Push** the current branch, optionally opening a pull request. It goes
+  through an approval request like a merge, never force-pushes, and sends the
+  token only to github.com (through git's environment, never on disk or on the
+  command line). Without a token, git uses the machine's own login.
+- **Docker images on GitHub Actions**: pick the Dockerfiles, image names,
+  registries (GHCR and/or Docker Hub), platforms and triggers, preview the
+  workflow, and commit it (optionally removing workflows that don't belong).
+  GHCR uses the run's own `GITHUB_TOKEN`; the Docker Hub steps are skipped
+  until the repo has `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets.
+- **Copy Docker Hub login to GitHub secrets** sets those two secrets on the
+  repo, encrypted with the repo's public key.
