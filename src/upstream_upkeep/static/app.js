@@ -1004,24 +1004,28 @@ async function renderFiles(wrap, repoId) {
   if (first) first.tabIndex = 0
 }
 
-// Memory: what the assistant remembers about this repo (mem0). Search can span
-// every watched repo to find similar changes elsewhere.
+// Memory: what the assistant remembers about this repo (a local SQLite file:
+// keyword search plus links to files and commits). Search can span every
+// watched repo to find related changes elsewhere. Day logs are the model's log
+// of each day's chats and events.
 async function renderMemory(wrap, repoId) {
   wrap.innerHTML = ""
   const head = el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap" }, el("h3", { style: "margin:0" }, "Memory"))
   const statusEl = el("div", { class: "muted", style: "margin-top:4px" }, "Loading…")
   const qIn = el("input", { placeholder: "Search memories…", "aria-label": "Search memories", style: "flex:1;min-width:0" })
   const scopeSel = el("select", { "aria-label": "Search scope" }, el("option", { value: "repo" }, "This repo"), el("option", { value: "all" }, "All repos"))
+  const kindSel = el("select", { "aria-label": "Show" }, el("option", { value: "" }, "Everything"), el("option", { value: "daylog" }, "Day logs"),
+    el("option", { value: "note" }, "Notes"), el("option", { value: "chat" }, "Chat facts"), el("option", { value: "event" }, "Events"), el("option", { value: "commit" }, "Commits"))
   const list = el("div", { class: "mem-list" })
   const load = async () => {
     const q = qIn.value.trim()
     list.replaceChildren(loading(q ? "Searching…" : "Loading…"))
     let res
-    try { res = await api(apiUrl(`/api/repo/${repoId}/memory?q=${encodeURIComponent(q)}&scope=${scopeSel.value}`)) }
+    try { res = await api(apiUrl(`/api/repo/${repoId}/memory?q=${encodeURIComponent(q)}&scope=${scopeSel.value}&kind=${kindSel.value}`)) }
     catch (e) { res = { ok: false, error: e.message, items: [] } }
     statusEl.textContent = !res.ok
       ? `Memory unavailable: ${res.error || "unknown error"}`
-      : `${res.items.length} ${q ? "matches" : "memories"} · embeddings: ${res.embed_provider} ${res.embed_model} · auto-clean ${res.auto_cleanup ? "on" : "off"}`
+      : `${res.items.length} ${q ? "matches" : "memories"} · day logs ${res.daily_log ? "on" : "off"} · auto-clean ${res.auto_cleanup ? "on" : "off"}`
     list.innerHTML = ""
     for (const m of res.items || []) {
       const del = el("button", { class: "btn ghost mem-del", title: "Forget this", "aria-label": `Forget: ${m.memory.slice(0, 60)}` }, "×")
@@ -1031,12 +1035,21 @@ async function renderMemory(wrap, repoId) {
           el("span", { class: `badge kind-${m.kind}` }, m.kind),
           m.repo && m.repo !== repoId ? el("span", { class: "badge warn" }, m.repo) : "",
           m.score != null ? el("span", { class: "muted" }, ` ${Number(m.score).toFixed(2)}`) : ""),
-        el("div", { style: "flex:1" }, m.memory), del))
+        m.kind === "daylog" ? daylogBody(m.memory) : el("div", { style: "flex:1" }, m.memory), del))
     }
     if (!(res.items || []).length && res.ok) list.append(el("p", { class: "muted" }, q ? "No matches." : "Nothing remembered yet. Chat, index commits, or add a note."))
   }
+  // Day logs are Markdown and long: show the first lines, expand on click.
+  const daylogBody = (text) => {
+    const body = el("div", { class: "md", style: "flex:1;min-width:0" })
+    const [title, ...rest] = text.split("\n")
+    body.innerHTML = renderMarkdown(rest.join("\n").trim())
+    const box = el("details", { style: "flex:1;min-width:0" }, el("summary", {}, title), body)
+    return box
+  }
   qIn.addEventListener("keydown", (e) => { if (e.key === "Enter") load() })
   scopeSel.onchange = load
+  kindSel.onchange = load
   const noteIn = el("input", { placeholder: "Add a note to remember…", "aria-label": "Note to remember", style: "flex:1;min-width:0" })
   const noteBtn = el("button", { class: "btn ghost" }, "Remember")
   noteBtn.onclick = () => {
@@ -1054,7 +1067,14 @@ async function renderMemory(wrap, repoId) {
     toast(`Indexed ${res.added} new commits (${res.total} total)`, "ok")
     await load()
   })
-  const cleanBtn = el("button", { class: "btn ghost", title: "Remove duplicates, junk and old events. Also runs automatically." }, "Clean up")
+  const logBtn = el("button", { class: "btn ghost", title: "Have the model write a log of today's chats and events in this repo (replaces today's earlier log). Finished days are logged automatically." }, "Write today's log")
+  logBtn.onclick = () => busy(logBtn, "Writing…", async () => {
+    const res = await api(apiUrl(`/api/repo/${repoId}/memory/daylog`), { method: "POST", body: "{}" })
+    if (res.ok) { toast(`Logged ${res.day} (${res.sources} messages and events)`, "ok"); kindSel.value = "daylog" }
+    else toast(res.error || "Could not write the log", "error")
+    await load()
+  })
+  const cleanBtn = el("button", { class: "btn ghost", title: "Remove duplicates, junk and old events (day logs are kept). Also runs automatically." }, "Clean up")
   cleanBtn.onclick = () => busy(cleanBtn, "Checking…", async () => {
     {
       // Preview first; deletion has no undo, so only the previewed ids are removed.
@@ -1071,9 +1091,9 @@ async function renderMemory(wrap, repoId) {
     }
     await load()
   })
-  head.append(el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" }, cleanBtn, idxBtn))
+  head.append(el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" }, logBtn, cleanBtn, idxBtn))
   wrap.append(head, statusEl,
-    el("div", { style: "display:flex;gap:6px;margin-top:8px" }, qIn, scopeSel),
+    el("div", { style: "display:flex;gap:6px;margin-top:8px" }, qIn, scopeSel, kindSel),
     el("div", { style: "display:flex;gap:6px;margin-top:6px" }, noteIn, noteBtn),
     list)
   await load()
@@ -1248,23 +1268,23 @@ async function renderSettings() {
         el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, accSave, testBtn("github", "Test GitHub"), testBtn("dockerhub", "Test Docker Hub"), removeBtn)))
     const mem = local.memory || {}
     const st = await api(apiUrl('/api/memory/status'))
-    const provSel = el("select", {}, el("option", { value: "fastembed" }, "fastembed (in-process, CPU)"), el("option", { value: "openai" }, "OpenAI-compatible server"))
-    provSel.value = st.embed_provider
-    const embModelIn = el("input", { value: st.embed_model || "", style: "width:320px" })
-    const embUrlIn = el("input", { value: st.embed_base_url || "", placeholder: "http://host:8082/v1 (server only)", style: "width:420px" })
-    const memSave = el("button", { class: "btn", style: "margin-top:8px" }, "Save & reload memory")
-    const memStatus = el("div", { class: "muted" }, st.ok ? "Memory is running." : `Memory not running: ${st.error || "not started"}`)
-    memSave.onclick = () => busy(memSave, "Reloading memory…", async () => {
-      await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ memory: { ...mem, embed_provider: provSel.value, embed_model: embModelIn.value, embed_base_url: embUrlIn.value } }) })
+    const onOff = (v) => { const sel = el("select", { style: "width:160px" }, el("option", { value: "on" }, "On"), el("option", { value: "off" }, "Off")); sel.value = v ? "on" : "off"; return sel }
+    const enabledSel = onOff(st.enabled), dailySel = onOff(st.daily_log), cleanSel = onOff(st.auto_cleanup)
+    const memSave = el("button", { class: "btn", style: "margin-top:8px" }, "Save memory settings")
+    const describe = (r) => r.ok ? `Memory is running: ${r.memories} memories, ${r.messages} chat messages kept · ${r.path}` : `Memory not running: ${r.error || "not started"}`
+    const memStatus = el("div", { class: "muted" }, describe(st))
+    memSave.onclick = () => busy(memSave, "Saving…", async () => {
+      await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ memory: { ...mem, enabled: enabledSel.value, daily_log: dailySel.value, auto_cleanup: cleanSel.value } }) })
       const r = await api(apiUrl("/api/memory/status"))
-      memStatus.textContent = r.ok ? "Memory is running." : `Memory not running: ${r.error}`
-      toast(r.ok ? "Memory reloaded" : "Memory failed to start", r.ok ? "ok" : "error")
+      memStatus.textContent = describe(r)
+      toast(r.ok || !r.enabled ? "Memory settings saved" : "Memory failed to start", r.ok || !r.enabled ? "ok" : "error")
     })
-    card.append(el("h4", { style: "margin-top:20px" }, "Memory embeddings (mem0)"),
-      el("div", { style: "display:flex;flex-direction:column;gap:12px" },
-        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Provider", provSel),
-        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Embedding model", embModelIn),
-        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Embedding server URL", embUrlIn),
+    card.append(el("h4", { style: "margin-top:20px" }, "Memory"),
+      el("div", { class: "muted" }, "A local SQLite database: notes, chat facts, events and commits, linked to the files and commits they mention, with keyword search. No embedding model is needed. Day logs use the chat model above to write a log of each day's chats and events."),
+      el("div", { style: "display:flex;flex-direction:column;gap:12px;margin-top:8px" },
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Memory", enabledSel),
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Write a log of each day with activity", dailySel),
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Automatic cleanup", cleanSel),
         memStatus, memSave))
   } catch (e) { card.replaceChildren(el("p", { class: "muted" }, `Could not load settings: ${e.message}`)) }
 }

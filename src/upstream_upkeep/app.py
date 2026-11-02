@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import threading
+from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -710,6 +711,7 @@ def api_run_daily():
                 results.append({"repo_id": repo["id"], "status": "error", "error": str(e)})
     for r in results:
         _remember_daily(r)
+    memory.write_due_logs_soon()  # log any finished day that has no log yet
     return jsonify({"ok": True, "results": results})
 
 
@@ -896,13 +898,13 @@ def api_memory_reload():
 
 @flask_app.route("/api/repo/<repo_id>/memory")
 def api_memory(repo_id):
-    """All memories of a repo, or a search with ?q= (&scope=all for every repo)."""
+    """All memories of a repo, or a search with ?q= (&scope=all for every repo); ?kind= filters the list."""
     if not registry.get_repo(repo_id):
         abort(404)
     q = request.args.get("q", "").strip()
     try:
         if not q:
-            items = memory.list_repo(repo_id)
+            items = memory.list_repo(repo_id, kind=request.args.get("kind") or None)
         elif request.args.get("scope") == "all":
             items = memory.search(q, k=20)
         else:
@@ -924,8 +926,8 @@ def api_memory_add(repo_id):
 
 @flask_app.route("/api/repo/<repo_id>/memory/index-commits", methods=["POST"])
 def api_memory_index_commits(repo_id):
-    """Store recent commits (subject + touched files) as memories so related
-    changes, here and in other repos, can be found by meaning."""
+    """Store recent commits (subject + touched files) as memories, linked to
+    their files, so related changes here and in other repos can be found."""
     repo = registry.get_repo(repo_id)
     if not repo:
         abort(404)
@@ -938,7 +940,7 @@ def api_memory_index_commits(repo_id):
         files = c.get("files") or []
         shown = ", ".join(files[:15]) + (f" (+{len(files) - 15} more)" if len(files) > 15 else "")
         memory.remember(repo_id, f"Commit {c['sha']} on {c['date'][:10]} by {c['author']}: {c['subject']}. Files: {shown or 'none'}",
-                        kind="commit", extra={"sha": c["sha"]})
+                        kind="commit", extra={"sha": c["sha"]}, link={c["sha"].lower(), *memory.refs(" ".join(files))})
         done.add(c["sha"])
         added += 1
     with store.lock:
@@ -946,6 +948,20 @@ def api_memory_index_commits(repo_id):
         store.save_repo(repo)
     cleaned = memory.cleanup(repo_id) if memory._settings()["auto_cleanup"] else None
     return jsonify({"ok": True, "added": added, "total": len(done), "cleaned": cleaned})
+
+
+@flask_app.route("/api/repo/<repo_id>/memory/daylog", methods=["POST"])
+def api_memory_daylog(repo_id):
+    """Have the model write the log of one day ({"day": "YYYY-MM-DD"}, default today), replacing any earlier one."""
+    if not registry.get_repo(repo_id):
+        abort(404)
+    day = (request.get_json(silent=True) or {}).get("day")
+    if day:
+        try:
+            day = date.fromisoformat(day).isoformat()
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "day must be YYYY-MM-DD"}), 400
+    return jsonify(memory.write_day_log(repo_id, day))
 
 
 @flask_app.route("/api/repo/<repo_id>/memory/cleanup", methods=["POST"])
@@ -997,7 +1013,7 @@ def api_save_settings():
     if isinstance(data.get("llm"), dict) and "api_key" in data["llm"]:
         data["llm"]["api_key"] = _unmask(data["llm"]["api_key"]) or ""
     save_settings(data)
-    if "memory" in data or "llm" in data:  # mem0 bakes in the chat model for extraction
+    if "memory" in data:
         memory.reload()
     return jsonify({"ok": True, "settings": _public_settings()})
 
@@ -1132,6 +1148,8 @@ TEMPLATE = r"""<!DOCTYPE html>
   .badge.kind-event { background: #332a14; border-color: #5a4a23; }
   .badge.kind-decision { background: #2b1d40; border-color: #45306a; }
   .badge.kind-note { background: #14301f; border-color: #235a3a; }
+  .badge.kind-daylog { background: #102c33; border-color: #1f5560; }
+  .mem .md p:first-child { margin-top: 0; } .mem .md p:last-child { margin-bottom: 0; }
   .badge.bad { background: #3a1d1d; border-color: #6a2d2d; }
   .repo-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); }
   .tabs { display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap; }

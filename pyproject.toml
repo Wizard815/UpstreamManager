@@ -1,17 +1,15 @@
 [project]
 name = "upstream-upkeep"
 version = "0.1.0"
-description = "Studio connector that keeps local repos in sync with upstreams and recent changes, with daily checks, approval-gated pushes, per-repo chat, and an LLM settings page sharing the same backend as Studio."
+description = "Studio connector that keeps local repos in sync with upstreams and recent changes, with daily checks, approval-gated pushes, per-repo chat with memory and daily logs, and an LLM settings page sharing the same backend as Studio."
 readme = "README.md"
 authors = [
     { name = "Wizard815", email = "fellasnetwork815@gmail.com" }
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "fastembed>=0.9.0",
     "flask>=3.0",
     "keyring>=25.7.0",
-    "mem0ai>=2.2.1",
     "pynacl>=1.6.2",
     "pyyaml>=6.0.3",
     "requests>=2.31",

@@ -12,6 +12,27 @@ uv run pytest                              # tests (node runs the Markdown rende
 The model connection is the app's own setting (LLM Settings page): any
 OpenAI-compatible server, such as llama-server, llama-swap or Argos.
 
+## Memory and day logs
+
+Memory is one local SQLite file (`memory.db`, next to the state file); no
+embedding model or vector database is needed.
+
+- It keeps your notes, durable facts from chats (the chat model picks them
+  out), daily-check events and indexed commits. Each is linked to the files and
+  commit ids it mentions, so asking about `src/app.py` or a commit finds
+  related memories exactly, in this repo or any other. Everything else is
+  keyword search.
+- Every chat message is kept there as well, even after you delete the chat.
+- **Day logs**: for each repo and day with chats or events, the chat model
+  writes a log of what was worked on, decided, went wrong and is still open.
+  Finished days are logged automatically (hourly while the app runs, and after
+  the daily check); **Write today's log** on the Memory tab does today now.
+  Ask "what did we do yesterday?" or about a date (`2026-11-01`, "3 days ago")
+  and that day's log goes to the model.
+- Settings → Memory turns memory, day logs and automatic cleanup on or off
+  (or set `UPSTREAM_MEMORY`, `UPSTREAM_DAILY_LOG`, `UPSTREAM_MEMORY_AUTOCLEAN`
+  to `off`).
+
 ## Components: one repo that pins other repos
 
 A hub repo that includes other projects as git submodules (for example
