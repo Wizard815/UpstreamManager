@@ -18,13 +18,18 @@ from waitress import serve
 
 from .app import flask_app
 
-if __name__ == "__main__":
+
+def main(default_port: int = 5000) -> None:
     serve(
         flask_app,
         host=os.environ.get("HOST", "127.0.0.1"),
-        port=int(os.environ.get("PORT", "5000")),
+        port=int(os.environ.get("PORT", str(default_port))),
         threads=int(os.environ.get("UPSTREAM_THREADS", "8")),
         # LLM chat and git fetches can run for minutes; don't drop them early
         # (keep this above UPSTREAM_LLM_TIMEOUT).
         channel_timeout=int(os.environ.get("UPSTREAM_LLM_TIMEOUT", "900")) + 60,
     )
+
+
+if __name__ == "__main__":
+    main()
