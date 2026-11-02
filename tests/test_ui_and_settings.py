@@ -11,10 +11,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_server_listens_on_localhost_by_default():
-    for f in ("src/upstream_upkeep/run.py", "daemonize_upkeep.py"):
-        text = (ROOT / f).read_text(encoding="utf-8")
-        assert 'os.environ.get("HOST", "127.0.0.1")' in text, f
-        assert '"0.0.0.0"' not in text.replace('HOST=0.0.0.0', ''), f
+    run = (ROOT / "src/upstream_upkeep/run.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("HOST", "127.0.0.1")' in run
+    # The daemon serves through run.main, so it inherits the same host default.
+    daemon = (ROOT / "daemonize_upkeep.py").read_text(encoding="utf-8")
+    assert "from upstream_upkeep.run import main" in daemon and ".run(host=" not in daemon
+    for text in (run, daemon):
+        assert '"0.0.0.0"' not in text.replace('HOST=0.0.0.0', '')
+
+
+def test_daemon_second_fork_parent_exits():
+    # os.fork() never returns < 0; checking that left two processes both serving.
+    daemon = (ROOT / "daemonize_upkeep.py").read_text(encoding="utf-8")
+    assert "os.fork() < 0" not in daemon
+    assert daemon.count("if os.fork() > 0:") == 2
 
 
 def test_api_key_is_masked_and_kept(client):

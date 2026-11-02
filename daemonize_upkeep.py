@@ -18,15 +18,16 @@ def daemonize():
     if os.fork() > 0:
         os._exit(0)
     os.setsid()
-    # Second fork.
-    if os.fork() < 0:
-        os._exit(1)
+    # Second fork: the session leader exits so the daemon can never reacquire
+    # a controlling terminal. (os.fork() raises on failure; it never returns < 0.)
+    if os.fork() > 0:
+        os._exit(0)
 
     # Detach file descriptors from the controlling terminal.
     devnull = os.open(os.devnull, os.O_RDWR)
     os.dup2(devnull, 0)
 
-    log = open("/tmp/upkeep-daemon.log", "a")
+    log = open(os.environ.get("UPSTREAM_DAEMON_LOG", "/tmp/upkeep-daemon.log"), "a")
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
     return log
@@ -34,7 +35,7 @@ def daemonize():
 
 def main():
     try:
-        from upstream_upkeep.run import flask_app
+        from upstream_upkeep.run import main as serve_app
     except Exception as exc:  # pragma: no cover - startup failure
         sys.stderr.write(f"[daemon] failed to import app: {exc}\n")
         os._exit(1)
@@ -45,10 +46,9 @@ def main():
         f"state_file={os.environ.get('UPSTREAM_STATE_FILE')})",
         flush=True,
     )
-    # debug=False so we don't get the reloader's extra fork loop; werkzeug
-    # re-exec is not needed for a long-lived daemon.
-    # Local-only unless HOST says otherwise (the app has no login).
-    flask_app.run(host=os.environ.get("HOST", "127.0.0.1"), port=port, debug=False, use_reloader=False)
+    # Same Waitress server and settings as `python -m upstream_upkeep.run`
+    # (local-only unless HOST says otherwise; the app has no login).
+    serve_app(default_port=5001)
 
 
 if __name__ == "__main__":
