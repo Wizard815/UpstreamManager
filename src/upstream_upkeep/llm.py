@@ -184,10 +184,14 @@ def attachments_block(repo: dict, attachments: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-# Cosine similarity cut-offs for memories put in the prompt. Measured with
-# bge-small: unrelated cross-repo items score 0.36-0.63, real matches 0.74+.
+# Cut-offs for memories put in the prompt. A score is 1.0 when the memory is
+# linked to a file or commit the message names, else the share of the
+# message's words it contains. Another repo's memory must be clearly about the
+# same thing: a shared file or commit, or most of the same words.
 OWN_MIN_SCORE = 0.3
 OTHER_REPO_MIN_SCORE = 0.7
+# Day logs are long; this much of each goes in the prompt.
+DAYLOG_PROMPT_CHARS = 2500
 
 
 def _relevant(m: dict, minimum: float) -> bool:
@@ -208,6 +212,9 @@ def _memories(repo_id: str, message: str) -> tuple[list[dict], list[dict], list[
     # Other repos' memories only when they are clearly about the same thing;
     # loosely similar ones (another repo's "commits behind" chat) mislead the model.
     other = [m for m in memory.search(message, exclude=repo_id, k=4) if _relevant(m, OTHER_REPO_MIN_SCORE)]
+    # "What did we do yesterday?" / "on 2026-11-01": that day's log, whatever its wording.
+    logs = memory.day_logs(repo_id, memory.days_mentioned(message))
+    own = logs + [m for m in own if m.get("id") not in {d["id"] for d in logs}]
     user = [m for m in own if m["kind"] in USER_KINDS]
     return user, [m for m in own if m["kind"] not in USER_KINDS], other
 
@@ -216,11 +223,18 @@ def _memory_block(repo_mem: list[dict], other: list[dict]) -> str:
     """Repo-history memories for the system prompt (user preferences go next to the question)."""
     parts = []
     if repo_mem:
-        parts.append("What you remember about this repo:\n" + "\n".join(f"- [{m['kind']}] {m['memory']}" for m in repo_mem))
+        parts.append("What you remember about this repo:\n" + "\n".join(f"- [{m['kind']}] {_clip(m)}" for m in repo_mem))
     if other:
         parts.append("Possibly related, from other watched repos:\n" + "\n".join(
             f"- ({m['repo']}, {m['kind']}) {m['memory']}" for m in other))
     return "\n\n".join(parts)
+
+
+def _clip(m: dict) -> str:
+    text = m["memory"]
+    if m.get("kind") == "daylog" and len(text) > DAYLOG_PROMPT_CHARS:
+        text = text[:DAYLOG_PROMPT_CHARS] + " ...(rest of the log left out)"
+    return text
 
 
 def _preferences_block(user: list[dict]) -> str:
@@ -275,7 +289,8 @@ def chat(repo_id: str, message: str, session_id: str | None = None, attachments:
     session = store.get_session(repo_id, session_id)
     cfg = config()
     messages = build_messages(repo, session, message, attachments)
-    store.add_chat_message(repo_id, session["id"], "user", message, attachments=attachments or None)
+    sent = store.add_chat_message(repo_id, session["id"], "user", message, attachments=attachments or None)
+    memory.record_message(repo_id, session["id"], "user", message, sent["timestamp"])
     try:
         resp = requests.post(
             f"{cfg['base_url']}/chat/completions",
@@ -299,6 +314,7 @@ def chat(repo_id: str, message: str, session_id: str | None = None, attachments:
 
     proposed = [{k: v for k, v in edits.preview(repo["path"], e).items() if k != "_new"} for e in edits.parse(reply)]
     msg = store.add_chat_message(repo_id, session["id"], "assistant", reply, extra={"edits": proposed} if proposed else None)
+    memory.record_message(repo_id, session["id"], "assistant", reply, msg["timestamp"])
     memory.learn_from_chat(repo_id, message, reply)
     index = len(store.get_session(repo_id, session["id"])["messages"]) - 1
     return {"ok": True, "reply": reply, "session": session["id"], "edits": msg.get("edits", []), "index": index}

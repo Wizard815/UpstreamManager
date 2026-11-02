@@ -16,10 +16,12 @@ import os
 
 from waitress import serve
 
+from . import memory
 from .app import flask_app
 
 
 def main(default_port: int = 5000) -> None:
+    memory.start_background()  # writes the log of each finished day that had activity
     serve(
         flask_app,
         host=os.environ.get("HOST", "127.0.0.1"),
