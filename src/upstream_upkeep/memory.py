@@ -302,7 +302,10 @@ def days_mentioned(message: str) -> list[str]:
         elif word == "yesterday":
             day = (today - timedelta(days=1)).isoformat()
         else:
-            day = (today - timedelta(days=int(m.group(2)))).isoformat()
+            n = int(m.group(2))
+            if n > 3650:  # beyond ten years is not a day anyone means
+                continue
+            day = (today - timedelta(days=n)).isoformat()
         if day not in out:
             out.append(day)
     return out[:3]

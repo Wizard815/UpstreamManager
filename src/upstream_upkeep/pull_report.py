@@ -31,7 +31,7 @@ def _git(path: str, *args: str) -> str | None:
 
 def _commit_files(path: str, rng: str) -> list[dict]:
     """Every commit in the range, oldest first, with the files it touches."""
-    out = _git(path, "log", "--reverse", "--no-renames", "--name-only", "--format=%x1e%H%x1f%h%x1f%P%x1f%s", rng) or ""
+    out = _git(path, "log", "--reverse", "--no-renames", "--name-only", "--format=%x1e%H%x1f%h%x1f%P%x1f%s", "--end-of-options", rng) or ""
     commits = []
     for block in out.split("\x1e"):
         if not block.strip():
@@ -50,7 +50,7 @@ def _merges_clean(path: str, mine: str, theirs: str) -> bool | None:
 
 def clean_prefix(path: str, mine: str, theirs: str) -> dict:
     """Newest first-parent commit of `theirs` that merges into `mine` without conflict."""
-    chain = (_git(path, "rev-list", "--first-parent", "--reverse", f"{mine}..{theirs}") or "").split()
+    chain = (_git(path, "rev-list", "--first-parent", "--reverse", "--end-of-options", f"{mine}..{theirs}") or "").split()
     if not chain:
         return {"sha": None, "commits": 0, "of": 0, "complete": True}
     if _merges_clean(path, mine, chain[-1]):
@@ -67,7 +67,7 @@ def clean_prefix(path: str, mine: str, theirs: str) -> dict:
         return {"sha": None, "commits": 0, "of": len(chain), "complete": False,
                 "first_conflict": gitops.short_sha(path, chain[0])}
     sha = chain[lo]
-    count = int((_git(path, "rev-list", "--count", f"{mine}..{sha}") or "0").strip() or 0)
+    count = int((_git(path, "rev-list", "--count", "--end-of-options", f"{mine}..{sha}") or "0").strip() or 0)
     return {"sha": sha, "short": sha[:10], "commits": count, "of": len(chain), "complete": lo == len(chain) - 1,
             "first_conflict": None if lo == len(chain) - 1 else chain[lo + 1][:10]}
 

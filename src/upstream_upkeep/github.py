@@ -76,16 +76,27 @@ def auth_env(token: str) -> dict[str, str]:
             "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}"}
 
 
-def push(repo_path: str, remote: str, branch: str) -> dict:
-    """Push a local branch to the same name on `remote`. Never forces."""
+def push(repo_path: str, remote: str, branch: str, head: str | None = None) -> dict:
+    """Push a local branch to the same name on `remote`. Never forces.
+
+    With `head` (the commit an approved request showed), exactly that commit is
+    pushed: commits made after the request was raised were never reviewed.
+    """
     if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch or "") or branch.startswith("-"):
         raise GitHubError("bad branch name")
+    source = f"refs/heads/{branch}"
+    if head:
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise GitHubError("bad commit id in the request")
+        if gitops._run(["git", "merge-base", "--is-ancestor", head, source], cwd=repo_path).returncode != 0:
+            raise GitHubError(f"{branch} no longer contains the reviewed commit {head[:10]} (history was rewritten): raise a new request")
+        source = head
     url = gitops.remotes(repo_path).get(remote)
     if not url:
         raise GitHubError(f"no remote named {remote}")
     token = credentials.get("github_token")
     extra = auth_env(token) if token and parse_remote(url) and url.startswith("https://") else None
-    res = gitops._run(["git", "push", "--porcelain", remote, f"refs/heads/{branch}:refs/heads/{branch}"],
+    res = gitops._run(["git", "push", "--porcelain", remote, f"{source}:refs/heads/{branch}"],
                       cwd=repo_path, extra_env=extra)
     out = (res.stdout + res.stderr).strip()
     if token:
