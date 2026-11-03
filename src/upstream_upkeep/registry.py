@@ -115,6 +115,8 @@ def add_repo(path: str | None, url: str | None, name: str | None,
             raise ValueError(f"not a git repo: {path}")
         p = Path(os.path.abspath(path)).resolve()
         remotes = gitops.remotes(str(p))
+        if focus_branch and not gitops.ref_exists(str(p), f"refs/heads/{focus_branch}"):
+            raise ValueError(f"{focus_branch!r} is not a branch in this repo")
         fb = focus_branch or gitops.current_branch(str(p))
         rid = slugify(name or p.name)
         repo = {
@@ -173,11 +175,18 @@ def add_url(repo_id: str, remote_name: str, remote_url: str,
     remotes = gitops.remotes(repo["path"])
     remote_url = remote_url.replace(" (fetch)", "").replace(" (push)", "")
     focus = focus_branch or repo.get("focus_branch") or gitops.current_branch(repo["path"])
+    if focus_branch and not gitops.valid_branch_name(repo["path"], focus_branch):
+        raise ValueError(f"{focus_branch!r} is not a valid branch name")
     existing = remotes.get(remote_name)
+    if existing and remote_url and existing != remote_url.strip():
+        raise ValueError(f"remote {remote_name} already points to {existing}; pick another name")
     if not existing:
-        gitops._run(["git", "remote", "add", remote_name, remote_url], cwd=repo["path"])
-        remotes[remote_name] = remote_url
-    up = {"name": remote_name, "url": remote_url, "branch": focus, "enabled": True}
+        if not remote_url or remote_url.startswith("-"):
+            raise ValueError("enter the upstream's git URL")
+        res = gitops._run(["git", "remote", "add", remote_name, remote_url], cwd=repo["path"])
+        if res.returncode != 0:
+            raise ValueError((res.stderr or res.stdout).strip() or "git remote add failed")
+    up = {"name": remote_name, "url": existing or remote_url, "branch": focus, "enabled": True}
     with store.lock:
         repo["upstreams"] = [u for u in repo.get("upstreams", []) if u.get("name") != remote_name] + [up]
         _save_repo(repo)
@@ -204,6 +213,9 @@ def set_focus_branch(repo_id: str, branch: str) -> dict | None:
         repo = _get_repo(repo_id)
         if not repo:
             return None
+        if not gitops.valid_branch_name(repo["path"], branch) or \
+                not gitops.ref_exists(repo["path"], f"refs/heads/{branch}"):
+            raise ValueError(f"{branch!r} is not a branch in this repo")
         repo["focus_branch"] = branch
         _save_repo(repo)
     return repo

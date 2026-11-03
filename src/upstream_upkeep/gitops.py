@@ -56,7 +56,7 @@ def _remotes(path: str) -> dict[str, str]:
         # git remote -v appends ' (fetch)' or ' (push)' to each URL
         url = re.sub(r"\s*\(push\)$", "", url)
         url = re.sub(r"\s*\(fetch\)$", "", url)
-        remotes[name.strip().lower()] = url.strip()
+        remotes[name.strip()] = url.strip()
     return remotes
 
 
@@ -134,15 +134,21 @@ def fetch(path: str, remote: str) -> tuple[bool, str]:
     return res.returncode == 0, (res.stderr or res.stdout).strip()
 
 
+def valid_branch_name(path: str, name: str) -> bool:
+    """A name git accepts as a branch, that can't be read as an option."""
+    return bool(name) and not name.startswith("-") and \
+        _run(["git", "check-ref-format", "--branch", name], cwd=path).returncode == 0
+
+
 def ref_exists(path: str, ref: str) -> bool:
     return _run(["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=path).returncode == 0
 
 
 def behind_ahead(path: str, local_ref: str, remote_ref: str) -> tuple[int, int]:
     """(behind, ahead): commits the remote has that local lacks, and the reverse."""
-    out = _run(["git", "rev-list", "--left-right", "--count", f"{remote_ref}...{local_ref}"], cwd=path)
+    out = _run(["git", "rev-list", "--left-right", "--count", "--end-of-options", f"{remote_ref}...{local_ref}"], cwd=path)
     if out.returncode != 0:
-        return 0, 0
+        return 0, 0  # callers check that both refs exist first (see upstream_check.compare)
     behind, ahead = out.stdout.split()
     return int(behind), int(ahead)
 
@@ -152,7 +158,7 @@ def merge_check(path: str, local_ref: str, remote_ref: str) -> dict:
 
     Uses `git merge-tree --write-tree`: exit 0 = clean, 1 = conflicts (file names listed).
     """
-    res = _run(["git", "merge-tree", "--write-tree", "--name-only", "--no-messages", local_ref, remote_ref], cwd=path)
+    res = _run(["git", "merge-tree", "--write-tree", "--name-only", "--no-messages", "--end-of-options", local_ref, remote_ref], cwd=path)
     if res.returncode == 0:
         return {"ok": True, "conflict": False, "files": []}
     if res.returncode == 1:
@@ -170,7 +176,7 @@ def list_commits(path: str, rev: str, skip: int = 0, limit: int = 50, query: str
         args += ["-i", f"--grep={query}"]
     if no_merges:
         args.append("--no-merges")
-    args.append(rev)
+    args += ["--end-of-options", rev]
     res = _run(["git", *args], cwd=path)
     if res.returncode != 0:
         return []

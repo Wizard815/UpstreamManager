@@ -123,7 +123,8 @@ async function loadRepos(container) {
     runBtn.onclick = () => busy(runBtn, "Running…", async () => {
       const res = await api(apiUrl('/api/run-daily'), { method: "POST" })
       const n = (s) => res.results.filter(r => r.status === s).length
-      toast(`Done: ${n("merged")} fast-forwarded, ${n("request_raised")} requests raised, ${n("error")} errors`, n("error") ? "error" : "ok")
+      toast(`Done: ${n("merged")} fast-forwarded, ${n("request_raised")} requests raised, ${n("skipped")} skipped, ${n("error")} errors`
+        + res.results.filter(r => r.status === "skipped").map(r => `\n${r.repo_name}: ${r.detail}`).join(""), n("error") || n("skipped") ? "error" : "ok")
       await loadRepos(list)
     })
     const fetchBtn = el("button", { class: "btn ghost", style: "margin:12px 0 12px 8px" }, "Fetch all upstreams")
@@ -1127,6 +1128,14 @@ async function renderRequests() {
       const isActions = r.type === "actions"
       const approveBtn = el("button", { class: "btn" }, isActions ? "Approve and apply on GitHub" : isPush ? (r.open_pr ? "Approve, push and open PR" : "Approve and push") : isComp ? "Approve and bump pins" : "Approve and merge")
       approveBtn.onclick = () => decide("approve", approveBtn)
+      // A merge with conflicts can't be approved through: it is always aborted. Offer
+      // the pull report instead, which can raise a request for the clean part.
+      const conflicted = !isComp && !isPush && !isActions ? (r.upstreams || []).filter(u => u.conflict) : []
+      const reportBtns = conflicted.map(u => {
+        const b = el("button", { class: "btn" }, conflicted.length > 1 ? `Pull report: ${u.name}` : "Pull report")
+        b.onclick = () => showPullReport(r.repo_id, { upstream: u.name })
+        return b
+      })
       const denyBtn = el("button", { class: "btn danger" }, "Deny")
       denyBtn.onclick = () => decide("deny", denyBtn)
       wrap.append(el("div", { class: "repo-card", id: `req-${r.id}` },
@@ -1166,14 +1175,16 @@ async function renderRequests() {
         (r.result || []).filter(o => o.url).map(o => el("div", {}, el("a", { href: o.url, target: "_blank", rel: "noopener", style: "color:#9fb4ff" }, `Open the pull request: ${o.url}`))),
         (r.result || []).filter(o => o.after_update).map(o => el("div", { style: "color:#e0a060;font-size:13px" }, `Now run for ${o.name}: `, el("code", {}, o.after_update))),
         r.comment ? el("div", { class: "muted" }, `Note: ${r.comment}`) : null,
-        pending ? el("div", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px" }, approveBtn, denyBtn, commentIn,
+        pending ? el("div", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px" }, ...(reportBtns.length ? reportBtns : [approveBtn]), denyBtn, commentIn,
           el("span", { class: "muted", style: "font-size:12px" }, isActions
             ? "Approve changes these workflows on GitHub (needs a token with Actions: read/write). Files are not touched."
             : isPush
             ? "Approve pushes this branch (never forced). A PR is opened if you asked for one."
             : isComp
             ? "Approve moves each pin to its upstream in one commit on your local branch. Nothing is pushed."
-            : "Approve merges into your local branch. Conflicts are never auto-resolved; the merge is aborted instead. Nothing is pushed.")) : null
+            : reportBtns.length
+            ? "These upstream commits conflict with yours. The pull report shows which ones merge cleanly and can raise a request for just those."
+            : "Approve merges exactly the commits shown into your local branch. Conflicts are never auto-resolved; the merge is aborted instead. Nothing is pushed.")) : null
       ))
     }
   } catch (e) { wrap.replaceChildren(el("p", { class: "muted" }, `Could not load requests: ${e.message}`)) }

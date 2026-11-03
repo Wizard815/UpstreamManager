@@ -40,12 +40,15 @@ def detect(repo_path: str) -> list[dict]:
     """Submodules declared in .gitmodules: [{name, path, url, branch}]."""
     if not (Path(repo_path) / ".gitmodules").is_file():
         return []
-    raw = _out(repo_path, "config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.(path|url|branch)$") or ""
+    # -z: each entry is "key\nvalue\0", so names with spaces split correctly.
+    res = _git(repo_path, "config", "-z", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.(path|url|branch)$")
+    raw = res.stdout if res.returncode == 0 else ""
     found: dict[str, dict] = {}
-    for line in raw.splitlines():
-        key, _, value = line.partition(" ")
-        name, field = key[len("submodule."):].rsplit(".", 1)
-        found.setdefault(name, {"name": name})[field] = value.strip()
+    for entry in filter(None, raw.split("\0")):
+        key, _, value = entry.partition("\n")
+        name, _, field = key[len("submodule."):].rpartition(".")
+        if name and field:
+            found.setdefault(name, {"name": name})[field] = value.strip()
     return [c for c in found.values() if c.get("path") and c.get("url")]
 
 

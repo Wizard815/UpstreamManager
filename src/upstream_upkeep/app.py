@@ -115,7 +115,10 @@ def api_focus(repo_id):
     branch = data.get("branch")
     if not branch:
         abort(400)
-    repo = registry.set_focus_branch(repo_id, branch)
+    try:
+        repo = registry.set_focus_branch(repo_id, branch)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     if not repo:
         abort(404)
     return jsonify({"ok": True, "repo": repo})
@@ -235,7 +238,7 @@ def api_credentials():
 def api_credentials_save():
     """Save any of github_token / dockerhub_username / dockerhub_token ("" removes it)."""
     data = request.get_json(force=True) or {}
-    where = {k: credentials.set(k, str(v).strip()) for k, v in data.items() if k in credentials.FIELDS}
+    where = {k: credentials.set(k, str(v or "").strip()) for k, v in data.items() if k in credentials.FIELDS}
     return jsonify({"ok": True, "stored": where, **credentials.public()})
 
 
@@ -296,6 +299,7 @@ def api_push_request(repo_id):
     rec = store.record_request({
         "id": f"{repo['id']}:push:{branch}", "type": "push", "repo_id": repo["id"], "repo_name": repo["name"],
         "focus_branch": branch, "remote": remote, "remote_url": rem["url"], "branch": branch,
+        "head": gitops.short_sha(repo["path"], f"refs/heads/{branch}"),
         "open_pr": pr, "base": base, "owner": rem["owner"], "github_repo": rem["repo"],
         "commits": commits, "safe": True, "status": "pending", "created_at": config.now_iso(),
         "comment": None, "decided_at": None, "upstreams": [], "conflicts": [],
@@ -306,7 +310,7 @@ def api_push_request(repo_id):
 def _do_push(repo: dict, req: dict) -> list[dict]:
     """Run an approved push request: push, then (optionally) open the PR."""
     try:
-        res = github.push(repo["path"], req["remote"], req["branch"])
+        res = github.push(repo["path"], req["remote"], req["branch"], req.get("head"))
     except github.GitHubError as e:
         return [{"upstream": req["remote"], "ok": False, "detail": str(e)}]
     out = [{"upstream": req["remote"], "ok": True, "detail": f"{res['detail']} (using {res['auth']})"}]
@@ -676,7 +680,11 @@ def api_run_daily():
                                                        focus_branch=focus, fetch=True)
                 pending = []
                 for up in plan.upstreams:
-                    if up.missing_ref or up.behind == 0:
+                    if up.missing_ref:  # say so: a silent skip reads as "up to date"
+                        results.append({"repo_id": repo["id"], "repo_name": repo["name"], "upstream": up.name,
+                                        "status": "skipped", "detail": up.conflict_detail})
+                        continue
+                    if up.behind == 0:
                         continue
                     if up.ahead == 0 and not up.conflict:
                         r = daily_check.merge_upstream(repo["path"], up.to_dict(), focus)
@@ -814,9 +822,12 @@ def api_decide(req_id):
             failed = not bumped["ok"]
             result = store.decide_request(req_id, decision, comment, outcome, failed)
             return jsonify({"ok": not failed, "request": store.snapshot(result)})
+        # Merge exactly what the request showed: upstream commits pushed after it
+        # was raised were never reviewed, so they wait for the next request.
         with _run_lock:
-            outcome = [{"upstream": u["name"], **daily_check.merge_upstream(repo["path"], u, req["focus_branch"],
-                                                                            allow_merge_commit=True)}
+            outcome = [{"upstream": u["name"], **daily_check.merge_upstream(
+                           repo["path"], {**u, "target": u.get("target") or u.get("upstream_sha")}, req["focus_branch"],
+                           allow_merge_commit=True)}
                        for u in req.get("upstreams", [])]
         failed = not all(o["ok"] for o in outcome)
     result = store.decide_request(req_id, decision, comment, outcome, failed)
@@ -1055,7 +1066,7 @@ def api_file_write():
     data = request.get_json(force=True) or {}
     repo = _tracked(data.get("repo"))
     p = _repo_file(repo, data.get("path") or "")
-    if p is None or p == Path(repo["path"]).resolve() or ".git" in p.relative_to(Path(repo["path"]).resolve()).parts:
+    if p is None or p == Path(repo["path"]).resolve() or ".git" in {x.casefold() for x in p.relative_to(Path(repo["path"]).resolve()).parts}:
         abort(400)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(data.get("content", ""), encoding="utf-8")
@@ -1088,7 +1099,13 @@ def _branches(repo: dict):
 def api_models():
     """Models the server offers; ?base_url=&api_key= probe a server before saving."""
     from . import llm
-    models, error = llm.list_models(request.args.get("base_url"), _unmask(request.args.get("api_key")))
+    base_url, key = request.args.get("base_url"), request.args.get("api_key")
+    if key and key.startswith(KEY_MASK):
+        # The saved key only ever goes to the saved server: any page can make the
+        # browser load this URL, so a masked key aimed elsewhere is dropped.
+        saved = (store.load_llm_config().get("base_url") or "").rstrip("/")
+        key = _saved_key() if base_url is None or (base_url or "").rstrip("/") == saved else ""
+    models, error = llm.list_models(base_url, key)
     return jsonify({"data": [{"id": m} for m in models], "error": error})
 
 

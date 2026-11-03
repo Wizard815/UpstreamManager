@@ -56,6 +56,14 @@ def _remote_url(path: str, remote: str) -> str | None:
 _merge_cache: dict[tuple[str, str], dict] = {}
 
 
+def _has_remote_refs(path: str, remote: str) -> bool:
+    """Whether anything was ever fetched from `remote` (so a missing branch is really missing)."""
+    try:
+        return bool(gitops._git(["for-each-ref", "--count=1", "--format=%(refname)", f"refs/remotes/{remote}/"], path))
+    except gitops.GitError:
+        return False
+
+
 def cached_merge_check(path: str, local_sha: str, upstream_sha: str) -> dict:
     """merge_check keyed by the two commit ids, so unchanged refs are never re-merged."""
     key = (local_sha, upstream_sha)
@@ -88,10 +96,21 @@ def compare_upstream(path: str, upstream: dict, focus_branch: str | None = None,
             fetch_error = msg
 
     ref = f"refs/remotes/{remote}/{branch}"
-    if not gitops.ref_exists(path, ref):
+    if not gitops.ref_exists(path, focus):
+        # Without this, rev-list fails and the counts read 0/0, i.e. "up to date".
         return UpstreamComparison(name=remote, url=url, branch=branch, ahead=0, behind=0, up_to_date=False,
-                                  conflict_detail=fetch_error or f"{remote}/{branch} not fetched yet - press Fetch",
+                                  conflict_detail=f"your focus branch {focus} does not exist here: pick another",
                                   missing_ref=True)
+    if not gitops.ref_exists(path, ref):
+        if fetch_error:
+            detail = fetch_error
+        elif _has_remote_refs(path, remote):
+            detail = (f"{remote} has no branch {branch}: set this upstream's branch, "
+                      f"or pick a focus branch that {remote} also has")
+        else:
+            detail = f"{remote}/{branch} not fetched yet - press Fetch"
+        return UpstreamComparison(name=remote, url=url, branch=branch, ahead=0, behind=0, up_to_date=False,
+                                  conflict_detail=detail, missing_ref=True)
     local = gitops.short_sha(path, focus)
     upstream_sha = gitops.short_sha(path, ref)
     behind, ahead = gitops.behind_ahead(path, focus, ref)

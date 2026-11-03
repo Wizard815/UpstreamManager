@@ -66,7 +66,7 @@ def _write(p: Path, text: str) -> None:
 
 def _target(root: Path, rel: str) -> Path | None:
     p = (root / rel).resolve()
-    if root not in p.parents or ".git" in p.relative_to(root).parts:
+    if root not in p.parents or ".git" in {x.casefold() for x in p.relative_to(root).parts}:
         return None
     return p
 
