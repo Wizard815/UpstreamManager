@@ -182,3 +182,41 @@ def set_state(owner: str, repo: str, workflow_id: int, enable: bool) -> None:
     """Enable or disable one workflow (needs a token with Actions: read/write)."""
     github._api("PUT", f"/repos/{owner}/{repo}/actions/workflows/{int(workflow_id)}/{'enable' if enable else 'disable'}")
     clear_cache()
+
+
+FAILED = ("failure", "timed_out", "startup_failure", "cancelled")
+
+
+def health(repo: dict, remote: str = "origin") -> dict:
+    """Does each workflow pass? Its latest run (with a link) and the outcome of its last 10 runs."""
+    url = gitops.remotes(repo["path"]).get(remote)
+    gh = github.parse_remote(url or "")
+    if not gh:
+        return {"ok": False, "error": f"{remote} is not a github.com repository"}
+    owner, name = gh
+    wfs = _get(f"/repos/{owner}/{name}/actions/workflows", {"per_page": 100}).get("workflows", [])
+    runs = _get(f"/repos/{owner}/{name}/actions/runs", {"per_page": 100}).get("workflow_runs", [])
+    by_wf: dict[int, list] = {}
+    for r in runs:  # newest first
+        by_wf.setdefault(r["workflow_id"], []).append(r)
+    items = []
+    for w in wfs:
+        rs = by_wf.get(w["id"], [])
+        last = rs[0] if rs else None
+        items.append({
+            "name": w["name"], "path": w["path"], "state": w["state"], "html_url": w.get("html_url"),
+            "last": None if not last else {
+                "conclusion": last.get("conclusion"), "status": last.get("status"), "url": last.get("html_url"),
+                "branch": last.get("head_branch"), "event": last.get("event"), "at": last.get("created_at"),
+                "title": last.get("display_title")},
+            "recent": [r.get("conclusion") or r.get("status") for r in rs[:10]],
+        })
+    rank = {"failing": 0, "running": 1, "passing": 2, "no runs": 3, "disabled": 4}
+    for i in items:
+        c = (i["last"] or {}).get("conclusion")
+        i["health"] = ("disabled" if i["state"] != "active" else "no runs" if not i["last"]
+                       else "running" if not c else "failing" if c in FAILED else "passing")
+    items.sort(key=lambda i: (rank[i["health"]], i["name"].lower()))
+    return {"ok": True, "owner": owner, "repo": name, "url": f"https://github.com/{owner}/{name}/actions",
+            "token": bool(credentials.get("github_token")), "workflows": items,
+            "counts": {k: sum(i["health"] == k for i in items) for k in rank}}

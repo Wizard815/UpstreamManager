@@ -163,9 +163,15 @@ def _component_facts(repo: dict) -> list[str]:
 
 
 def attachments_block(repo: dict, attachments: list[dict]) -> str:
-    """Expand the commits/files the user tagged into text the model can read."""
+    """Expand the commits/files the user tagged into text the model can read.
+
+    An item may name its own repo (a general chat, or a commit of another repo)."""
     parts = []
+    home = repo
     for a in attachments[:MAX_ATTACHMENTS]:
+        repo = store.get_repo(a["repo"]) if a.get("repo") else home
+        if not repo or not repo.get("path"):
+            continue
         try:
             if a.get("type") == "commit":
                 d = gitops.commit_detail(repo["path"], a["id"], ATTACH_CHARS)
@@ -260,8 +266,69 @@ def _history(session: dict) -> list[dict]:
     return list(reversed(out))
 
 
+GENERAL_PROMPT = """You are the assistant inside Upstream Management, a web app that watches the user's git
+repositories and their upstreams. This chat is not about one repository: below is a short overview of
+every watched repo. You cannot run commands or open files; you only know what is in this message.
+Answer from these facts, say when you would need more (the user can open the repo's own chat or tag
+a commit), and never claim to have merged, pushed or changed anything."""
+
+
+def general_facts() -> str:
+    """A line or two per watched repo, for chats that are not about one repo."""
+    lines = []
+    for r in store.snapshot(store.all_repos()):
+        focus = r.get("focus_branch")
+        bits = []
+        for u in r.get("upstreams") or []:
+            if not u.get("enabled", True):
+                continue
+            try:
+                c = upstream_check.compare_upstream(r["path"], u, focus)
+            except Exception:
+                continue
+            bits.append(f"{c.name}/{c.branch}: " + (c.conflict_detail or "not compared") if c.missing_ref else
+                        f"{c.name}/{c.branch}: {c.behind} behind, {c.ahead} ahead"
+                        + (f", conflicts in {', '.join(c.conflict_files[:5])}" if c.conflict else ""))
+        lines.append(f"- {r.get('name') or r['id']} (id {r['id']}, {r.get('path')}), focus {focus}: "
+                     + ("; ".join(bits) or "no upstreams"))
+    return "Watched repositories:\n" + ("\n".join(lines) or "- none yet")
+
+
+def session_tags_block(repo: dict, session: dict) -> str:
+    """What this chat is about (its tags), expanded for the model."""
+    tags = session.get("tags") or []
+    if not tags:
+        return ""
+    parts = []
+    commits = [{"type": "commit", "id": t["id"], "repo": t.get("repo")} for t in tags if t["type"] == "commit"]
+    for t in tags:
+        if t["type"] in ("request", "push"):
+            r = store.get_request(t["id"])
+            if r:
+                ups = "; ".join(f"{u.get('name')}/{u.get('branch')}: {u.get('behind')} commit(s) ({u.get('reason', '')})"
+                                for u in r.get("upstreams") or [])
+                what = r.get("type") or "merge"
+                extra = (f" branch {r.get('branch')} to {r.get('remote')}" if what == "push" else "")
+                parts.append(f"[Request {r['id']}: {what}{extra}, {r.get('status')}] {ups}"
+                             + (f"\nResult: {'; '.join(o.get('detail', '') for o in r.get('result') or [])}" if r.get("result") else "")
+                             + (f"\nAgent's summary: {r['summary']}" if r.get("summary") else ""))
+            else:
+                parts.append(f"[Request {t['id']}: no longer exists]")
+        elif t["type"] == "pr":
+            parts.append(f"[Pull request {t.get('label')}: {t.get('url') or t['id']}]")
+    if commits:
+        parts.append(attachments_block(repo, commits))
+    return "This chat is about:\n\n" + "\n\n".join(p for p in parts if p)
+
+
 def build_messages(repo: dict, session: dict, message: str, attachments: list[dict] | None = None) -> list[dict]:
-    system = SYSTEM_PROMPT + "\n\n" + repo_facts(repo)
+    if repo["id"] == store.GENERAL:
+        system = GENERAL_PROMPT + "\n\n" + general_facts()
+    else:
+        system = SYSTEM_PROMPT + "\n\n" + repo_facts(repo)
+    about = session_tags_block(repo, session)
+    if about:
+        system += "\n\n" + about
     user_mem, repo_mem, other_mem = _memories(repo["id"], message)  # one search per message
     mem = _memory_block(repo_mem, other_mem)
     if mem:
@@ -283,7 +350,7 @@ def build_messages(repo: dict, session: dict, message: str, attachments: list[di
 
 def chat(repo_id: str, message: str, session_id: str | None = None, attachments: list[dict] | None = None) -> dict:
     """Send a chat message to the LLM and return {ok, reply, error, session}."""
-    repo = store.get_repo(repo_id)
+    repo = store.chat_owner(repo_id)
     if not repo:
         return {"ok": False, "error": "repo not found"}
     session = store.get_session(repo_id, session_id)
@@ -312,7 +379,8 @@ def chat(repo_id: str, message: str, session_id: str | None = None, attachments:
         store.add_chat_message(repo_id, session["id"], "assistant", f"[LLM error: {e}]", error=True)
         return {"ok": False, "error": str(e), "reply": "", "session": session["id"]}
 
-    proposed = [{k: v for k, v in edits.preview(repo["path"], e).items() if k != "_new"} for e in edits.parse(reply)]
+    proposed = [{k: v for k, v in edits.preview(repo["path"], e).items() if k != "_new"}
+                for e in edits.parse(reply)] if repo.get("path") else []
     msg = store.add_chat_message(repo_id, session["id"], "assistant", reply, extra={"edits": proposed} if proposed else None)
     memory.record_message(repo_id, session["id"], "assistant", reply, msg["timestamp"])
     memory.learn_from_chat(repo_id, message, reply)

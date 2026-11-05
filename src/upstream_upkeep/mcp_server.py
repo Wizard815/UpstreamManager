@@ -31,7 +31,13 @@ then open_merge_workspace. It gives a separate checkout (path) on its own branch
 started; resolve the conflicts there with your own file and shell tools, run the project's tests,
 `git add` and `git commit`. Check workspace_status, then submit_merge_workspace with a short summary.
 That raises an approval request; the user decides. Never edit the repo's main working tree to merge,
-never push, and keep the user's own commits."""
+never push, and keep the user's own commits.
+
+To merge several branches together (e.g. three feature branches into main): list_branches, then
+open_branch_set with all of them. They merge in order in one workspace; a clean merge is committed and
+the next one starts; when one conflicts the set stops there. Resolve it, then continue_merge_workspace
+(it commits the resolved merge and merges the rest). Repeat until workspace_status says ready, run the
+tests on the combined result, then submit once for the whole set."""
 
 READ = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
@@ -164,6 +170,26 @@ def open_merge_workspace(repo: str, upstream: str) -> dict:
     conflicts left in the files. Work there with your own tools; the repo's own tree is not touched.
     Returns the existing workspace if one is open for the same upstream commit."""
     return _call("POST", _r(repo) + "/workspaces", {"upstream": upstream})["workspace"]
+
+
+@server.tool(annotations=READ)
+def list_branches(repo: str) -> list[str]:
+    """The repo's local branches (for open_branch_set; remote branches like origin/feature work too)."""
+    return _call("GET", _r(repo) + "/branches")["branches"]
+
+
+@server.tool(annotations=WRITE)
+def open_branch_set(repo: str, branches: list[str]) -> dict:
+    """Merge several branches (local, remote like origin/feature, or upstream names) into the focus branch
+    together, in this order, in one workspace of its own. Stops at the first conflict for you to resolve."""
+    return _call("POST", _r(repo) + "/workspaces", {"branches": branches})["workspace"]
+
+
+@server.tool(annotations=WRITE)
+def continue_merge_workspace(repo: str, name: str) -> dict:
+    """After resolving a conflict in the workspace files: commit that merge and merge the remaining
+    branches of the set. Refused while conflict markers are left."""
+    return _call("POST", _r(repo) + f"/workspaces/{quote(name, safe='')}/continue", {})["workspace"]
 
 
 @server.tool(annotations=READ)

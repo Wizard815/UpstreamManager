@@ -388,6 +388,24 @@ def api_actions(repo_id):
     return jsonify(data)
 
 
+@flask_app.route("/api/workflows")
+def api_workflows():
+    """Workflow health of every watched repo with a GitHub origin, fetched in parallel."""
+    from concurrent.futures import ThreadPoolExecutor
+    if request.args.get("refresh"):
+        actions.clear_cache()
+
+    def one(repo):
+        base = {"repo_id": repo["id"], "repo_name": repo.get("name") or repo["id"]}
+        try:
+            return {**base, **actions.health(repo)}
+        except Exception as e:  # GitHub errors, rate limits, network
+            return {**base, "ok": False, "error": str(e)}
+    repos = store.snapshot(store.all_repos())
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        return jsonify(list(pool.map(one, repos)))
+
+
 @flask_app.route("/api/repo/<repo_id>/actions/reviewed", methods=["POST"])
 def api_actions_reviewed(repo_id):
     """Mark the current workflow files as reviewed (clears the "new" flags)."""
@@ -540,13 +558,18 @@ def api_workspaces(repo_id):
 
 @flask_app.route("/api/repo/<repo_id>/workspaces", methods=["POST"])
 def api_open_workspace(repo_id):
-    """Start merging {"upstream": name} in a worktree of its own; conflicts are left to resolve there."""
+    """Start merging {"upstream": name}, or a set {"branches": [branch, ...]} (local branches,
+    remote branches like origin/feature, or upstream names), in a worktree of its own."""
     repo = registry.get_repo(repo_id)
     if not repo:
         abort(404)
+    data = request.get_json(silent=True) or {}
+    branches = data.get("branches")
+    if branches is not None and not (isinstance(branches, list) and all(isinstance(b, str) for b in branches)):
+        return jsonify({"ok": False, "error": "branches must be a list of names"}), 400
     try:
         with _run_lock:
-            ws = workspaces.open_workspace(repo, (request.get_json(silent=True) or {}).get("upstream", ""))
+            ws = workspaces.open_workspace(repo, data.get("upstream") or None, branches)
     except workspaces.WorkspaceError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     return jsonify({"ok": True, "workspace": ws})
@@ -561,6 +584,20 @@ def api_workspace(repo_id, name):
         return jsonify({"ok": True, "workspace": workspaces.status(repo, name)})
     except workspaces.WorkspaceError as e:
         return jsonify({"ok": False, "error": str(e)}), 404
+
+
+@flask_app.route("/api/repo/<repo_id>/workspaces/<name>/continue", methods=["POST"])
+def api_continue_workspace(repo_id, name):
+    """Commit the resolved merge in progress and merge the rest of the set."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    try:
+        with _run_lock:
+            ws = workspaces.continue_workspace(repo, name)
+    except workspaces.WorkspaceError as e:
+        return jsonify({"ok": False, "error": str(e)}), 409
+    return jsonify({"ok": True, "workspace": ws})
 
 
 @flask_app.route("/api/repo/<repo_id>/workspaces/<name>/submit", methods=["POST"])
@@ -579,13 +616,14 @@ def api_submit_workspace(repo_id, name):
     focus = ws["focus_branch"]
     rec = store.record_request({
         "id": f"{repo['id']}:{focus}:{name}", "repo_id": repo["id"], "repo_name": repo["name"], "focus_branch": focus,
-        "workspace": name, "summary": summary or None,
+        "workspace": name, "summary": summary or None, "sources": ws["sources"],
         "conflicts": [], "safe": True, "status": "pending", "created_at": config.now_iso(),
         "comment": None, "decided_at": None,
         "upstreams": [{"name": "workspace", "url": ws["path"], "branch": ws["branch"], "target": ws["head"],
                        "upstream_sha": ws["head"], "behind": ws["commits_beyond_focus"], "ahead": ws["focus_commits_missing"],
                        "conflict": False, "conflict_files": [],
-                       "reason": f"resolved merge from workspace {name}" + (f": {summary}" if summary else "")}],
+                       "reason": f"merges {', '.join(s['label'] for s in ws['sources']) or 'the workspace'}"
+                                 f" (resolved in workspace {name})" + (f": {summary}" if summary else "")}],
     })
     return jsonify({"ok": True, "request": store.snapshot(rec)})
 
@@ -698,6 +736,16 @@ def api_commit(repo_id, sha):
         return jsonify({"ok": False, "error": str(e)}), 404
 
 
+def _in_workspace(repo: dict, name: str | None) -> dict:
+    """The repo, or a merge workspace of it (?ws=name) as if it were the repo, for the editor."""
+    if not name:
+        return repo
+    try:
+        return {**repo, "path": str(workspaces.path_of(repo, name))}
+    except workspaces.WorkspaceError:
+        abort(404)
+
+
 def _repo_file(repo: dict, rel: str) -> Path | None:
     """Resolve `rel` inside the repo, or None if it would escape it."""
     root = Path(repo["path"]).resolve()
@@ -711,6 +759,7 @@ def api_tree(repo_id):
     repo = registry.get_repo(repo_id)
     if not repo:
         abort(404)
+    repo = _in_workspace(repo, request.args.get("ws"))
     d = _repo_file(repo, request.args.get("path", ""))
     if d is None or not d.is_dir():
         abort(400)
@@ -731,6 +780,7 @@ def api_file(repo_id):
     repo = registry.get_repo(repo_id)
     if not repo:
         abort(404)
+    repo = _in_workspace(repo, request.args.get("ws"))
     f = _repo_file(repo, request.args.get("path", ""))
     if f is None or not f.is_file():
         abort(404)
@@ -740,7 +790,125 @@ def api_file(repo_id):
         text = f.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return jsonify({"ok": False, "error": "binary file"})
-    return jsonify({"ok": True, "path": request.args.get("path", ""), "content": text, "lines": text.count(chr(10)) + 1})
+    return jsonify({"ok": True, "path": request.args.get("path", ""), "content": text, "lines": text.count(chr(10)) + 1,
+                    "mtime": f.stat().st_mtime_ns})
+
+
+def _writable(repo: dict, rel: str) -> Path | None:
+    """A path inside the repo that the editor may change: not the root, nothing in .git."""
+    root = Path(repo["path"]).resolve()
+    p = _repo_file(repo, rel or "")
+    if p is None or p == root:
+        return None
+    if ".git" in {x.casefold() for x in p.relative_to(root).parts}:
+        return None
+    return p
+
+
+def _rel(repo: dict, p: Path) -> str:
+    return p.relative_to(Path(repo["path"]).resolve()).as_posix()
+
+
+@flask_app.route("/api/repo/<repo_id>/file", methods=["POST"])
+def api_file_save(repo_id):
+    """Save a file from the editor: {path, content, mtime?}. With mtime (from when it was
+    opened), a file changed on disk since then is not overwritten unless {"force": true}."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    repo = _in_workspace(repo, (request.get_json(silent=True) or {}).get("ws"))
+    data = request.get_json(force=True) or {}
+    p = _writable(repo, data.get("path"))
+    if p is None or p.is_dir() or not isinstance(data.get("content"), str):
+        return jsonify({"ok": False, "error": "can't write that path"}), 400
+    if p.exists() and data.get("mtime") and not data.get("force") and p.stat().st_mtime_ns != int(data["mtime"]):
+        return jsonify({"ok": False, "error": "the file changed on disk since you opened it", "changed": True}), 409
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(data["content"], encoding="utf-8")
+    return jsonify({"ok": True, "path": _rel(repo, p), "mtime": p.stat().st_mtime_ns})
+
+
+@flask_app.route("/api/repo/<repo_id>/changes")
+def api_changes(repo_id):
+    """Uncommitted changes, for marking files in the editor: [{path, status}] with status
+    M (modified), A (added), D (deleted), R (renamed), U (conflicted) or ? (untracked)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    repo = _in_workspace(repo, request.args.get("ws"))
+    res = gitops._run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=repo["path"])
+    out, parts = [], res.stdout.split("\0") if res.returncode == 0 else []
+    i = 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        x, y, path = entry[0], entry[1], entry[3:]
+        if x == "R" or x == "C":
+            i += 1  # the next field is the old name
+        code = "U" if "U" in (x, y) or (x, y) in (("A", "A"), ("D", "D")) else "?" if x == "?" else (x if x != " " else y)
+        out.append({"path": path, "status": code})
+    return jsonify({"ok": True, "items": out})
+
+
+@flask_app.route("/api/repo/<repo_id>/files/new", methods=["POST"])
+def api_file_new(repo_id):
+    """Create an empty file, or a folder with {"dir": true}."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    repo = _in_workspace(repo, (request.get_json(silent=True) or {}).get("ws"))
+    data = request.get_json(force=True) or {}
+    p = _writable(repo, data.get("path"))
+    if p is None:
+        return jsonify({"ok": False, "error": "can't create that path"}), 400
+    if p.exists():
+        return jsonify({"ok": False, "error": f"{_rel(repo, p)} already exists"}), 409
+    if data.get("dir"):
+        p.mkdir(parents=True)
+    else:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("", encoding="utf-8")
+    return jsonify({"ok": True, "path": _rel(repo, p)})
+
+
+@flask_app.route("/api/repo/<repo_id>/files/rename", methods=["POST"])
+def api_file_rename(repo_id):
+    """Rename or move {path, to} inside the repo; never over an existing path."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    repo = _in_workspace(repo, (request.get_json(silent=True) or {}).get("ws"))
+    data = request.get_json(force=True) or {}
+    src, dst = _writable(repo, data.get("path")), _writable(repo, data.get("to"))
+    if src is None or dst is None or not src.exists():
+        return jsonify({"ok": False, "error": "can't rename that path"}), 400
+    if dst.exists():
+        return jsonify({"ok": False, "error": f"{_rel(repo, dst)} already exists"}), 409
+    if src in dst.parents:
+        return jsonify({"ok": False, "error": "can't move a folder into itself"}), 400
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src.rename(dst)
+    return jsonify({"ok": True, "path": _rel(repo, dst)})
+
+
+@flask_app.route("/api/repo/<repo_id>/files/delete", methods=["POST"])
+def api_file_delete(repo_id):
+    """Delete a file, or a folder with everything in it. Tracked files can be restored with git."""
+    import shutil
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    repo = _in_workspace(repo, (request.get_json(silent=True) or {}).get("ws"))
+    p = _writable(repo, (request.get_json(force=True) or {}).get("path"))
+    if p is None or not (p.exists() or p.is_symlink()):
+        return jsonify({"ok": False, "error": "can't delete that path"}), 400
+    if p.is_dir() and not p.is_symlink():
+        shutil.rmtree(p)
+    else:
+        p.unlink()
+    return jsonify({"ok": True})
 
 
 @flask_app.route("/api/repo/<repo_id>/upstream/<name>/enable", methods=["POST"])
@@ -952,8 +1120,7 @@ def api_decide(req_id):
 
 @flask_app.route("/api/repo/<repo_id>/chat", methods=["POST"])
 def api_chat(repo_id):
-    repo = registry.get_repo(repo_id)
-    if not repo:
+    if not store.chat_owner(repo_id):
         abort(404)
     data = request.get_json(force=True) or {}
     message = data.get("message")
@@ -967,21 +1134,22 @@ def api_chat(repo_id):
 @flask_app.route("/api/chat/<repo_id>")
 def api_chat_history(repo_id):
     """Messages of one session (?session=<id>, default: the active one)."""
-    if not registry.get_repo(repo_id):
+    if not store.chat_owner(repo_id):
         abort(404)
     session = store.snapshot(store.get_session(repo_id, request.args.get("session")))
-    repo = registry.get_repo(repo_id)
-    for m in session["messages"]:
+    repo = store.chat_owner(repo_id)
+    for m in session["messages"] if repo.get("path") else []:
         # Edits not applied yet are checked against the files as they are now.
         if m.get("edits") and not m.get("applied"):
             m["edits"] = [{k: v for k, v in edits.preview(repo["path"], e).items() if k != "_new"}
                           for e in edits.parse(m["content"])]
-    return jsonify({"session": session["id"], "title": session.get("title"), "messages": session["messages"]})
+    return jsonify({"session": session["id"], "title": session.get("title"), "messages": session["messages"],
+                    "tags": session.get("tags", []), "repo_id": repo_id, "repo_name": repo.get("name")})
 
 
 @flask_app.route("/api/repo/<repo_id>/sessions")
 def api_sessions(repo_id):
-    if not registry.get_repo(repo_id):
+    if not store.chat_owner(repo_id):
         abort(404)
     return jsonify(store.list_sessions(repo_id))
 
@@ -989,7 +1157,7 @@ def api_sessions(repo_id):
 @flask_app.route("/api/repo/<repo_id>/sessions", methods=["POST"])
 def api_new_session(repo_id):
     """Start a fresh conversation (or switch with {"session": id}); memory is kept."""
-    if not registry.get_repo(repo_id):
+    if not store.chat_owner(repo_id):
         abort(404)
     sid = (request.get_json(silent=True) or {}).get("session")
     session = store.set_active_session(repo_id, sid) if sid else store.new_session(repo_id)
@@ -998,9 +1166,26 @@ def api_new_session(repo_id):
 
 @flask_app.route("/api/repo/<repo_id>/sessions/<session_id>", methods=["DELETE"])
 def api_delete_session(repo_id, session_id):
-    if not registry.get_repo(repo_id):
+    if not store.chat_owner(repo_id):
         abort(404)
     return jsonify({"ok": store.delete_session(repo_id, session_id), "active": store.get_session(repo_id)["id"]})
+
+
+@flask_app.route("/api/chats")
+def api_all_chats():
+    """Every chat with messages, of every repo and the general ones, newest first."""
+    return jsonify(store.all_sessions())
+
+
+@flask_app.route("/api/repo/<repo_id>/sessions/<session_id>/tags", methods=["POST"])
+def api_session_tags(repo_id, session_id):
+    """Set what a chat is about: {"tags": [{type: commit|pr|request|push, id, label, repo?, url?}]}."""
+    if not store.chat_owner(repo_id):
+        abort(404)
+    tags = (request.get_json(silent=True) or {}).get("tags")
+    if not isinstance(tags, list):
+        return jsonify({"ok": False, "error": "tags must be a list"}), 400
+    return jsonify({"ok": True, "tags": store.set_session_tags(repo_id, session_id, tags)})
 
 
 # --------------------------------------------------------------------- memory
