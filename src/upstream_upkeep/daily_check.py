@@ -17,7 +17,8 @@ def blocker(path: str, focus: str) -> str | None:
     current = gitops.current_branch(path)
     if current != focus:
         return f"the checked-out branch is {current}, not the focus branch {focus}"
-    if gitops.status_summary(path)["dirty"]:
+    # Untracked files can't be lost: git refuses a merge that would overwrite one.
+    if gitops.status_summary(path)["tracked"]:
         return "the working tree has uncommitted changes"
     return None
 

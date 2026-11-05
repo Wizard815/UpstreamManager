@@ -211,11 +211,12 @@ def health(repo: dict, remote: str = "origin") -> dict:
                 "title": last.get("display_title")},
             "recent": [r.get("conclusion") or r.get("status") for r in rs[:10]],
         })
-    rank = {"failing": 0, "running": 1, "passing": 2, "no runs": 3, "disabled": 4}
+    rank = {"failing": 0, "running": 1, "passing": 2, "skipped": 3, "no runs": 4, "disabled": 5}
     for i in items:
         c = (i["last"] or {}).get("conclusion")
         i["health"] = ("disabled" if i["state"] != "active" else "no runs" if not i["last"]
-                       else "running" if not c else "failing" if c in FAILED else "passing")
+                       else "running" if not c else "failing" if c in FAILED
+                       else "passing" if c == "success" else "skipped")  # skipped/neutral is not a pass
     items.sort(key=lambda i: (rank[i["health"]], i["name"].lower()))
     return {"ok": True, "owner": owner, "repo": name, "url": f"https://github.com/{owner}/{name}/actions",
             "token": bool(credentials.get("github_token")), "workflows": items,

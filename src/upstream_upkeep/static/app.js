@@ -81,75 +81,175 @@ function toast(msg, type = "info") {
 // Anything async that failed without its own handler still tells the user.
 window.addEventListener("unhandledrejection", (e) => { toast(e.reason instanceof Error ? e.reason : String(e.reason), "error") })
 
-// --- repos page ---
+// --- dashboard (repos page) ---
+const badge = (cls, txt, title) => el("span", { class: `badge ${cls}`, title: title || null }, txt)
+const ago = (iso) => {
+  if (!iso) return ""
+  const s = (Date.now() - new Date(iso).getTime()) / 1000
+  if (s < 90) return "just now"
+  if (s < 3600) return `${Math.round(s / 60)}m ago`
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`
+  return `${Math.round(s / 86400)}d ago`
+}
+
+async function refreshPendingCount() {
+  try {
+    const reqs = await api(apiUrl('/api/requests'))
+    $("#pending-count").textContent = reqs.filter(r => r.status === "pending").length || ""
+    return reqs
+  } catch { return [] }
+}
+
+async function refreshModelStatus() {
+  const box = $("#model-status")
+  try {
+    const s = await api(apiUrl('/api/settings'))
+    const ok = !!(s.llm?.base_url && s.llm?.model)
+    box.className = `status-dot ${ok ? "ok" : "bad"}`
+    box.lastChild.textContent = ok ? `Model: ${s.llm.model}` : "No model set"
+    box.title = ok ? s.llm.base_url : "Set the model connection in Settings"
+  } catch { box.className = "status-dot" }
+}
+
+// What a request would do, in one line.
+function requestLine(r) {
+  if (r.type === "push") return `push ${r.branch} to ${r.remote}` + (r.open_pr ? ` and open a PR into ${r.base}` : "")
+  if (r.type === "actions") return `GitHub Actions: ${(r.disable || []).length} to disable, ${(r.enable || []).length} to enable`
+  if (r.type === "components") return `bump ${(r.components || []).length} submodule pin(s)`
+  return (r.upstreams || []).map(u => u.name === "workspace"
+    ? (u.reason || "merge a workspace")
+    : `merge ${u.behind} commit(s) from ${u.name}/${u.branch}` + (u.conflict ? `, conflicts in ${(u.conflict_files || []).slice(0, 3).join(", ")}` : u.ahead ? ` · ${u.ahead} of yours · merges cleanly` : "")).join("; ")
+}
+
 async function renderRepos() {
   const content = $("#content")
+  content.replaceChildren(loading("Checking repos…"))
+  const [repos, reqs] = await Promise.all([api(apiUrl('/api/repos')), refreshPendingCount()])
+  const pending = reqs.filter(r => r.status === "pending")
   content.innerHTML = ""
-  content.append(el("h2", {}, "Watched Repositories"))
 
-  const urlIn = el("input", { placeholder: "https://github.com/Wizard815/DNDWORLDAPP.git", style: "width:320px" })
-  const dirIn = el("input", { placeholder: "or /local/path/to/repo", style: "width:320px" })
-  const nameIn = el("input", { placeholder: "display name", style: "width:200px" })
-  const addBtn = el("button", { class: "btn", style: "align-self:flex-end" }, "Add / Watch")
+  // header + add form
+  const addBox = el("div", { class: "card", hidden: "" })
+  const urlIn = el("input", { placeholder: "https://github.com/you/project.git", "aria-label": "Git URL", style: "flex:2 1 260px" })
+  const dirIn = el("input", { placeholder: "or a local folder: /path/to/repo", "aria-label": "Local folder", style: "flex:2 1 260px" })
+  const nameIn = el("input", { placeholder: "display name (optional)", "aria-label": "Display name", style: "flex:1 1 160px" })
+  const addBtn = el("button", { class: "btn" }, "Add")
   addBtn.onclick = async () => {
-    const url = urlIn.value.trim()
-    const dir = dirIn.value.trim()
-    if (!url && !dir) return toast("Enter a git URL or local path", "error")
+    const url = urlIn.value.trim(), dir = dirIn.value.trim()
+    if (!url && !dir) return toast("Enter a git URL or a local folder", "error")
     await busy(addBtn, url ? "Cloning…" : "Adding…", async () => {
       await api(apiUrl('/api/add'), { method: "POST", body: JSON.stringify({ url: url || null, path: dir || null, name: nameIn.value.trim() }) })
-      toast("Repo added", "ok")
-      await loadRepos(list)
+      toast("Repo added", "ok"); await renderRepos()
     })
   }
-  content.append(el("div", { class: "repo-card", style: "margin-bottom:24px" },
-    el("h3", {}, "Add or watch a repo"),
-    el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin-top:8px" }, urlIn, dirIn, nameIn, addBtn),
-    el("p", { class: "muted" }, "Drop a repo into the watch folder, or paste a git URL like https://github.com/Wizard815/DNDWORLDAPP.git. Track multiple upstreams per repo (e.g. origin + a llamacpp mirror).")
-  ))
+  addBox.append(el("div", { class: "row" }, urlIn, dirIn, nameIn, addBtn),
+    el("p", { class: "muted", style: "margin:8px 0 0" }, "A URL is cloned into the watch folder. A local folder is watched where it is. Add more upstreams on the repo's page."))
+  const addToggle = el("button", { class: "btn ghost" }, "+ Add repo")
+  addToggle.onclick = () => { addBox.hidden = !addBox.hidden; if (!addBox.hidden) urlIn.focus() }
+  const fetchBtn = el("button", { class: "btn ghost" }, "Fetch all")
+  fetchBtn.onclick = () => busy(fetchBtn, "Fetching…", async () => {
+    const failed = []
+    await Promise.all(repos.map(r => api(apiUrl(`/api/repo/${r.id}/fetch`), { method: "POST", body: "{}" }).catch(() => failed.push(r.name || r.id))))
+    if (failed.length) toast(`Fetch failed for ${failed.join(", ")}`, "error")
+    await renderRepos()
+  })
+  const runBtn = el("button", { class: "btn" }, "▶ Run daily check")
+  runBtn.onclick = () => busy(runBtn, "Running…", async () => {
+    const res = await api(apiUrl('/api/run-daily'), { method: "POST", body: "{}" })
+    const n = (s) => res.results.filter(r => r.status === s).length
+    toast(`Done: ${n("merged")} fast-forwarded, ${n("request_raised")} requests raised, ${n("skipped")} skipped, ${n("error")} errors`
+      + res.results.filter(r => r.status === "skipped").map(r => `\n${r.repo_name}: ${r.detail}`).join(""), n("error") || n("skipped") ? "error" : "ok")
+    await renderRepos()
+  })
+  content.append(el("div", { class: "col", style: "gap:16px" },
+    el("div", { class: "row" }, el("h1", { class: "page" }, "Repositories"), el("div", { class: "spacer" }), addToggle, fetchBtn, runBtn),
+    addBox))
+  const wrap = content.firstChild
 
-  const list = el("div", {}, loading("Checking repos…"))
-  content.append(list)
-  await loadRepos(list)
+  if (!repos.length) {
+    addBox.hidden = false
+    wrap.append(el("p", { class: "muted" }, "No repos yet. Add one above, or drop a clone into the watch folder."))
+    return
+  }
+
+  // tiles
+  const ups = (r) => (r.upstream_details || []).filter(u => u.enabled !== false)
+  const behindRepos = repos.filter(r => ups(r).some(u => u.behind > 0))
+  const attention = []
+  for (const r of repos) {
+    if (r.error) attention.push({ repo: r, text: r.error })
+    for (const u of ups(r)) if (u.missing_ref) attention.push({ repo: r, text: `${u.name}/${u.branch}: ${u.conflict_detail || "not compared"}`, action: "Set upstream branch" })
+    if (r.dirty_tracked && ups(r).some(u => u.behind > 0)) attention.push({ repo: r, text: `behind upstream, but ${r.dirty_tracked} uncommitted change(s) to tracked files block merging: commit or stash them`, action: "Show changes" })
+  }
+  const tile = (label, value, cls) => el("div", { class: `tile ${cls || ""}` }, el("span", { class: "muted" }, label), el("b", {}, value))
+  wrap.append(el("div", { class: "tiles" },
+    tile("Repos", repos.length),
+    tile("Behind upstream", behindRepos.length ? `${behindRepos.length} repo${behindRepos.length > 1 ? "s" : ""}` : "None", behindRepos.length ? "warn" : "good"),
+    tile("Waiting for approval", pending.length || "None", pending.length ? "warn" : "good"),
+    tile("Needs attention", attention.length || "None", attention.length ? "bad" : "good")))
+
+  // approvals
+  if (pending.length) {
+    const box = el("section", { class: "notice approve", "aria-labelledby": "h-approve" }, el("div", { class: "row" }, el("h2", { id: "h-approve" }, "Needs your approval"), el("div", { class: "spacer" }), el("a", { href: `${BASE}/requests`, class: "small" }, "All requests")))
+    for (const r of pending.slice(0, 6)) {
+      const conflicted = (r.upstreams || []).filter(u => u.conflict)
+      const acts = el("div", { class: "row" })
+      if (conflicted.length) for (const u of conflicted) acts.append(el("button", { class: "btn ghost small", onclick: () => showPullReport(r.repo_id, { upstream: u.name }) }, conflicted.length > 1 ? `Pull report: ${u.name}` : "Pull report"))
+      else {
+        const ok = el("button", { class: "btn small" }, r.type === "push" ? "Approve and push" : r.type === "actions" ? "Approve" : "Approve and merge")
+        ok.onclick = () => busy(ok, "Working…", async () => {
+          const res = await api(apiUrl(`/api/request/${encodeURIComponent(r.id)}/decide`), { method: "POST", body: JSON.stringify({ decision: "approve" }) })
+          const detail = (res.request?.result || []).map(o => o.detail).join("; ")
+          toast(res.ok ? `Done. ${detail}` : `Not done. ${res.error || detail}`, res.ok ? "ok" : "error")
+          await renderRepos()
+        })
+        acts.append(el("button", { class: "btn ghost small", onclick: () => route("/requests") }, "Details"), ok)
+      }
+      box.append(el("div", { class: "item" }, el("div", {}, el("strong", {}, r.repo_name || r.repo_id), el("span", { class: "muted" }, ` · ${requestLine(r)}`),
+        r.summary ? el("div", { class: "small", style: "margin-top:2px;color:#d9c9a8" }, `Agent: ${r.summary}`) : null), acts))
+    }
+    wrap.append(box)
+  }
+
+  // attention
+  if (attention.length) {
+    const box = el("section", { class: "notice attention", "aria-labelledby": "h-att" }, el("h2", { id: "h-att" }, "Needs attention"))
+    for (const a of attention.slice(0, 8)) box.append(el("div", { class: "item" },
+      el("div", {}, el("strong", {}, a.repo.name || a.repo.id), el("span", { class: "muted" }, ` · ${a.text}`)),
+      el("button", { class: "btn ghost small", onclick: () => route(`/repo/${a.repo.id}`) }, a.action || "Open")))
+    wrap.append(box)
+  }
+
+  // table
+  const tbody = el("tbody")
+  for (const r of repos) {
+    const lc = r.last_commit
+    const status = el("div", { class: "row", style: "gap:4px" })
+    for (const u of ups(r)) status.append(...upstreamBadges(u).map(b => { b.title = `${u.name}/${u.branch}: ${b.title || b.textContent}`; return b }))
+    if (!ups(r).length) status.append(badge("", "no upstream"))
+    if (r.dirty) status.append(badge("warn", `${r.dirty} uncommitted`))
+    for (const c of r.components || []) status.append(componentBadge(c))
+    const tr = el("tr", { class: "click", onclick: (e) => { if (!e.target.closest("a")) route(`/repo/${r.id}`) } },
+      el("td", {}, el("a", { href: `${BASE}/repo/${r.id}`, style: "font-weight:600;color:var(--text);text-decoration:none" }, r.name || r.id),
+        el("div", { class: "muted small" }, `${r.focus_branch || ""} · ${r.path}`)),
+      el("td", { class: "muted" }, ups(r).map(u => `${u.name}/${u.branch}`).join(", ") || "-"),
+      el("td", {}, status),
+      el("td", { class: "muted" }, lc ? [el("code", { style: "color:var(--accent2)" }, lc.sha), ` ${lc.subject} · ${ago(lc.date)}`] : ""))
+    tbody.append(tr)
+  }
+  wrap.append(el("div", { class: "table-box" }, el("table", { class: "list" },
+    el("thead", {}, el("tr", {}, el("th", {}, "Repository"), el("th", {}, "Upstreams"), el("th", {}, "Status"), el("th", {}, "Last commit"))), tbody)))
 }
 
-async function loadRepos(container) {
-  const list = container || $("#content")
-  try {
-    const repos = await api(apiUrl('/api/repos'))
-    list.innerHTML = ""
-    if (!repos.length) { list.append(el("p", { class: "muted" }, "No repos yet. Add one above or drop a repo into the watch folder.")); return; }
-    for (const r of repos) list.append(await repoCard(r))
-    const runBtn = el("button", { class: "btn", style: "margin:12px 0" }, "▶ Run Daily Check")
-    runBtn.onclick = () => busy(runBtn, "Running…", async () => {
-      const res = await api(apiUrl('/api/run-daily'), { method: "POST" })
-      const n = (s) => res.results.filter(r => r.status === s).length
-      toast(`Done: ${n("merged")} fast-forwarded, ${n("request_raised")} requests raised, ${n("skipped")} skipped, ${n("error")} errors`
-        + res.results.filter(r => r.status === "skipped").map(r => `\n${r.repo_name}: ${r.detail}`).join(""), n("error") || n("skipped") ? "error" : "ok")
-      await loadRepos(list)
-    })
-    const fetchBtn = el("button", { class: "btn ghost", style: "margin:12px 0 12px 8px" }, "Fetch all upstreams")
-    fetchBtn.onclick = () => busy(fetchBtn, "Fetching…", async () => {
-      const failed = []
-      for (const r of repos) await api(apiUrl(`/api/repo/${r.id}/fetch`), { method: "POST" }).catch(() => failed.push(r.name || r.id))
-      if (failed.length) toast(`Fetch failed for ${failed.join(", ")}`, "error")
-      await loadRepos(list)
-    })
-    list.append(runBtn, fetchBtn)
-  } catch (e) { toast(String(e), "error") }
-}
-
-const badge = (cls, txt, title) => el("span", { class: `badge ${cls}`, title: title || null }, txt)
-
-// ↓ behind = commits the upstream has that you lack; ↑ ahead = commits only you have.
 function upstreamBadges(u) {
-  if (u.missing_ref) return [badge("warn", "not fetched", u.conflict_detail || "press Fetch")]
+  if (u.missing_ref) return [badge("warn", "not compared", u.conflict_detail || "press Fetch")]
   const out = []
   if (u.up_to_date) out.push(badge("up", "up to date"))
   else {
-    out.push(badge(u.behind ? "warn" : "", `↓ ${u.behind} behind`, "commits the upstream has that you lack"))
-    out.push(badge("", `↑ ${u.ahead} ahead`, "commits only you have"))
+    if (u.behind) out.push(badge("warn", `${u.behind} behind`, "commits the upstream has that you lack"))
+    if (u.ahead) out.push(badge("", `${u.ahead} ahead`, "commits only you have"))
   }
-  if (u.conflict) out.push(badge("bad", `⚠ ${(u.conflict_files || []).length} conflicting files`, (u.conflict_files || []).join("\n")))
+  if (u.conflict) out.push(badge("bad", `${(u.conflict_files || []).length} conflicts`, (u.conflict_files || []).join("\n")))
   else if (u.behind && u.ahead) out.push(badge("up", "merges cleanly"))
   return out
 }
@@ -162,32 +262,12 @@ function componentBadge(c) {
   return badge(c.local ? "bad" : "warn", `${c.name} ↓${c.behind}`, `${c.behind} upstream commits newer than the pin` + (c.local ? `; ${c.local} pinned commits not upstream` : ""))
 }
 
-async function repoCard(repo) {
-  const ups = repo.upstream_details || []
-  const lc = repo.last_commit
-  return el("div", { class: "repo-card", id: `repo-${repo.id}` },
-    el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:12px" },
-      el("h3", { style: "margin:0" }, repo.name || repo.id, " ", badge("", repo.focus_branch || "")),
-      el("button", { class: "btn ghost", onclick: () => route(`/repo/${repo.id}`) }, "Open")),
-    el("div", { class: "muted" }, `${repo.kind} · ${repo.path}`),
-    lc ? el("div", { class: "muted" }, `last commit ${lc.sha} · ${(lc.date || "").slice(0, 10)} · ${lc.subject}`) : null,
-    ...ups.map(u => el("div", { style: "margin-top:8px" }, el("strong", {}, `${u.name}/${u.branch} `), ...upstreamBadges(u))),
-    !ups.length && !repo.error ? el("div", { class: "muted", style: "margin-top:8px" }, "No upstream configured.") : null,
-    (repo.components || []).length ? el("div", { style: "margin-top:8px" },
-      el("strong", {}, `components (${repo.components.length}) `),
-      ...repo.components.map(c => componentBadge(c))) : null,
-    repo.dirty ? el("div", { style: "margin-top:6px" }, badge("warn", `${repo.dirty} uncommitted change${repo.dirty > 1 ? "s" : ""}`)) : null,
-    repo.error ? el("div", { style: "color:#e08080;margin-top:6px" }, repo.error) : null
-  )
-}
-
 // ---- tagged items: commits/files the user pins to the chat so the model can read them
 const loadTags = (id) => { try { return JSON.parse(localStorage.getItem(`tags:${id}`) || "[]") } catch { return [] } }
 const saveTags = (id, t) => { try { localStorage.setItem(`tags:${id}`, JSON.stringify(t)) } catch {} }
 // The server reads at most this many attachments per message (llm.MAX_ATTACHMENTS).
 const MAX_TAGS = 6
 let refreshTray = () => {}
-let refreshCommits = () => {}
 function addTag(repoId, tag) {
   const t = loadTags(repoId)
   if (t.some(x => x.type === tag.type && x.id === tag.id)) return toast(`${tag.label} is already tagged`, "info")
@@ -198,49 +278,89 @@ function addTag(repoId, tag) {
   toast(`Tagged ${tag.label} for the chat`, "ok")
 }
 
+// ↓ behind = commits the upstream has that you lack; ↑ ahead = commits only you have.
+let tools = null  // the open repo page's tool tabs: {show(name), openFiles(ws)}
+
+const store_ = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v) } catch { return d } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)) } catch {} },
+}
+
 async function renderRepoPage(repoId) {
   const content = $("#content")
   content.replaceChildren(loading())
-  let repo
-  try { repo = await api(apiUrl(`/api/repo/${repoId}`)); }
-  catch (e) { content.replaceChildren(el("p", { class: "muted" }, e.status === 404 ? "Repo not found." : e.message)); return; }
+  let repo, branches
+  try { [repo, branches] = await Promise.all([api(apiUrl(`/api/repo/${repoId}`)), repoBranches(repoId)]) }
+  catch (e) { content.replaceChildren(el("p", { class: "muted" }, e.status === 404 ? "Repo not found." : e.message)); return }
   content.innerHTML = ""
 
-  content.append(el("a", { href: `${BASE}/repos`, style: "color:#9fb4ff", onclick: (e) => { e.preventDefault(); route('/repos') } }, "← All repos"))
-
-  const focusSel = el("select", { id: `focus-${repoId}` })
-  const branches = await repoBranches(repoId)
-  for (const b of branches) focusSel.append(el("option", { value: b }, b))
+  const focusSel = el("select", { id: `focus-${repoId}`, "aria-label": "Focus branch" })
+  for (const b of branches.filter(b => !b.startsWith("upkeep/"))) focusSel.append(el("option", { value: b }, b))
   focusSel.value = repo.focus_branch
   focusSel.onchange = async () => {
     focusSel.disabled = true
     try {
       await api(apiUrl(`/api/repo/${repoId}/focus`), { method: "POST", body: JSON.stringify({ branch: focusSel.value }) })
-      toast("Focus branch updated", "ok")
-      await renderRepoPage(repoId)
-    } catch (e) { toast(e, "error"); focusSel.disabled = false }
+      toast("Focus branch updated", "ok"); await renderRepoPage(repoId)
+    } catch (e) { toast(e, "error"); focusSel.disabled = false; focusSel.value = repo.focus_branch }
   }
+  const tree = el("span", { class: "badge" }, "…")
+  const pathEl = el("button", { class: "path btn link", title: `${repo.path} (click to copy)`, onclick: () => { navigator.clipboard?.writeText(repo.path); toast("Path copied", "ok") } }, repo.path)
+  content.append(el("div", { class: "repo-head" },
+    el("a", { href: `${BASE}/repos`, class: "muted", style: "text-decoration:none" }, "Repos"), el("span", { class: "muted" }, "/"),
+    el("h1", { class: "page" }, repo.name || repoId),
+    el("label", { class: "row muted", style: "gap:6px" }, "Focus", focusSel), tree, el("div", { class: "spacer" }), pathEl))
 
-  content.append(el("div", { class: "grid", style: "margin-top:16px" },
-    el("div", {}, el("h2", {}, repo.name || repoId), el("div", { class: "muted" }, repo.path)),
-    el("div", {},
-      el("label", { for: `focus-${repoId}`, style: "display:block;margin-bottom:4px" }, "Focus branch"),
-      focusSel
-    )
-  ))
-
-  const upWrap = el("div", { style: "margin-top:20px" }, loading("Comparing upstreams…"))
-  content.append(upWrap)
-  await refreshUpstreams(upWrap, repoId).catch(e => upWrap.replaceChildren(el("p", { class: "muted" }, `Could not compare upstreams: ${e.message}`)))
-
-  const compWrap = el("div", { style: "margin-top:20px" })
-  content.append(compWrap)
+  const upWrap = el("div", { class: "panel ups" }, loading("Comparing upstreams…"))
+  const compWrap = el("div")
+  content.append(upWrap, compWrap)
+  refreshUpstreams(upWrap, repoId, tree).catch(e => upWrap.replaceChildren(el("p", { class: "muted", style: "padding:10px" }, `Could not compare upstreams: ${e.message}`)))
   renderComponents(compWrap, repoId).catch(e => compWrap.replaceChildren(el("p", { class: "muted" }, `Could not read components: ${e.message}`)))
 
-  const chatWrap = el("div")
-  const toolsWrap = el("div")
-  content.append(el("div", { class: "grid repo-grid", style: "margin-top:20px;align-items:start" }, chatWrap, toolsWrap))
-  await Promise.all([renderChat(chatWrap, repoId, repo.focus_branch), renderTools(toolsWrap, repoId)])
+  // workbench: tools | splitter | chat
+  const bench = el("div", { class: "workbench" })
+  const toolsPane = el("section", { class: "pane tools", "aria-label": "Repo tools" })
+  const splitter = el("div", { class: "splitter", role: "separator", "aria-orientation": "vertical", "aria-label": "Resize chat", tabindex: "0" })
+  const chatPane = el("aside", { class: "pane chat", "aria-label": "Chat" })
+  bench.append(toolsPane, splitter, chatPane)
+  content.append(bench)
+  const setW = (w) => { w = Math.max(320, Math.min(w, bench.clientWidth - 360)); bench.style.setProperty("--chat-w", `${w}px`); return w }
+  // The workbench fills the rest of the window, whatever the upstream panel above it takes.
+  const fit = () => { if (!bench.isConnected) return removeEventListener("resize", fit); bench.style.setProperty("--bench-h", `${Math.max(480, innerHeight - bench.getBoundingClientRect().top + scrollY - 16)}px`) }
+  addEventListener("resize", fit); new ResizeObserver(fit).observe(upWrap)
+  setW(store_.get("chatWidth", 460))
+  splitter.addEventListener("pointerdown", (e) => {
+    e.preventDefault()  // or the browser starts a text selection and takes the pointer away
+    splitter.setPointerCapture(e.pointerId); splitter.classList.add("drag"); document.body.style.userSelect = "none"
+    const move = (ev) => setW(bench.getBoundingClientRect().right - ev.clientX)
+    const up = () => {
+      splitter.classList.remove("drag"); document.body.style.userSelect = ""
+      splitter.removeEventListener("pointermove", move); splitter.removeEventListener("pointerup", up); splitter.removeEventListener("pointercancel", up)
+      store_.set("chatWidth", parseInt(getComputedStyle(bench).getPropertyValue("--chat-w")))
+    }
+    splitter.addEventListener("pointermove", move); splitter.addEventListener("pointerup", up); splitter.addEventListener("pointercancel", up)
+  })
+  splitter.addEventListener("keydown", (e) => {
+    const cur = parseInt(getComputedStyle(bench).getPropertyValue("--chat-w")) || 460
+    const d = { ArrowLeft: 40, ArrowRight: -40 }[e.key]
+    if (d) { e.preventDefault(); store_.set("chatWidth", setW(cur + d)) }
+  })
+  const setMode = (m) => {
+    bench.classList.toggle("chat-wide", m === "wide"); bench.classList.toggle("chat-hidden", m === "hidden")
+    store_.set("chatMode", m); chatToggle.textContent = m === "hidden" ? "Show chat" : "Hide chat"
+  }
+  const chatToggle = el("button", { class: "btn ghost small chat-ctl", onclick: () => setMode(bench.classList.contains("chat-hidden") ? "normal" : "hidden") }, "Hide chat")
+
+  const chat = chatPanel(repoId, { focus: repo.focus_branch, onWide: () => setMode(bench.classList.contains("chat-wide") ? "normal" : "wide"), isWide: () => bench.classList.contains("chat-wide") })
+  tools = renderTools(toolsPane, repoId, { extra: chatToggle })
+  // Chat sits beside the tools on a wide screen and is a tab on a narrow one.
+  const narrow = matchMedia("(max-width: 900px)")
+  const place = () => {
+    const target = narrow.matches ? tools.chatPanel : chatPane
+    if (chat.parentNode !== target) target.append(chat)
+  }
+  place(); narrow.addEventListener("change", place)
+  setMode(store_.get("chatMode", "normal"))
 }
 
 async function repoBranches(repoId) {
@@ -250,70 +370,171 @@ async function repoBranches(repoId) {
   } catch { return []; }
 }
 
-async function refreshUpstreams(wrap, repoId) {
+function menu(label, items) {
+  const d = el("details", { class: "menu" }, el("summary", { class: "btn ghost icon", "aria-label": label, title: label }, "⋯"))
+  const list = el("div", { class: "menu-list", role: "menu" })
+  for (const it of items) {
+    if (!it) continue
+    list.append(el("button", { class: it.danger ? "danger" : "", role: "menuitem", onclick: (e) => { d.open = false; it.run(e) } }, it.label))
+  }
+  d.append(list)
+  document.addEventListener("click", (e) => { if (!d.contains(e.target)) d.open = false })
+  return d
+}
+
+let refreshCommits = () => {}
+async function refreshUpstreams(wrap, repoId, treeBadge) {
   const [repo, cmp] = await Promise.all([api(apiUrl(`/api/repo/${repoId}`)), api(apiUrl(`/api/repo/${repoId}/compare`))])
   const byName = Object.fromEntries((cmp.plan?.upstreams || []).map(u => [u.name, u]))
-  wrap.innerHTML = ""
   const git = cmp.git || {}
-  const fetchAll = el("button", { class: "btn" }, "Fetch all")
+  if (treeBadge) { treeBadge.className = `badge ${git.dirty ? "warn" : "up"}`; treeBadge.textContent = git.dirty ? `${git.dirty} uncommitted` : "working tree clean" }
+  wrap.innerHTML = ""
+  const again = () => refreshUpstreams(wrap, repoId, treeBadge)
+  const fetchAll = el("button", { class: "btn ghost small" }, "Fetch all")
   fetchAll.onclick = () => busy(fetchAll, "Fetching…", async () => {
-    await api(apiUrl(`/api/repo/${repoId}/fetch`), { method: "POST" })
-    await refreshUpstreams(wrap, repoId); refreshCommits()
+    await api(apiUrl(`/api/repo/${repoId}/fetch`), { method: "POST", body: "{}" })
+    await again(); refreshCommits()
   })
-  wrap.append(el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap" },
-    el("h3", { style: "margin:0" }, "Upstreams"),
-    el("div", { class: "muted" }, git.dirty ? `${git.dirty} uncommitted change(s) in working tree` : "working tree clean"),
-    fetchAll))
-  for (const u of repo.upstreams || []) {
-    const c = byName[u.name]
-    const files = c?.conflict_files || []
-    const upEl = el("div", { class: "upstream" },
-      el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap" },
-        el("div", {},
-          el("strong", {}, `${u.name} / ${u.branch} `),
-          ...(u.enabled ? (c ? upstreamBadges(c) : []) : [badge("", "disabled")])
-        ),
-        el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" },
-          el("button", { class: "btn ghost", "aria-label": `Fetch ${u.name}`, onclick: (e) => busy(e.currentTarget, "Fetching…", async () => {
-            const r = await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}/rebase`), { method: "POST" })
-            const err = (r.plan?.upstreams || []).find(x => x.name === u.name)?.conflict_detail
-            if (err && /fatal|could not|unable/i.test(err)) toast(err, "error")
-            await refreshUpstreams(wrap, repoId); refreshCommits()
-          }) }, "Fetch"),
-          el("button", { class: "btn ghost", "aria-label": `Pull report for ${u.name}`, onclick: (e) => busy(e.currentTarget, "Analysing…", () => showPullReport(repoId, { upstream: u.name })) }, "Pull report"),
-          el("button", { class: "btn ghost", "aria-label": `${u.enabled ? "Disable" : "Enable"} ${u.name}`, onclick: (e) => busy(e.currentTarget, null, async () => {
-            await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}/enable`), { method: "POST", body: JSON.stringify({ enabled: !u.enabled }) })
-            await refreshUpstreams(wrap, repoId)
-          }) }, u.enabled ? "Disable" : "Enable"),
-          el("button", { class: "btn danger", "aria-label": `Remove ${u.name}`, onclick: (e) => {
-            if (!confirm(`Remove upstream ${u.name}?`)) return
-            return busy(e.currentTarget, "Removing…", async () => {
-              await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}`), { method: "DELETE" })
-              await refreshUpstreams(wrap, repoId)
-            })
-          } }, "Remove")
-        )
-      ),
-      el("div", { class: "muted" }, u.url),
-      c && c.missing_ref ? el("div", { class: "muted", style: "color:#e0a060" }, c.conflict_detail) : null,
-      files.length ? el("details", { style: "margin-top:6px" }, el("summary", {}, `Conflicting files (${files.length})`),
-        el("div", { class: "muted", style: "font-family:monospace;font-size:12px" }, ...files.map(f => el("div", {}, f)))) : null
-    )
-    wrap.append(upEl)
-  }
-  const nameIn = el("input", { placeholder: "remote name (e.g. upstream)", "aria-label": "Remote name", style: "width:180px" })
-  const urlIn = el("input", { placeholder: "https://github.com/org/repo.git", "aria-label": "Remote URL", style: "width:320px" })
-  const branchIn = el("input", { placeholder: "its branch (default: focus)", "aria-label": "Upstream branch", style: "width:170px", title: "The upstream's branch to compare against, e.g. main or master" })
-  const addUpBtn = el("button", { class: "btn", style: "align-self:flex-end" }, "Add upstream")
+  const addBox = el("div", { class: "row", hidden: "", style: "padding:8px 12px;border-top:1px solid #1e2330" })
+  const nameIn = el("input", { placeholder: "name, e.g. upstream", "aria-label": "Remote name", style: "flex:1 1 140px" })
+  const urlIn = el("input", { placeholder: "https://github.com/org/repo.git", "aria-label": "Remote URL", style: "flex:3 1 260px" })
+  const branchIn = el("input", { placeholder: "its branch (default: focus)", "aria-label": "Upstream branch", style: "flex:1 1 160px" })
+  const addUpBtn = el("button", { class: "btn small" }, "Add")
   addUpBtn.onclick = () => {
     if (!nameIn.value.trim() || !urlIn.value.trim()) return toast("Enter a remote name and URL", "error")
     return busy(addUpBtn, "Adding…", async () => {
       await api(apiUrl(`/api/repo/${repoId}/upstream`), { method: "POST", body: JSON.stringify({ name: nameIn.value.trim(), url: urlIn.value.trim(), branch: branchIn.value.trim() || null }) })
-      toast("Upstream added. Press Fetch to compare.", "ok")
-      await refreshUpstreams(wrap, repoId)
+      toast("Upstream added. Fetch it to compare.", "ok"); await again()
     })
   }
-  wrap.append(el("div", { style: "display:flex;gap:8px;margin-top:12px;flex-wrap:wrap" }, nameIn, urlIn, branchIn, addUpBtn))
+  addBox.append(nameIn, urlIn, branchIn, addUpBtn)
+  wrap.append(el("div", { class: "up-row" }, el("h2", {}, "Upstreams"), el("div", { class: "spacer" }),
+    el("button", { class: "btn ghost small", onclick: () => branchSetDialog(repoId) }, "Merge branches…"),
+    el("button", { class: "btn ghost small", onclick: () => { addBox.hidden = !addBox.hidden; if (!addBox.hidden) nameIn.focus() } }, "+ Add upstream"), fetchAll))
+  if (!(repo.upstreams || []).length) wrap.append(el("div", { class: "up-row muted" }, "No upstream yet. Add the project you forked from to compare against it."))
+  for (const u of repo.upstreams || []) {
+    const c = byName[u.name]
+    const acts = el("div", { class: "row", style: "gap:6px" })
+    acts.append(el("button", { class: "btn ghost small", "aria-label": `Fetch ${u.name}`, onclick: (e) => busy(e.currentTarget, "Fetching…", async () => {
+      const r = await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}/rebase`), { method: "POST", body: "{}" })
+      const err = (r.plan?.upstreams || []).find(x => x.name === u.name)?.conflict_detail
+      if (err && /fatal|could not|unable/i.test(err)) toast(err, "error")
+      await again(); refreshCommits()
+    }) }, "Fetch"))
+    if (c && c.behind) acts.append(el("button", { class: "btn ghost small", onclick: (e) => busy(e.currentTarget, "Analysing…", () => showPullReport(repoId, { upstream: u.name })) }, "Pull report"))
+    if (c && c.behind && c.conflict) acts.append(el("button", { class: "btn small", title: "Start the merge in a separate checkout and resolve the conflicts there (you or an agent)", onclick: (e) => busy(e.currentTarget, "Opening…", () => openWorkspace(repoId, { upstream: u.name })) }, "Resolve in workspace"))
+    acts.append(menu(`More actions for ${u.name}`, [
+      c && c.behind && !c.conflict ? { label: "Merge in a workspace", run: () => openWorkspace(repoId, { upstream: u.name }) } : null,
+      { label: u.enabled ? "Disable (stop comparing)" : "Enable", run: async () => {
+        await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}/enable`), { method: "POST", body: JSON.stringify({ enabled: !u.enabled }) }); await again() } },
+      { label: "Copy URL", run: () => { navigator.clipboard?.writeText(u.url); toast("URL copied", "ok") } },
+      { label: "Remove upstream", danger: true, run: async () => {
+        if (!confirm(`Remove upstream ${u.name}? Its git remote is removed too.`)) return
+        await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}`), { method: "DELETE", body: "{}" }); await again() } },
+    ]))
+    const files = c?.conflict_files || []
+    wrap.append(el("div", { class: "up-row" },
+      el("strong", {}, `${u.name} / ${u.branch}`),
+      ...(u.enabled ? (c ? upstreamBadges(c) : []) : [badge("", "disabled")]),
+      el("span", { class: "muted small", style: "min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:320px", title: u.url }, u.url),
+      el("div", { class: "spacer" }), acts,
+      c && c.missing_ref ? el("div", { class: "small", style: "flex-basis:100%;color:var(--warn)" }, c.conflict_detail) : null,
+      files.length ? el("details", { style: "flex-basis:100%" }, el("summary", { class: "small muted" }, `Conflicting files (${files.length})`),
+        el("div", { class: "small mono", style: "color:var(--bad)" }, ...files.map(f => el("div", {}, f)))) : null))
+  }
+  wrap.append(addBox)
+}
+
+// ---- merge workspaces and branch sets
+async function openWorkspace(repoId, body) {
+  const res = await api(apiUrl(`/api/repo/${repoId}/workspaces`), { method: "POST", body: JSON.stringify(body) })
+  const ws = res.workspace
+  toast(ws.ready ? "Everything merged cleanly. Review it, then submit for approval." : ws.next_step, ws.ready ? "ok" : "info")
+  tools?.show("Merges")
+  return ws
+}
+
+async function branchSetDialog(repoId) {
+  const [repo, branches] = await Promise.all([api(apiUrl(`/api/repo/${repoId}`)), repoBranches(repoId)])
+  const choices = [...branches.filter(b => b !== repo.focus_branch && !b.startsWith("upkeep/")),
+    ...(repo.upstreams || []).map(u => u.name)]
+  const order = []
+  const list = el("div", { class: "col", style: "gap:4px;max-height:50vh;overflow:auto;margin:10px 0" })
+  const other = el("input", { placeholder: "or a remote branch, e.g. origin/feature-x", "aria-label": "Remote branch" })
+  const summary = el("div", { class: "muted" })
+  const redraw = () => {
+    list.querySelectorAll("label").forEach(l => {
+      const n = order.indexOf(l.dataset.name)
+      l.querySelector(".ord").textContent = n >= 0 ? String(n + 1) : ""
+    })
+    summary.textContent = order.length ? `Merge order: ${order.join(" → ")} → into ${repo.focus_branch}` : "Pick the branches to merge, in the order to merge them."
+  }
+  for (const b of choices) {
+    const isUp = (repo.upstreams || []).some(u => u.name === b)
+    const cb = el("input", { type: "checkbox", style: "height:auto" })
+    cb.onchange = () => { cb.checked ? order.push(b) : order.splice(order.indexOf(b), 1); redraw() }
+    const l = el("label", { class: "row", style: "gap:8px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;cursor:pointer", "data-name": b },
+      cb, el("span", { class: "badge info ord", style: "min-width:22px;justify-content:center" }), el("span", {}, b), isUp ? badge("", "upstream") : null)
+    list.append(l)
+  }
+  if (!choices.length) list.append(el("p", { class: "muted" }, "No other branches here. Create feature branches first, or type a remote branch below."))
+  const go = el("button", { class: "btn" }, "Open merge workspace")
+  let close
+  go.onclick = () => {
+    const extra = other.value.trim()
+    const picks = extra ? [...order, extra] : order
+    if (!picks.length) return toast("Pick at least one branch", "error")
+    return busy(go, "Merging…", async () => { await openWorkspace(repoId, { branches: picks }); close() })
+  }
+  close = openDialog(`Merge branches into ${repo.focus_branch}`,
+    el("p", { class: "muted", style: "margin:8px 0 0" }, "They merge in a separate checkout, one after another, each as it is right now. A clean merge goes straight on to the next; a conflict stops there so you (in Files) or an agent can resolve it, then Continue. Nothing reaches your branch until you approve the finished set."),
+    list, other, summary, el("div", { class: "row", style: "margin-top:10px" }, go))
+  redraw()
+}
+
+async function renderMerges(wrap, repoId) {
+  const res = await api(apiUrl(`/api/repo/${repoId}/workspaces`))
+  wrap.innerHTML = ""
+  wrap.append(el("div", { class: "row", style: "margin-bottom:10px" },
+    el("h3", {}, "Merge workspaces"), el("div", { class: "spacer" }),
+    el("button", { class: "btn ghost small", onclick: () => branchSetDialog(repoId) }, "Merge branches…"),
+    el("button", { class: "btn ghost small", onclick: () => renderMerges(wrap, repoId) }, "Refresh")))
+  if (!res.items.length) {
+    wrap.append(el("p", { class: "muted" }, "None open. Use “Resolve in workspace” on a conflicting upstream, or “Merge branches…” to combine several feature branches. A connected coding agent can open and finish these too."))
+    return
+  }
+  const stateBadge = (s) => badge({ merged: "up", conflict: "bad", failed: "bad", pending: "" }[s] || "", s)
+  for (const w of res.items) {
+    if (w.error) { wrap.append(el("div", { class: "card" }, el("strong", {}, w.name), el("div", { class: "muted" }, w.error))); continue }
+    const cont = el("button", { class: "btn small" }, "Continue")
+    cont.onclick = () => busy(cont, "Merging…", async () => {
+      const r = await api(apiUrl(`/api/repo/${repoId}/workspaces/${w.name}/continue`), { method: "POST", body: "{}" })
+      toast(r.workspace.next_step, r.workspace.ready ? "ok" : "info"); await renderMerges(wrap, repoId)
+    })
+    const submit = el("button", { class: "btn small" }, "Submit for approval")
+    submit.onclick = () => {
+      const summary = prompt("Summary for the approval (how conflicts were resolved, what you tested):", "") 
+      if (summary === null) return
+      return busy(submit, "Submitting…", async () => {
+        await api(apiUrl(`/api/repo/${repoId}/workspaces/${w.name}/submit`), { method: "POST", body: JSON.stringify({ summary }) })
+        toast("Raised. Approve it on the Requests page.", "ok"); await refreshPendingCount(); await renderMerges(wrap, repoId)
+      })
+    }
+    const files = el("button", { class: "btn ghost small", onclick: () => tools?.openFiles(w.name) }, "Open in Files")
+    const discard = el("button", { class: "btn ghost small", onclick: () => {
+      if (!confirm(`Discard workspace ${w.name}? Its merges and edits are lost.`)) return
+      return busy(discard, "Discarding…", async () => { await api(apiUrl(`/api/repo/${repoId}/workspaces/${w.name}`), { method: "DELETE", body: "{}" }); await renderMerges(wrap, repoId) })
+    } }, "Discard")
+    const needsContinue = !w.ready && (w.merging || (w.sources || []).some(s => s.state !== "merged"))
+    wrap.append(el("div", { class: "card", style: "margin-bottom:10px" },
+      el("div", { class: "row" }, el("strong", {}, w.branch), w.ready ? badge("up", "ready") : badge("warn", "in progress"), el("div", { class: "spacer" }),
+        files, needsContinue ? cont : null, w.ready ? submit : null, discard),
+      el("div", { class: "row", style: "gap:6px;margin-top:8px" }, ...(w.sources || []).map((s, i) => el("span", { class: "row", style: "gap:4px" },
+        el("span", { class: "muted small" }, `${i + 1}.`), el("span", {}, s.label), stateBadge(s.state)))),
+      el("div", { style: "margin-top:8px" }, w.next_step),
+      (w.unresolved || []).length ? el("div", { class: "small mono", style: "margin-top:4px;color:var(--bad)" }, `Conflicted: ${w.unresolved.join(", ")}`) : null,
+      el("div", { class: "muted small", style: "margin-top:4px" }, w.path)))
+  }
 }
 
 // Components: the repo's git submodules. Each keeps its own upstream and is
@@ -394,92 +615,165 @@ async function renderComponents(wrap, repoId) {
 
 // Chat: one conversation per session. "New chat" resets what the model sees of
 // the conversation; repo facts, memory and tagged commits/files go with every message.
-async function renderChat(wrap, repoId, focus, sessionId) {
-  wrap.replaceChildren(loading("Loading chat…"))
-  const sessions = await api(apiUrl(`/api/repo/${repoId}/sessions`))
-  const sessSel = el("select", { style: "max-width:240px", "aria-label": "Chat session" })
-  for (const s of sessions) sessSel.append(el("option", { value: s.id }, `${s.title || "New chat"} · ${s.count} msgs`))
-  const hist = await api(apiUrl(`/api/chat/${repoId}` + (sessionId ? `?session=${sessionId}` : "")))
-  if (![...sessSel.options].some(o => o.value === hist.session)) sessSel.append(el("option", { value: hist.session }, "New chat · 0 msgs"))
-  sessSel.value = hist.session
-  wrap.innerHTML = ""
-  sessSel.onchange = async () => {
-    await api(apiUrl(`/api/repo/${repoId}/sessions`), { method: "POST", body: JSON.stringify({ session: sessSel.value }) })
-    await renderChat(wrap, repoId, focus, sessSel.value)
+// Chat panel: one conversation of a repo (or of no repo: GENERAL). Used beside the
+// repo tools and on the Chats page. A chat can be "about" commits, PRs or requests
+// (its tags, sent to the model with every message); the tray holds commits/files
+// attached to the next messages only.
+const GENERAL = "_general"
+function chatPanel(repoId, opts = {}) {
+  const root = el("div", { class: "col", style: "gap:0;flex:1;min-height:0;height:100%" })
+  let sessionId = opts.sessionId || null
+  const load = async () => {
+    root.replaceChildren(loading("Loading chat…"))
+    try { await draw() } catch (e) { root.replaceChildren(el("p", { class: "muted", style: "padding:10px" }, `Could not load the chat: ${e.message}`)) }
   }
-  const newBtn = el("button", { class: "btn ghost", title: "Start a new conversation. The repo memory is kept." }, "New chat")
-  newBtn.onclick = () => busy(newBtn, null, async () => {
-    const res = await api(apiUrl(`/api/repo/${repoId}/sessions`), { method: "POST", body: "{}" })
-    await renderChat(wrap, repoId, focus, res.session)
-  })
-  const delBtn = el("button", { class: "btn ghost", title: "Delete this conversation (memory is kept)" }, "Delete chat")
-  delBtn.onclick = () => {
-    if (!confirm("Delete this chat? The repo memory is kept.")) return
-    return busy(delBtn, "Deleting…", async () => {
-      const res = await api(apiUrl(`/api/repo/${repoId}/sessions/${hist.session}`), { method: "DELETE" })
-      await renderChat(wrap, repoId, focus, res.active)
-    })
-  }
-  wrap.append(
-    el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap" },
-      el("h3", { style: "margin:0" }, `Chat · ${focus}`),
-      el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" }, sessSel, newBtn, delBtn)),
-  )
-  const box = el("div", { class: "chat-box", style: "margin-top:8px", role: "log", "aria-live": "polite", "aria-label": "Conversation", tabindex: "0" })
-  const msgIn = el("textarea", { placeholder: "Ask about this repo… (Enter to send, Shift+Enter for a new line)", "aria-label": "Message", rows: "2", style: "width:100%;resize:vertical;margin-top:8px" })
-  const sendBtn = el("button", { class: "btn", style: "margin-top:8px" }, "Send")
-  const tray = el("div", { class: "tray" })
-  refreshTray = () => {
-    tray.innerHTML = ""
-    const tags = loadTags(repoId)
-    if (!tags.length) { tray.append(el("span", { class: "muted" }, "Nothing tagged. Use Tag on a commit or file so the model can read it.")); return }
-    tray.append(el("span", { class: "muted" }, `Sent with every message (${tags.length}/${MAX_TAGS}):`))
-    for (const t of tags) {
-      const x = el("button", { class: "chip-x", title: "Remove", "aria-label": `Remove ${t.label}` }, "×")
-      x.onclick = () => { saveTags(repoId, loadTags(repoId).filter(y => !(y.type === t.type && y.id === t.id))); refreshTray() }
-      tray.append(el("span", { class: "chip" }, `${t.type === "commit" ? "◆" : "▤"} ${t.label}`, x))
+  const draw = async () => {
+    const [sessions, hist] = await Promise.all([
+      api(apiUrl(`/api/repo/${repoId}/sessions`)),
+      api(apiUrl(`/api/chat/${repoId}` + (sessionId ? `?session=${sessionId}` : ""))),
+    ])
+    sessionId = hist.session
+    opts.onSession?.(sessionId)
+    const sessSel = el("select", { "aria-label": "Conversation" })
+    for (const s of sessions) sessSel.append(el("option", { value: s.id }, `${s.title || "New chat"} · ${s.count}`))
+    if (![...sessSel.options].some(o => o.value === sessionId)) sessSel.append(el("option", { value: sessionId }, "New chat · 0"))
+    sessSel.value = sessionId
+    sessSel.onchange = async () => {
+      await api(apiUrl(`/api/repo/${repoId}/sessions`), { method: "POST", body: JSON.stringify({ session: sessSel.value }) })
+      sessionId = sessSel.value; await load()
     }
-  }
-  refreshTray()
-  // Replies are Markdown; renderMarkdown escapes everything first (see md.js).
-  const setReply = (d, text) => { d.innerHTML = renderMarkdown(text) }
-  const addMsg = (m, index) => {
-    const d = el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.error ? " err" : ""}` })
-    if (m.role === "user" || m.error) d.textContent = m.content
-    else setReply(d, m.content)
-    if (m.edits?.length) d.append(editCard(repoId, hist.session, index, m))
-    if (m.attachments?.length) d.append(el("div", { class: "muted", style: "margin-top:4px;font-size:12px" }, "📎 " + m.attachments.map(a => a.label).join(", ")))
-    box.append(d)
-    return d
-  }
-  sendBtn.onclick = async () => {
-    const text = msgIn.value.trim()
-    if (!text || sendBtn.disabled) return
-    const attachments = loadTags(repoId)
-    msgIn.value = ""
-    sendBtn.disabled = true
-    sendBtn.textContent = "Sending…"
-    if (!hist.messages?.length) box.querySelector("p.muted")?.remove()
-    addMsg({ role: "user", content: text, attachments })
-    const replyBox = el("div", { class: "msg bot" }, loading("Thinking…"))
-    box.append(replyBox)
+    const newBtn = el("button", { class: "btn ghost icon", title: "New chat (memory is kept)", "aria-label": "New chat" }, "+")
+    newBtn.onclick = () => busy(newBtn, null, async () => {
+      const res = await api(apiUrl(`/api/repo/${repoId}/sessions`), { method: "POST", body: "{}" })
+      sessionId = res.session; await load(); opts.onChange?.()
+    })
+    const head = el("div", { class: "chat-head" }, opts.title ? el("strong", {}, opts.title) : el("strong", {}, "Chat"), sessSel, newBtn)
+    if (opts.onWide) {
+      const wide = el("button", { class: "btn ghost icon chat-ctl", title: "Make the chat bigger / smaller", "aria-label": "Toggle wide chat" }, opts.isWide?.() ? "⤡" : "⤢")
+      wide.onclick = () => { opts.onWide(); wide.textContent = opts.isWide?.() ? "⤡" : "⤢" }
+      head.append(wide)
+    }
+    head.append(menu("Chat actions", [
+      { label: "Open on the Chats page", run: () => route(`/chats?repo=${repoId}&session=${sessionId}`) },
+      { label: "Delete this chat", danger: true, run: async () => {
+        if (!confirm("Delete this chat? What the assistant remembers is kept.")) return
+        const res = await api(apiUrl(`/api/repo/${repoId}/sessions/${sessionId}`), { method: "DELETE", body: "{}" })
+        sessionId = res.active; await load(); opts.onChange?.() } },
+    ]))
+
+    // about (session tags)
+    const tags = hist.tags || []
+    const saveAbout = async (next) => {
+      await api(apiUrl(`/api/repo/${repoId}/sessions/${sessionId}/tags`), { method: "POST", body: JSON.stringify({ tags: next }) })
+      await load(); opts.onChange?.()
+    }
+    const about = el("div", { class: "about" }, el("span", { class: "muted" }, "About:"))
+    const icon = { commit: "◆", pr: "⇄", request: "✓", push: "↑" }
+    for (const t of tags) {
+      const x = el("button", { class: "chip-x", "aria-label": `Remove ${t.label}`, onclick: () => saveAbout(tags.filter(y => y !== t)) }, "×")
+      const label = el("span", {}, `${icon[t.type] || ""} ${t.label}`)
+      const chip = el("span", { class: "chip about-chip", title: `${t.type}${t.repo ? ` in ${t.repo}` : ""}: ${t.id}` }, t.url ? el("a", { href: t.url, target: "_blank", rel: "noopener", style: "color:inherit" }, label) : label, x)
+      about.append(chip)
+    }
+    about.append(el("button", { class: "btn link small", onclick: () => aboutDialog(repoId, tags, saveAbout) }, tags.length ? "+ add" : "+ a commit, PR or request"))
+
+    const box = el("div", { class: "chat-box", role: "log", "aria-live": "polite", "aria-label": "Conversation", tabindex: "0" })
+    const setReply = (d, text) => { d.innerHTML = renderMarkdown(text) }
+    const addMsg = (m, index) => {
+      const d = el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.error ? " err" : ""}` })
+      if (m.role === "user" || m.error) d.textContent = m.content
+      else setReply(d, m.content)
+      if (m.edits?.length && repoId !== GENERAL) d.append(editCard(repoId, sessionId, index, m))
+      if (m.attachments?.length) d.append(el("div", { class: "small", style: "margin-top:4px;opacity:.8" }, "📎 " + m.attachments.map(a => a.label).join(", ")))
+      box.append(d)
+      return d
+    }
+    ;(hist.messages || []).forEach((m, i) => addMsg(m, i))
+    if (!(hist.messages || []).length) box.append(el("p", { class: "muted" }, repoId === GENERAL
+      ? "A chat about no particular repo. The assistant sees an overview of every watched repo."
+      : "New conversation. The assistant knows this repo, its upstreams and what it remembers about it."))
+
+    const msgIn = el("textarea", { placeholder: "Message… (Enter to send, Shift+Enter for a new line)", "aria-label": "Message", rows: "2" })
+    const sendBtn = el("button", { class: "btn" }, "Send")
+    const tray = el("div", { class: "tray" })
+    const trayKey = repoId
+    refreshTray = () => {
+      tray.innerHTML = ""
+      const items = loadTags(trayKey)
+      if (!items.length) { tray.append(el("span", { class: "muted small" }, repoId === GENERAL ? "" : "Tip: “Tag” a commit or file to attach it to your next messages.")); return }
+      tray.append(el("span", { class: "muted small" }, `Attached (${items.length}/${MAX_TAGS}):`))
+      for (const t of items) {
+        const x = el("button", { class: "chip-x", "aria-label": `Remove ${t.label}`, onclick: () => { saveTags(trayKey, loadTags(trayKey).filter(y => !(y.type === t.type && y.id === t.id))); refreshTray() } }, "×")
+        tray.append(el("span", { class: "chip" }, `${t.type === "commit" ? "◆" : "▤"} ${t.label}`, x))
+      }
+    }
+    refreshTray()
+    sendBtn.onclick = async () => {
+      const text = msgIn.value.trim()
+      if (!text || sendBtn.disabled) return
+      const attachments = loadTags(trayKey)
+      msgIn.value = ""; sendBtn.disabled = true; sendBtn.textContent = "Sending…"
+      box.querySelector("p.muted")?.remove()
+      addMsg({ role: "user", content: text, attachments })
+      const replyBox = el("div", { class: "msg bot" }, loading("Thinking…"))
+      box.append(replyBox); box.scrollTop = box.scrollHeight
+      try {
+        const res = await api(apiUrl(`/api/repo/${repoId}/chat`), { method: "POST", body: JSON.stringify({ message: text, session: sessionId, attachments }) })
+        if (res.ok) { setReply(replyBox, res.reply); if (res.edits?.length) replyBox.append(editCard(repoId, sessionId, res.index, { edits: res.edits })) }
+        else { replyBox.textContent = `Error: ${res.error}`; replyBox.classList.add("err") }
+      } catch (e) { replyBox.textContent = `Error: ${e.message}`; replyBox.classList.add("err") }
+      sendBtn.disabled = false; sendBtn.textContent = "Send"; box.scrollTop = box.scrollHeight
+      opts.onChange?.()
+    }
+    msgIn.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendBtn.click() } })
+    root.replaceChildren(head, about, box, el("div", { class: "composer" }, tray, msgIn, el("div", { class: "row" }, el("div", { class: "spacer" }), sendBtn)))
     box.scrollTop = box.scrollHeight
-    try {
-      const res = await api(apiUrl(`/api/repo/${repoId}/chat`), { method: "POST", body: JSON.stringify({ message: text, session: hist.session, attachments }) })
-      if (res.ok) { setReply(replyBox, res.reply); if (res.edits?.length) replyBox.append(editCard(repoId, hist.session, res.index, { edits: res.edits })) }
-      else { replyBox.textContent = `Error: ${res.error}`; replyBox.classList.add("err") }
-    } catch (e) { replyBox.textContent = `Error: ${e.message}`; replyBox.classList.add("err") }
-    sendBtn.disabled = false
-    sendBtn.textContent = "Send"
-    box.scrollTop = box.scrollHeight
   }
-  msgIn.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendBtn.click() }
-  })
-  ;(hist.messages || []).forEach((m, i) => addMsg(m, i))
-  if (!(hist.messages || []).length) box.append(el("p", { class: "muted" }, "New conversation. The assistant still knows this repo and what it remembers about it."))
-  wrap.append(box, tray, msgIn, sendBtn)
-  box.scrollTop = box.scrollHeight
+  load()
+  return root
+}
+
+// Pick what a chat is about: a commit, a pull request, or an approval request (merge/push).
+async function aboutDialog(repoId, current, save) {
+  const [reqs, repos] = await Promise.all([api(apiUrl("/api/requests")), api(apiUrl("/api/repos"))])
+  const repoSel = el("select", { "aria-label": "Repository" }, ...repos.map(r => el("option", { value: r.id }, r.name || r.id)))
+  if (repoId !== GENERAL) repoSel.value = repoId
+  const commitSel = el("select", { "aria-label": "Commit", style: "flex:1;min-width:0" })
+  const loadCommits = async () => {
+    commitSel.replaceChildren(el("option", { value: "" }, "Loading…"))
+    const res = await api(apiUrl(`/api/repo/${repoSel.value}/commits?view=all&limit=40`)).catch(() => ({ items: [] }))
+    commitSel.replaceChildren(el("option", { value: "" }, "Pick a commit…"), ...(res.items || []).map(c => el("option", { value: c.full || c.sha, "data-label": `${c.sha} ${c.subject}`.slice(0, 80) }, `${c.sha} ${c.subject}`)))
+  }
+  repoSel.onchange = loadCommits
+  if (repos.length) loadCommits()
+  const shaIn = el("input", { placeholder: "or a commit id", "aria-label": "Commit id", style: "width:160px" })
+  const reqSel = el("select", { "aria-label": "Request", style: "flex:1;min-width:0" }, el("option", { value: "" }, "Pick a request…"),
+    ...reqs.filter(r => repoId === GENERAL || r.repo_id === repoId).slice().reverse().map(r => el("option", { value: r.id, "data-type": r.type === "push" ? "push" : "request" },
+      `${r.repo_name || r.repo_id}: ${requestLine(r).slice(0, 70)} (${r.status})`)))
+  const prUrl = el("input", { placeholder: "https://github.com/owner/repo/pull/123", "aria-label": "Pull request URL", style: "flex:2;min-width:0" })
+  const prTitle = el("input", { placeholder: "title (optional)", "aria-label": "Pull request title", style: "flex:1;min-width:0" })
+  const add = el("button", { class: "btn" }, "Add")
+  let close
+  add.onclick = async () => {
+    const next = [...current]
+    const repo = repoId === GENERAL || repoSel.value !== repoId ? repoSel.value : undefined
+    const sha = shaIn.value.trim() || commitSel.value
+    if (sha) next.push({ type: "commit", id: sha, label: shaIn.value.trim() ? sha.slice(0, 10) : commitSel.selectedOptions[0].dataset.label, repo })
+    if (reqSel.value) next.push({ type: reqSel.selectedOptions[0].dataset.type, id: reqSel.value, label: reqSel.selectedOptions[0].textContent.slice(0, 60) })
+    const url = prUrl.value.trim()
+    if (url) {
+      const m = url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/)
+      next.push({ type: "pr", id: m ? `${m[1]}#${m[2]}` : url, label: prTitle.value.trim() || (m ? `#${m[2]} ${m[1]}` : url), url })
+    }
+    if (next.length === current.length) return toast("Pick a commit, a request or a PR", "error")
+    await busy(add, "Saving…", async () => { await save(next); close() })
+  }
+  close = openDialog("What is this chat about?",
+    el("p", { class: "muted" }, "These are sent to the model with every message of this chat: a commit's message and patch, a request's details and outcome, a pull request's link."),
+    el("h4", {}, "A commit"), el("div", { class: "row" }, repos.length > 1 || repoId === GENERAL ? repoSel : null, commitSel, shaIn),
+    el("h4", {}, "An approval request (merge or push)"), el("div", { class: "row" }, reqSel),
+    el("h4", {}, "A pull request"), el("div", { class: "row" }, prUrl, prTitle),
+    el("div", { class: "row", style: "margin-top:14px" }, add))
 }
 
 // Edits the model proposed in a reply: each shows its diff (or why it doesn't
@@ -699,13 +993,16 @@ async function renderActions(wrap, repoId, refresh = false) {
 }
 
 // Right-hand tools: commits, files, memory, publish, actions.
-function renderTools(wrap, repoId) {
-  const names = ["Commits", "Files", "Memory", "Publish", "Actions"]
+function renderTools(wrap, repoId, { extra } = {}) {
+  const names = ["Chat", "Commits", "Files", "Merges", "Memory", "Publish", "Actions"]
   const bar = el("div", { class: "tabs", role: "tablist", "aria-label": "Repo tools" })
-  const panes = {}
-  const tabs = {}
-  const built = {}
-  const builders = { Commits: renderCommits, Files: renderFiles, Memory: renderMemory, Publish: renderPublish, Actions: renderActions }
+  const panes = {}, tabs = {}, built = {}
+  let filesScope = null  // a merge workspace name, or null for the repo itself
+  const builders = {
+    Chat: async () => {}, Commits: renderCommits, Merges: renderMerges, Memory: renderMemory, Publish: renderPublish, Actions: renderActions,
+    Files: (pane, id) => renderFiles(pane, id, { ws: filesScope, onScope: (ws) => { filesScope = ws } }),
+  }
+  const flush = new Set(["Files", "Chat"])
   const show = async (n, focus = false) => {
     for (const k of names) {
       const on = k === n
@@ -715,18 +1012,18 @@ function renderTools(wrap, repoId) {
       tabs[k].tabIndex = on ? 0 : -1
     }
     if (focus) tabs[n].focus()
+    store_.set(`tab:${repoId}`, n)
     if (!built[n]) {
       built[n] = true
-      panes[n].replaceChildren(loading())
+      if (n !== "Chat") panes[n].replaceChildren(loading())
       try { await builders[n](panes[n], repoId) }
       catch (e) { built[n] = false; panes[n].replaceChildren(el("p", { class: "muted" }, `Could not load ${n.toLowerCase()}: ${e.message}`)) }
-    }
+    } else if (n === "Merges") renderMerges(panes[n], repoId).catch(() => {})
   }
   for (const n of names) {
     const id = `tab-${repoId}-${n}`
-    panes[n] = el("div", { role: "tabpanel", id: `${id}-panel`, "aria-labelledby": id, hidden: "" })
-    tabs[n] = el("button", { class: "tab", role: "tab", id, "aria-controls": `${id}-panel`, onclick: () => show(n) }, n)
-    // Arrow keys move between tabs (WAI-ARIA tabs pattern).
+    panes[n] = el("div", { role: "tabpanel", id: `${id}-panel`, "aria-labelledby": id, hidden: "", class: `tabpanel${flush.has(n) ? " flush" : ""}` })
+    tabs[n] = el("button", { class: `tab${n === "Chat" ? " chat-tab" : ""}`, role: "tab", id, "aria-controls": `${id}-panel`, onclick: () => show(n) }, n)
     tabs[n].addEventListener("keydown", (e) => {
       const i = names.indexOf(n)
       const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: names.length - 1 }[e.key]
@@ -736,8 +1033,22 @@ function renderTools(wrap, repoId) {
     })
     bar.append(tabs[n])
   }
+  if (extra) bar.append(el("div", { class: "spacer" }), extra)
   wrap.append(bar, ...names.map(n => panes[n]))
-  return show("Commits")
+  // Workspaces in progress show as a count on the Merges tab.
+  api(apiUrl(`/api/repo/${repoId}/workspaces`)).then(r => {
+    const open = (r.items || []).filter(w => !w.ready).length
+    if (open) tabs.Merges.append(el("span", { class: "count" }, String(open)))
+  }).catch(() => {})
+  const narrow = matchMedia("(max-width: 900px)").matches
+  let first = store_.get(`tab:${repoId}`, narrow ? "Chat" : "Commits")
+  if (first === "Chat" && !narrow) first = "Commits"
+  show(names.includes(first) ? first : "Commits")
+  return {
+    show,
+    chatPanel: panes.Chat,
+    openFiles: (ws) => { filesScope = ws; built.Files = false; show("Files") },
+  }
 }
 
 // Commits: what the upstream has that you lack, what only you have, or everything.
@@ -915,94 +1226,284 @@ async function showPullReport(repoId, { upstream, component }) {
 }
 
 // Files: a read-only tree plus a line-numbered viewer with find.
-async function renderFiles(wrap, repoId) {
-  const tree = el("div", { class: "tree", role: "tree", "aria-label": "Repository files" }, loading())
-  const viewer = el("div", { class: "viewer" }, el("p", { class: "muted", style: "padding:12px" }, "Pick a file."))
-  wrap.innerHTML = ""
-  wrap.append(el("div", { class: "files" }, tree, viewer))
-  const LH = 18
-  const openFile = async (path) => {
-    viewer.replaceChildren(loading(`Opening ${path}…`))
-    const f = await api(apiUrl(`/api/repo/${repoId}/file?path=${encodeURIComponent(path)}`)).catch((e) => ({ ok: false, error: e.status === 404 ? "file not found" : e.message }))
-    viewer.innerHTML = ""
-    const tag = el("button", { class: "btn ghost" }, "Tag for chat")
-    tag.onclick = () => addTag(repoId, { type: "file", id: path, label: path.split("/").slice(-2).join("/") })
-    const copy = el("button", { class: "btn ghost" }, "Copy path")
-    copy.onclick = () => { navigator.clipboard?.writeText(path); toast("Path copied", "ok") }
-    const findIn = el("input", { placeholder: "Find…", "aria-label": "Find in file (Enter for next)", style: "width:110px" })
-    const head = el("div", { class: "viewer-head" }, el("strong", { style: "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis" }, path), findIn, tag, copy)
-    viewer.append(head)
-    if (!f.ok) { viewer.append(el("p", { class: "muted", style: "padding:12px" }, f.error || "cannot show this file")); return }
-    const lines = f.content.split("\n")
-    const gutter = el("pre", { class: "gutter" }, lines.map((_, i) => i + 1).join("\n"))
-    const src = el("pre", { class: "src" }, f.content)
-    const hl = el("div", { class: "hl", style: "display:none" })
-    const body = el("div", { class: "code-body", tabindex: "0", "aria-label": `Contents of ${path}` }, el("div", { class: "code-inner" }, gutter, src, hl))
-    viewer.append(body, el("div", { class: "muted", style: "padding:4px 8px;font-size:12px" }, `${lines.length} lines`))
-    let last = -1
-    const find = () => {
-      const q = findIn.value.toLowerCase()
-      if (!q) return
-      let i = lines.findIndex((l, n) => n > last && l.toLowerCase().includes(q))
-      if (i < 0) i = lines.findIndex(l => l.toLowerCase().includes(q))
-      if (i < 0) { toast("Not found", "info"); return }
-      last = i
-      hl.style.display = ""; hl.style.top = `${i * LH + 8}px`
-      body.scrollTop = Math.max(0, i * LH - 80)
-    }
-    findIn.addEventListener("keydown", (e) => { if (e.key === "Enter") find() })
+// Files: a small VS Code-like editor. Explorer (tree with change marks and a
+// right-click menu), tabs, CodeMirror with syntax colours, Ctrl+S to save. It can
+// edit the repo itself or a merge workspace (to resolve conflicts by hand).
+let cmReady = null
+function loadCodeMirror() {
+  if (window.CodeMirror) return Promise.resolve()
+  return cmReady ||= new Promise((ok, fail) => {
+    const s = el("script", { src: `${BASE}/static/vendor/codemirror/codemirror.js` })
+    s.onload = ok; s.onerror = () => { cmReady = null; fail(new Error("could not load the editor")) }
+    document.head.append(s)
+  })
+}
+const MODES = {
+  js: "javascript", mjs: "javascript", cjs: "javascript", jsx: "jsx", ts: "text/typescript", tsx: "text/typescript-jsx",
+  json: "application/json", py: "python", css: "css", scss: "text/x-scss", less: "text/x-less", html: "htmlmixed", htm: "htmlmixed",
+  vue: "htmlmixed", xml: "xml", svg: "xml", md: "gfm", markdown: "gfm", yml: "yaml", yaml: "yaml", sh: "shell", bash: "shell",
+  zsh: "shell", toml: "toml", go: "go", rs: "rust", c: "text/x-csrc", h: "text/x-csrc", cpp: "text/x-c++src", hpp: "text/x-c++src",
+  cc: "text/x-c++src", java: "text/x-java", kt: "text/x-kotlin", cs: "text/x-csharp", sql: "sql", ini: "properties",
+  cfg: "properties", conf: "nginx", env: "properties", properties: "properties", diff: "diff", patch: "diff",
+}
+const modeFor = (path) => {
+  const base = path.split("/").pop().toLowerCase()
+  if (base === "dockerfile" || base.startsWith("dockerfile.")) return "dockerfile"
+  if (base === "makefile") return "shell"
+  if (base.startsWith(".env")) return "properties"
+  return MODES[base.includes(".") ? base.split(".").pop() : ""] || null
+}
+const modeName = (m) => !m ? "Plain text" : ({ gfm: "Markdown", htmlmixed: "HTML", "text/typescript": "TypeScript", "text/typescript-jsx": "TSX", "application/json": "JSON" }[m] || m.replace(/^text\/x-/, "").replace(/^\w/, c => c.toUpperCase()))
+
+async function renderFiles(wrap, repoId, { ws = null, onScope } = {}) {
+  wrap.replaceChildren(loading("Loading the editor…"))
+  try { await loadCodeMirror() } catch (e) { wrap.replaceChildren(el("p", { class: "muted", style: "padding:10px" }, e.message)); return }
+  const q = (extra = {}) => new URLSearchParams({ ...(ws ? { ws } : {}), ...extra }).toString()
+  const post = (path, body) => api(apiUrl(`/api/repo/${repoId}${path}`), { method: "POST", body: JSON.stringify({ ...(ws ? { ws } : {}), ...body }) })
+
+  const side = el("div", { class: "ide-side" })
+  const tree = el("div", { class: "tree", role: "tree", "aria-label": "Files", tabindex: "-1" })
+  const main = el("div", { class: "ide-main" })
+  const tabBar = el("div", { class: "ide-tabs", role: "tablist", "aria-label": "Open files" })
+  const host = el("div", { class: "ide-editor" })
+  const status = el("div", { class: "ide-bar" })
+  main.append(tabBar, host, status)
+  wrap.replaceChildren(el("div", { class: "ide" }, side, main))
+
+  // scope: the repo, or one of its merge workspaces
+  const scopeRow = el("div", { class: "ide-scope" })
+  api(apiUrl(`/api/repo/${repoId}/workspaces`)).then(r => {
+    const items = (r.items || []).filter(w => !w.error)
+    if (!items.length && !ws) return
+    const sel = el("select", { "aria-label": "Edit in" }, el("option", { value: "" }, "This repo's working tree"),
+      ...items.map(w => el("option", { value: w.name }, `Workspace: ${w.branch.replace("upkeep/", "")}${w.ready ? "" : " (in progress)"}`)))
+    sel.value = ws || ""
+    sel.onchange = () => { if (!confirmLeave()) { sel.value = ws || ""; return } onScope?.(sel.value || null); renderFiles(wrap, repoId, { ws: sel.value || null, onScope }) }
+    scopeRow.append(el("span", { class: "muted" }, "Edit in"), sel)
+  }).catch(() => {})
+
+  const docs = new Map()  // path -> {doc, mtime, clean (generation), tab}
+  let current = null, cm = null, changes = {}
+  const dirty = (d) => !d.doc.isClean(d.clean)
+  const confirmLeave = () => ![...docs.values()].some(dirty) || confirm("You have unsaved changes. Discard them?")
+
+  // ---- explorer
+  const btn = (label, title, fn) => el("button", { title, "aria-label": title, onclick: fn }, label)
+  const selectedDir = () => {
+    const row = tree.querySelector(".trow.sel")
+    if (!row) return ""
+    return row.dataset.type === "dir" ? row.dataset.path : row.dataset.path.split("/").slice(0, -1).join("/")
   }
-  // Keyboard: Up/Down move, Right opens a folder, Left closes it, Enter/Space activates.
-  const rows = () => $$(".trow", tree).filter(r => r.offsetParent !== null)
-  const focusRow = (r) => { if (!r) return; $$(".trow", tree).forEach(x => x.tabIndex = -1); r.tabIndex = 0; r.focus() }
+  const ask = (title, value = "") => { const v = prompt(title, value); return v === null ? null : v.trim().replace(/^\/+/, "") }
+  const newEntry = async (dir, isDir) => {
+    const name = ask(isDir ? `New folder in /${dir}` : `New file in /${dir}`, "")
+    if (!name) return
+    const path = (dir ? `${dir}/` : "") + name
+    try { await post("/files/new", { path, dir: isDir }); await reload(); await reveal(path); if (!isDir) openFile(path) }
+    catch (e) { toast(e, "error") }
+  }
+  const rename = async (path) => {
+    const to = ask(`Rename or move ${path} to:`, path)
+    if (!to || to === path) return
+    try {
+      await post("/files/rename", { path, to })
+      for (const [p, d] of [...docs]) if (p === path || p.startsWith(path + "/")) { closeTab(p, true) }
+      await reload(); await reveal(to); toast(`Renamed to ${to}`, "ok")
+    } catch (e) { toast(e, "error") }
+  }
+  const remove = async (path, isDir) => {
+    if (!confirm(`Delete ${path}${isDir ? " and everything in it" : ""}? Committed files can be restored with git.`)) return
+    try {
+      await post("/files/delete", { path })
+      for (const p of [...docs.keys()]) if (p === path || p.startsWith(path + "/")) closeTab(p, true)
+      await reload()
+    } catch (e) { toast(e, "error") }
+  }
+  side.append(el("div", { class: "ide-side-head" }, el("span", {}, ws ? "Workspace" : "Explorer"), el("span", { class: "spacer" }),
+    btn("＋", "New file", () => newEntry(selectedDir(), false)),
+    btn("▣", "New folder", () => newEntry(selectedDir(), true)),
+    btn("↻", "Refresh", () => reload()),
+    btn("⊟", "Collapse folders", () => { tree.querySelectorAll("[aria-expanded='true']").forEach(r => r.click()) })),
+    scopeRow, tree)
+
+  let ctx = null
+  const closeCtx = () => { ctx?.remove(); ctx = null }
+  document.addEventListener("click", closeCtx)
+  const showCtx = (ev, row) => {
+    ev.preventDefault(); closeCtx()
+    const path = row?.dataset.path || "", isDir = !row || row.dataset.type === "dir"
+    const items = [
+      isDir ? ["New file", () => newEntry(path, false)] : null,
+      isDir ? ["New folder", () => newEntry(path, true)] : null,
+      row ? ["Rename… (F2)", () => rename(path)] : null,
+      row ? ["Copy path", () => { navigator.clipboard?.writeText(path); toast("Path copied", "ok") }] : null,
+      row && !isDir && !ws ? ["Tag for chat", () => addTag(repoId, { type: "file", id: path, label: path.split("/").slice(-2).join("/") })] : null,
+      row ? ["Delete (Del)", () => remove(path, isDir), true] : null,
+    ].filter(Boolean)
+    ctx = el("div", { class: "menu-list", style: `position:fixed;left:${ev.clientX}px;top:${ev.clientY}px` },
+      ...items.map(([label, fn, danger]) => el("button", { class: danger ? "danger" : "", onclick: (e) => { e.stopPropagation(); closeCtx(); fn() } }, label)))
+    document.body.append(ctx)
+  }
+  tree.addEventListener("contextmenu", (ev) => showCtx(ev, ev.target.closest(".trow")))
+
+  const rows = () => [...tree.querySelectorAll(".trow")].filter(r => r.offsetParent !== null)
+  const focusRow = (r) => { if (!r) return; tree.querySelectorAll(".trow").forEach(x => x.tabIndex = -1); r.tabIndex = 0; r.focus() }
   tree.addEventListener("keydown", (ev) => {
     const row = ev.target.closest(".trow")
     if (!row) return
-    const all = rows()
-    const i = all.indexOf(row)
-    const isDir = row.hasAttribute("aria-expanded")
-    const open = row.getAttribute("aria-expanded") === "true"
+    const all = rows(), i = all.indexOf(row)
+    const isDir = row.dataset.type === "dir", open = row.getAttribute("aria-expanded") === "true"
     if (ev.key === "ArrowDown") focusRow(all[i + 1])
     else if (ev.key === "ArrowUp") focusRow(all[i - 1])
-    else if (ev.key === "Home") focusRow(all[0])
-    else if (ev.key === "End") focusRow(all[all.length - 1])
     else if (ev.key === "ArrowRight" && isDir && !open) row.click()
     else if (ev.key === "ArrowLeft" && isDir && open) row.click()
     else if (ev.key === "Enter" || ev.key === " ") row.click()
+    else if (ev.key === "F2") rename(row.dataset.path)
+    else if (ev.key === "Delete") remove(row.dataset.path, isDir)
     else return
     ev.preventDefault()
   })
+  const markFor = (path, isDir) => {
+    if (!isDir) return changes[path]
+    const pre = path + "/"
+    return Object.keys(changes).some(p => p.startsWith(pre)) ? "•" : null
+  }
   const loadDir = async (path, container, depth) => {
     let res
-    try { res = await api(apiUrl(`/api/repo/${repoId}/tree?path=${encodeURIComponent(path)}`)) }
+    try { res = await api(apiUrl(`/api/repo/${repoId}/tree?${q({ path })}`)) }
     catch (e) { container.replaceChildren(el("div", { class: "muted", style: "padding:6px 8px" }, e.message)); return }
     container.innerHTML = ""
     for (const e of res.entries || []) {
-      const row = el("div", { class: "trow", role: "treeitem", tabindex: "-1", "aria-level": String(depth + 1), style: `padding-left:${8 + depth * 14}px` }, e.type === "dir" ? "▸ " : "· ", e.name)
+      const isDir = e.type === "dir"
+      const mark = markFor(e.path, isDir)
+      const row = el("div", { class: `trow${mark && !isDir ? ` ch-${mark === "?" ? "q" : mark}` : ""}${mark && isDir ? " has-ch" : ""}`, role: "treeitem", tabindex: "-1",
+        "aria-level": String(depth + 1), "data-path": e.path, "data-type": e.type, style: `padding-left:${8 + depth * 14}px`, title: e.path },
+        el("span", { "aria-hidden": "true", style: "width:12px;color:var(--muted)" }, isDir ? "▸" : ""),
+        el("span", { "aria-hidden": "true" }, isDir ? "📁" : "📄"),
+        el("span", { class: "nm" }, e.name),
+        mark ? el("span", { class: "st", title: { M: "modified", A: "added", D: "deleted", R: "renamed", U: "conflicted", "?": "untracked" }[mark] || "changed" }, mark === "?" ? "U" : mark) : null)
       container.append(row)
-      if (e.type === "dir") {
+      if (isDir) {
         const kids = el("div", { role: "group", hidden: "" })
         row.setAttribute("aria-expanded", "false")
         container.append(kids)
         row.onclick = async () => {
           const open = row.getAttribute("aria-expanded") !== "true"
           row.setAttribute("aria-expanded", String(open))
-          row.firstChild.textContent = open ? "▾ " : "▸ "
+          row.firstChild.textContent = open ? "▾" : "▸"
           kids.hidden = !open
+          tree.querySelectorAll(".trow.sel").forEach(r => r.classList.remove("sel")); row.classList.add("sel")
           if (open && !kids.children.length) { kids.replaceChildren(loading()); await loadDir(e.path, kids, depth + 1) }
         }
       } else {
-        row.onclick = () => {
-          $$(".trow.sel", tree).forEach(r => { r.classList.remove("sel"); r.removeAttribute("aria-selected") })
-          row.classList.add("sel"); row.setAttribute("aria-selected", "true")
-          openFile(e.path)
-        }
+        row.onclick = () => { tree.querySelectorAll(".trow.sel").forEach(r => r.classList.remove("sel")); row.classList.add("sel"); openFile(e.path) }
       }
     }
   }
-  await loadDir("", tree, 0)
-  const first = tree.querySelector(".trow")
-  if (first) first.tabIndex = 0
+  // Open the folders down to `path` and select it.
+  const reveal = async (path) => {
+    const parts = path.split("/")
+    for (let i = 1; i < parts.length; i++) {
+      const r = tree.querySelector(`.trow[data-path="${CSS.escape(parts.slice(0, i).join("/"))}"]`)
+      if (r && r.getAttribute("aria-expanded") !== "true") await r.onclick()
+    }
+    const row = tree.querySelector(`.trow[data-path="${CSS.escape(path)}"]`)
+    if (row) { tree.querySelectorAll(".trow.sel").forEach(x => x.classList.remove("sel")); row.classList.add("sel"); row.scrollIntoView({ block: "nearest" }) }
+  }
+  const reload = async () => {
+    const open = [...tree.querySelectorAll("[aria-expanded='true']")].map(r => r.dataset.path)
+    try { changes = Object.fromEntries((await api(apiUrl(`/api/repo/${repoId}/changes?${q()}`))).items.map(i => [i.path, i.status])) } catch { changes = {} }
+    await loadDir("", tree, 0)
+    for (const p of open) { const r = tree.querySelector(`.trow[data-path="${CSS.escape(p)}"]`); if (r && r.getAttribute("aria-expanded") !== "true") await r.onclick() }
+    tree.querySelector(".trow")?.setAttribute("tabindex", "0")
+  }
+
+  // ---- editor
+  const showStatus = () => {
+    status.innerHTML = ""
+    if (!current) return
+    const d = docs.get(current)
+    const pos = d.doc.getCursor()
+    const save = el("button", { class: "btn small", disabled: dirty(d) ? null : "" }, "Save")
+    save.onclick = () => saveFile(current)
+    status.append(el("span", { class: "mono", style: "color:var(--soft)" }, (ws ? `[workspace] ` : "") + current),
+      el("span", {}, `Ln ${pos.line + 1}, Col ${pos.ch + 1}`), el("span", {}, modeName(d.mode)),
+      el("span", { style: `color:${dirty(d) ? "var(--warn)" : "var(--good)"}` }, dirty(d) ? "● unsaved" : "saved"),
+      el("span", { class: "spacer" }),
+      !ws ? el("button", { class: "btn ghost small", onclick: () => addTag(repoId, { type: "file", id: current, label: current.split("/").slice(-2).join("/") }) }, "Tag for chat") : null,
+      save)
+  }
+  const drawTabs = () => {
+    tabBar.innerHTML = ""
+    for (const [path, d] of docs) {
+      const x = el("span", { class: "x", role: "button", "aria-label": `Close ${path}`, title: "Close", onclick: (e) => { e.stopPropagation(); closeTab(path) } })
+      d.tab = el("button", { class: `ide-tab${path === current ? " on" : ""}${dirty(d) ? " dirty" : ""}`, role: "tab", "aria-selected": String(path === current), title: path, onclick: () => activate(path) },
+        path.split("/").pop(), x)
+      tabBar.append(d.tab)
+    }
+  }
+  const activate = (path) => {
+    current = path
+    const d = docs.get(path)
+    if (!cm) {
+      host.innerHTML = ""
+      cm = CodeMirror(host, {
+        lineNumbers: true, theme: "material-darker", keyMap: "sublime", indentUnit: 4, tabSize: 4, matchBrackets: true,
+        autoCloseBrackets: true, styleActiveLine: true, lineWrapping: false,
+        extraKeys: { "Ctrl-S": () => saveFile(current), "Cmd-S": () => saveFile(current), "Ctrl-/": "toggleComment", "Cmd-/": "toggleComment", "Alt-F": "findPersistent" },
+      })
+      cm.on("cursorActivity", showStatus)
+    }
+    cm.swapDoc(d.doc)
+    cm.setOption("indentWithTabs", /\n\t/.test(d.doc.getValue().slice(0, 5000)))
+    drawTabs(); showStatus(); setTimeout(() => { cm.refresh(); cm.focus() }, 0)
+  }
+  const openFile = async (path) => {
+    if (docs.has(path)) return activate(path)
+    const f = await api(apiUrl(`/api/repo/${repoId}/file?${q({ path })}`)).catch((e) => ({ ok: false, error: e.status === 404 ? "file not found" : e.message }))
+    if (!f.ok) { toast(`${path}: ${f.error || "can't open this file"}`, "error"); return }
+    const mode = modeFor(path)
+    const doc = CodeMirror.Doc(f.content, mode)
+    const d = { doc, mode, mtime: f.mtime, clean: doc.changeGeneration() }
+    doc.on("change", () => { d.tab?.classList.toggle("dirty", dirty(d)); if (path === current) showStatus() })
+    docs.set(path, d)
+    activate(path)
+    if (/^(<{7}|>{7}) /m.test(f.content)) {
+      const line = f.content.split("\n").findIndex(l => l.startsWith("<<<<<<< "))
+      cm.setCursor({ line, ch: 0 }); cm.scrollIntoView(null, 120)
+      toast("This file has conflict markers: keep what you want, delete the <<<<<<< ======= >>>>>>> lines, then save.", "info")
+    }
+  }
+  const saveFile = async (path, force = false) => {
+    const d = docs.get(path)
+    if (!d) return
+    try {
+      const r = await post("/file", { path, content: d.doc.getValue(), mtime: d.mtime, force })
+      d.mtime = r.mtime; d.clean = d.doc.changeGeneration()
+      drawTabs(); showStatus(); toast(`Saved ${path.split("/").pop()}`, "ok")
+      reload()
+    } catch (e) {
+      if (e.status === 409 && e.data?.changed) {
+        if (confirm(`${path} changed on disk since you opened it (maybe git or an agent changed it). Overwrite it with your version?`)) return saveFile(path, true)
+      } else toast(e, "error")
+    }
+  }
+  const closeTab = (path, discard = false) => {
+    const d = docs.get(path)
+    if (!d) return
+    if (!discard && dirty(d) && !confirm(`${path} has unsaved changes. Close it anyway?`)) return
+    docs.delete(path)
+    if (current === path) {
+      const next = [...docs.keys()].pop()
+      if (next) activate(next)
+      else { current = null; cm = null; host.replaceChildren(empty()); drawTabs(); showStatus() }
+    } else drawTabs()
+  }
+  const empty = () => el("div", { class: "ide-empty" },
+    el("p", {}, ws ? "Editing the merge workspace. Conflicted files are marked U in red." : "Open a file from the explorer."),
+    el("p", { class: "small" }, "Ctrl+S save · Ctrl+F find · Ctrl+H replace · Ctrl+/ comment · Ctrl+D add next match · right-click in the explorer for more."))
+  host.append(empty())
+  await reload()
 }
 
 // Memory: what the assistant remembers about this repo (a local SQLite file:
@@ -1103,7 +1604,7 @@ async function renderMemory(wrap, repoId) {
 async function renderRequests() {
   const content = $("#content")
   content.innerHTML = ""
-  content.append(el("h2", {}, "Approval Requests"))
+  content.append(el("h1", { class: "page", style: "margin-bottom:12px" }, "Approval requests"))
   const wrap = el("div", {}, loading())
   content.append(wrap)
   try {
@@ -1195,7 +1696,7 @@ async function renderRequests() {
 async function renderSettings() {
   const content = $("#content")
   content.innerHTML = ""
-  content.append(el("h2", {}, "LLM Settings"))
+  content.append(el("h1", { class: "page", style: "margin-bottom:12px" }, "Settings"))
   const card = el("div", { class: "repo-card", style: "margin-top:16px" }, loading())
   content.append(card)
   try {
@@ -1337,27 +1838,134 @@ async function agentSetup() {
   return box
 }
 
+// Chats: every conversation, of every repo and the general ones, in one place.
+async function renderChats() {
+  const content = $("#content")
+  content.replaceChildren(loading())
+  const params = new URLSearchParams(location.search)
+  let [chats, repos] = await Promise.all([api(apiUrl("/api/chats")), api(apiUrl("/api/repos"))])
+  let pick = { repo: params.get("repo") || chats[0]?.repo_id || GENERAL, session: params.get("session") || chats[0]?.id || null }
+  content.innerHTML = ""
+  const filterSel = el("select", { "aria-label": "Show chats of" }, el("option", { value: "" }, "All chats"), el("option", { value: GENERAL }, "General (no repo)"),
+    ...repos.map(r => el("option", { value: r.id }, r.name || r.id)))
+  const findIn = el("input", { placeholder: "Find a chat…", "aria-label": "Find a chat", style: "flex:1;min-width:0" })
+  const listBox = el("div", { style: "flex:1;overflow:auto" })
+  const newRepo = el("select", { "aria-label": "New chat in", style: "flex:1;min-width:0" }, el("option", { value: GENERAL }, "General (no repo)"), ...repos.map(r => el("option", { value: r.id }, r.name || r.id)))
+  const newBtn = el("button", { class: "btn small" }, "New chat")
+  newBtn.onclick = () => busy(newBtn, null, async () => {
+    const res = await api(apiUrl(`/api/repo/${newRepo.value}/sessions`), { method: "POST", body: "{}" })
+    pick = { repo: newRepo.value, session: res.session }; openChat()
+  })
+  const side = el("aside", { class: "panel chat-list", "aria-label": "Chats" },
+    el("div", { class: "col", style: "gap:6px;padding:8px;border-bottom:1px solid var(--line)" },
+      el("div", { class: "row", style: "gap:6px" }, newRepo, newBtn), el("div", { class: "row", style: "gap:6px" }, filterSel, findIn)),
+    listBox)
+  const chatPane = el("section", { class: "pane chat", style: "flex:1 1 auto" })
+  const drawList = () => {
+    const f = filterSel.value, t = findIn.value.trim().toLowerCase()
+    listBox.innerHTML = ""
+    const shown = chats.filter(c => (!f || c.repo_id === f) && (!t || (c.title || "").toLowerCase().includes(t) || (c.tags || []).some(x => x.label.toLowerCase().includes(t))))
+    if (!shown.length) listBox.append(el("p", { class: "muted", style: "padding:10px" }, chats.length ? "No chats match." : "No chats yet. Start one above."))
+    for (const c of shown) {
+      listBox.append(el("button", { class: `chat-item${c.id === pick.session ? " on" : ""}`, onclick: () => { pick = { repo: c.repo_id, session: c.id }; openChat() } },
+        el("div", { class: "t" }, c.title || "New chat"),
+        el("div", { class: "row small", style: "gap:4px;margin-top:3px" },
+          badge(c.repo_id === GENERAL ? "info" : "", c.repo_id === GENERAL ? "General" : c.repo_name),
+          ...(c.tags || []).slice(0, 3).map(x => badge("info", `${{ commit: "◆", pr: "⇄", request: "✓", push: "↑" }[x.type] || ""} ${x.label.slice(0, 24)}`)),
+          el("span", { class: "muted" }, `${c.count} · ${ago(c.updated_at)}`))))
+    }
+  }
+  const openChat = () => {
+    history.replaceState({}, "", `${BASE}/chats?repo=${encodeURIComponent(pick.repo)}${pick.session ? `&session=${pick.session}` : ""}`)
+    const name = pick.repo === GENERAL ? "General" : (repos.find(r => r.id === pick.repo)?.name || pick.repo)
+    chatPane.replaceChildren(chatPanel(pick.repo, {
+      sessionId: pick.session, title: name,
+      onSession: (sid) => { pick.session = sid; drawList() },
+      onChange: async () => { chats = await api(apiUrl("/api/chats")); drawList() },
+    }))
+    drawList()
+  }
+  filterSel.onchange = drawList; findIn.oninput = drawList
+  content.append(el("div", { class: "chats-layout" }, side, chatPane))
+  openChat()
+}
+
+// Workflows: is each repo's CI passing? Latest run per workflow, with links to GitHub.
+async function renderWorkflows(refresh = false) {
+  const content = $("#content")
+  content.replaceChildren(el("div", { class: "row" }, el("h1", { class: "page" }, "Workflows")), loading("Asking GitHub…"))
+  const items = await api(apiUrl(`/api/workflows${refresh ? "?refresh=1" : ""}`))
+  const refreshBtn = el("button", { class: "btn ghost" }, "Refresh")
+  refreshBtn.onclick = () => renderWorkflows(true)
+  const anyToken = items.some(i => i.token)
+  content.replaceChildren(el("div", { class: "col", style: "gap:14px" },
+    el("div", { class: "row" }, el("h1", { class: "page" }, "Workflows"), el("div", { class: "spacer" }), refreshBtn),
+    anyToken ? null : el("div", { class: "card muted" }, "Public repos work without signing in, up to GitHub's 60 requests an hour. For private repos, and to disable workflows or set secrets, save a GitHub token in ",
+      el("a", { href: `${BASE}/settings` }, "Settings → Accounts"), ". No Unraid login or GitHub password is needed: a fine-grained token limited to your repos is enough.")))
+  const wrap = content.firstChild
+  const health = { passing: ["up", "passing"], failing: ["bad", "failing"], running: ["info", "running"], skipped: ["", "skipped"], "no runs": ["", "no runs"], disabled: ["", "disabled"] }
+  const dot = (c) => el("span", { title: c || "", style: `display:inline-block;width:8px;height:8px;border-radius:2px;background:${c === "success" ? "#3fb96f" : ["failure", "timed_out", "startup_failure"].includes(c) ? "#e5484d" : ["cancelled", "skipped", "neutral"].includes(c) ? "#5c6575" : "#d6a01e"}` })
+  if (!items.length) wrap.append(el("p", { class: "muted" }, "No repos yet."))
+  for (const r of items) {
+    const head = el("div", { class: "row" }, el("h2", {}, r.repo_name), el("div", { class: "spacer" }))
+    if (r.ok) {
+      const c = r.counts || {}
+      head.append(c.failing ? badge("bad", `${c.failing} failing`) : "", c.running ? badge("info", `${c.running} running`) : "",
+        badge(c.failing ? "" : "up", `${c.passing || 0} passing`), el("a", { href: r.url, target: "_blank", rel: "noopener", class: "small" }, "GitHub Actions ↗"),
+        el("a", { href: `${BASE}/repo/${r.repo_id}`, class: "small", onclick: (e) => { e.preventDefault(); e.stopPropagation(); store_.set(`tab:${r.repo_id}`, "Actions"); route(`/repo/${r.repo_id}`) } }, "Manage"))
+    }
+    const card = el("section", { class: "card" }, head)
+    if (!r.ok) card.append(el("div", { class: "muted", style: "margin-top:6px" }, r.error))
+    else if (!r.workflows.length) card.append(el("div", { class: "muted", style: "margin-top:6px" }, "No workflows."))
+    else {
+      const tbody = el("tbody")
+      for (const w of r.workflows) {
+        const [cls, label] = health[w.health] || ["", w.health]
+        const last = w.last
+        tbody.append(el("tr", {},
+          el("td", {}, el("div", { style: "font-weight:600" }, w.name), el("div", { class: "muted small mono" }, w.path)),
+          el("td", {}, badge(cls, label)),
+          el("td", {}, last ? [el("a", { href: last.url, target: "_blank", rel: "noopener" }, last.title || "run"),
+            el("div", { class: "muted small" }, `${last.event} on ${last.branch} · ${ago(last.at)}`)] : el("span", { class: "muted" }, "-")),
+          el("td", {}, el("div", { class: "row", style: "gap:3px" }, ...(w.recent || []).slice().reverse().map(dot)))))
+      }
+      card.append(el("div", { class: "table-box", style: "margin-top:10px" }, el("table", { class: "list" },
+        el("thead", {}, el("tr", {}, el("th", {}, "Workflow"), el("th", {}, "Status"), el("th", {}, "Latest run"), el("th", {}, "Last 10 (oldest → newest)"))), tbody)))
+    }
+    wrap.append(card)
+  }
+}
+
 function currentView() {
   // location.pathname already carries the BASE when served behind Studio
   // (e.g. /upstream/requests); strip it to get the view-relative path.
   let path = location.pathname
   if (BASE && path.startsWith(BASE)) path = path.slice(BASE.length)
-  if (!path) path = '/repos'
   const parts = path.split('/').filter(Boolean)
-  if (parts[0] === 'repo' && parts[1]) return ['repo', parts[1]]
-  if (parts[0] === 'requests') return ['requests']
-  if (parts[0] === 'settings') return ['settings']
+  if (parts[0] === 'repo' && parts[1]) return ['repo', decodeURIComponent(parts[1])]
+  if (['requests', 'settings', 'chats', 'workflows'].includes(parts[0])) return [parts[0]]
   return ['repos']
 }
 
 async function router() {
   const [view, id] = currentView()
-  // Static heading belongs to the repo list; the other views render their own.
-  $("#page-title").hidden = view !== "repos"
-  if (view === "repos") await renderRepos()
-  else if (view === "repo") await renderRepoPage(id)
-  else if (view === "requests") await renderRequests()
-  else if (view === "settings") await renderSettings()
+  tools = null
+  $("#main").classList.toggle("wide", view === "repo" || view === "chats")
+  for (const a of $$("nav.main a")) {
+    const on = a.dataset.view === (view === "repo" ? "repos" : view)
+    a.classList.toggle("on", on)
+    if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current")
+  }
+  document.title = { repos: "Repositories", repo: id, chats: "Chats", workflows: "Workflows", requests: "Requests", settings: "Settings" }[view] + " · Upstream Manager"
+  try {
+    if (view === "repos") await renderRepos()
+    else if (view === "repo") await renderRepoPage(id)
+    else if (view === "chats") await renderChats()
+    else if (view === "workflows") await renderWorkflows()
+    else if (view === "requests") await renderRequests()
+    else if (view === "settings") await renderSettings()
+  } catch (e) { $("#content").replaceChildren(el("p", { class: "muted" }, `Could not load this page: ${e.message}`)) }
+  refreshPendingCount()
 }
 
 // SPA nav: intercept in-page link clicks so the shell is not reloaded.
@@ -1380,3 +1988,4 @@ document.addEventListener('click', (e) => {
 window.addEventListener('popstate', router)
 // The script tag sits at the end of <body>, so the DOM is ready already.
 router()
+refreshModelStatus()
