@@ -93,3 +93,19 @@ def test_editor_reads_the_workspace(client, features):
     ch = client.get(f"/api/repo/mine/changes?ws={ws['name']}").get_json()["items"]
     assert {"path": "app.py", "status": "U"} in ch
     assert client.get("/api/repo/mine/file?path=app.py&ws=merge-nope").status_code == 404
+
+
+def test_untracked_files_do_not_block_approval_but_tracked_changes_do(client, features):
+    mine = features
+    Path(mine, "scratch.txt").write_text("notes\n")  # untracked: git won't let a merge lose it
+    ws = client.post("/api/repo/mine/workspaces", json={"branches": ["feat-a"]}).get_json()["workspace"]
+    req = client.post(f"/api/repo/mine/workspaces/{ws['name']}/submit", json={"summary": ""}).get_json()["request"]
+    Path(mine, "app.py").write_text("x = 99\n")  # a tracked change does block
+    out = client.post(f"/api/request/{req['id']}/decide", json={"decision": "approve"}).get_json()
+    assert not out["ok"] and "uncommitted" in out["request"]["result"][0]["detail"]
+    git(mine, "checkout", "--", "app.py")
+    ws = client.post("/api/repo/mine/workspaces", json={"branches": ["feat-a"]}).get_json()["workspace"]
+    req = client.post(f"/api/repo/mine/workspaces/{ws['name']}/submit", json={"summary": ""}).get_json()["request"]
+    out = client.post(f"/api/request/{req['id']}/decide", json={"decision": "approve"}).get_json()
+    assert out["ok"], out
+    assert Path(mine, "a_feature.py").exists() and Path(mine, "scratch.txt").read_text() == "notes\n"

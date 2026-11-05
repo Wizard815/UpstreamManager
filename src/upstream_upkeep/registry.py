@@ -303,7 +303,7 @@ def _summary(repo: dict) -> dict:
         "components": _component_summary(repo),
         "upstreams": [u["name"] for u in repo.get("upstreams", [])],
         "last_commit": commits[0] if commits else None,
-        "dirty": gitops.status_summary(repo["path"])["dirty"] if not error else 0,
+        **({"dirty": st["dirty"], "dirty_tracked": st["tracked"]} if (st := (gitops.status_summary(repo["path"]) if not error else None)) else {"dirty": 0, "dirty_tracked": 0}),
         "error": error,
     }
 

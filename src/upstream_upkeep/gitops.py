@@ -206,4 +206,6 @@ def status_summary(path: str) -> dict:
     """Branch, dirty file count and a few changed paths, for the chat context."""
     res = _run(["git", "status", "--porcelain"], cwd=path)
     lines = [l for l in res.stdout.splitlines() if l.strip()] if res.returncode == 0 else []
-    return {"branch": current_branch_name(path), "dirty": len(lines), "changed": [l[3:] for l in lines[:15]]}
+    tracked = [l for l in lines if not l.startswith("??")]
+    return {"branch": current_branch_name(path), "dirty": len(lines), "tracked": len(tracked),
+            "changed": [l[3:] for l in lines[:15]]}

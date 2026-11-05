@@ -57,6 +57,9 @@ def test_editor_save_detects_changes_on_disk(client, repos):
     _, mine = repos
     registry.add_repo(str(mine), None, "mine")
     f = client.get("/api/repo/mine/file?path=a.txt").get_json()
+    # Nanoseconds since 1970 don't fit a JavaScript number exactly: it must travel as text,
+    # or every save from the browser looks like a change on disk.
+    assert isinstance(f["mtime"], str) and int(f["mtime"]) > 2 ** 53
     ok = client.post("/api/repo/mine/file", json={"path": "a.txt", "content": "new\n", "mtime": f["mtime"]}).get_json()
     assert ok["ok"] and Path(mine, "a.txt").read_text() == "new\n"
     stale = client.post("/api/repo/mine/file", json={"path": "a.txt", "content": "older\n", "mtime": f["mtime"]})

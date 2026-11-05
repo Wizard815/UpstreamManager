@@ -12,6 +12,36 @@ uv run pytest                              # tests (node runs the Markdown rende
 The model connection is the app's own setting (LLM Settings page): any
 OpenAI-compatible server, such as llama-server, llama-swap or Argos.
 
+## Using it
+
+- **Repos**: what is behind, what waits for your approval, and what needs
+  attention (an upstream without the branch, a check that was skipped,
+  uncommitted changes blocking a merge), with every repo's status below.
+- **A repo's page**: its upstreams (fetch, pull report, resolve in a
+  workspace; more under ⋯), then the tools on the left and the chat on the
+  right. Drag the divider to give the chat more room, or ⤢ to make it fill
+  the page. On a phone the chat is a tab.
+- **Files** is a small editor: an explorer that marks changed files
+  (right-click for new, rename, delete), tabs, syntax colours, Ctrl+S to save,
+  Ctrl+F/Ctrl+H to find and replace, Ctrl+/ to comment, Ctrl+D for the next
+  match. It warns before overwriting a file that changed on disk, and can edit
+  a merge workspace to resolve conflicts by hand.
+- **Merges** (merge workspaces): bring an upstream, or several branches at
+  once, into the focus branch. **Merge branches…** takes e.g. three feature
+  branches in the order you pick; they merge one after another in a separate
+  checkout, each as it was when you started. A clean merge goes straight on;
+  a conflict stops there: fix it in Files (or let an agent), then
+  **Continue**. **Submit** raises one approval for the whole set. Your own
+  working tree is not touched until you approve.
+- **Chats**: every conversation, of every repo, plus chats about no repo
+  (the assistant gets an overview of all of them). A chat can be about a
+  commit, a pull request or a request (“About” above the messages); those
+  go to the model with every message.
+- **Workflows**: each repo's GitHub Actions: passing, failing, running or
+  skipped, the latest run with a link, and the last ten results. Public repos
+  need nothing; private ones need the GitHub token in Settings → Accounts
+  (no GitHub password or server login is involved).
+
 ## Coding agents (OpenCode, Codex, Claude Code, Hermes)
 
 Upstream Manager is also an MCP server, so a coding agent can work with what
@@ -35,6 +65,9 @@ The agent gets:
   request. Approving fast-forwards your focus branch to it and removes the
   workspace. Your own working tree is never touched, and submitting is refused
   while conflicts or conflict markers are left.
+- **Branch sets**: `list_branches`, then `open_branch_set` with several
+  branches; after resolving a conflict, `continue_merge_workspace` commits it
+  and merges the rest. One submit covers the whole set.
 - `fetch_upstreams`, `add_note` and `request_clean_pull`.
 
 It has no tool that approves, merges into your branch or pushes: those stay

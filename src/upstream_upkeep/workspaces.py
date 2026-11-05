@@ -79,6 +79,18 @@ def _resolve(repo: dict, source: str) -> dict:
     return {"label": label, "ref": ref, "sha": gitops.short_sha(repo["path"], ref)}
 
 
+def _checked_out_at(repo: dict, branch: str) -> str | None:
+    """The worktree that has `branch` checked out, if any."""
+    out = _git(repo["path"], "worktree", "list", "--porcelain").stdout
+    path = None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line == f"branch refs/heads/{branch}":
+            return path
+    return None
+
+
 def _meta_file(ws: Path) -> Path:
     gd = _git(ws, "rev-parse", "--absolute-git-dir").stdout.strip()
     return Path(gd) / "upkeep-set.json"
@@ -161,9 +173,15 @@ def open_workspace(repo: dict, upstream: str | None = None, branches: list[str] 
         digest = hashlib.sha1("|".join(s["label"] + s["sha"] for s in sources).encode()).hexdigest()[:10]
         name = f"merge-set-{digest}"
     ws, branch = _dir(repo, name), f"upkeep/{name}"
-    if ws.exists():
+    if ws.exists() and _belongs(repo, ws):
         return status(repo, name)
+    if ws.exists():
+        raise WorkspaceError(f"{ws} belongs to another repo with the same id; remove that folder first")
     ws.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo["path"], "worktree", "prune")  # forget worktrees whose folders were deleted
+    elsewhere = _checked_out_at(repo, branch)
+    if elsewhere:
+        raise WorkspaceError(f"this merge is already open in another workspace: {elsewhere}")
     if gitops.ref_exists(repo["path"], f"refs/heads/{branch}"):
         res = _git(repo["path"], "worktree", "add", str(ws), branch)
     else:
@@ -253,13 +271,20 @@ def status(repo: dict, name: str) -> dict:
             "head": gitops.short_sha(str(ws), "HEAD")}
 
 
+def _belongs(repo: dict, ws: Path) -> bool:
+    """Whether a workspace folder is a worktree of this repo (not of an earlier repo with the same id)."""
+    common = _git(ws, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    mine = _git(repo["path"], "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    return bool(common) and Path(common).resolve() == Path(mine).resolve()
+
+
 def list_workspaces(repo: dict) -> list[dict]:
     root = _root(repo)
     if not root.is_dir():
         return []
     out = []
     for d in sorted(root.iterdir()):
-        if _NAME.fullmatch(d.name):
+        if _NAME.fullmatch(d.name) and _belongs(repo, d):
             try:
                 out.append(status(repo, d.name))
             except Exception as e:  # a worktree deleted by hand
