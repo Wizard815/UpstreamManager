@@ -12,6 +12,34 @@ uv run pytest                              # tests (node runs the Markdown rende
 The model connection is the app's own setting (LLM Settings page): any
 OpenAI-compatible server, such as llama-server, llama-swap or Argos.
 
+## Coding agents (OpenCode, Codex, Claude Code, Hermes)
+
+Upstream Manager is also an MCP server, so a coding agent can work with what
+it knows. **Settings → Coding agents** gives the config to paste for each
+agent, filled in with this machine's paths; the server is
+`uv run --project <this folder> upstream-mcp` and talks to the running app
+(`UPSTREAM_APP_URL`, default `http://127.0.0.1:5000`), so keep the app running.
+
+The agent gets:
+
+- **`repo_briefing`**: branches, upstreams and what they would bring,
+  conflicts, your notes and preferences, recent day logs, open requests and
+  the rules below. `list_repos`, `list_commits`, `show_commit`, `pull_report`,
+  `search_memory`, `day_logs` and `list_requests` read the rest.
+- **`conflict_details`**: for each conflicting file, what your side and the
+  upstream side each changed since they split, and the commits that did it.
+- **Merge workspaces**: `open_merge_workspace` starts the merge in a separate
+  checkout on its own branch (`upkeep/merge-…`), conflicts left in the files.
+  The agent resolves them there with its own tools, runs the tests and
+  commits; `submit_merge_workspace` (with a summary) raises an approval
+  request. Approving fast-forwards your focus branch to it and removes the
+  workspace. Your own working tree is never touched, and submitting is refused
+  while conflicts or conflict markers are left.
+- `fetch_upstreams`, `add_note` and `request_clean_pull`.
+
+It has no tool that approves, merges into your branch or pushes: those stay
+with you on the Requests page.
+
 ## Memory and day logs
 
 Memory is one local SQLite file (`memory.db`, next to the state file); no

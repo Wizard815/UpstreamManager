@@ -33,8 +33,8 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, render_template_string, abort
 
-from . import (actions, components, config, credentials, daily_check, edits, github, gitops, memory, pull_report,
-               registry, store, upstream_check, workflows)
+from . import (actions, agent_context, components, config, credentials, daily_check, edits, github, gitops, memory,
+               pull_report, registry, store, upstream_check, workflows, workspaces)
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -499,6 +499,109 @@ def api_request_pull(repo_id, name):
     return jsonify({"ok": True, "request": store.snapshot(rec)})
 
 
+# ------------------------------------------------- coding agents (see mcp_server.py)
+@flask_app.route("/api/agent-setup")
+def api_agent_setup():
+    """What a coding agent's MCP config needs: the command that starts the server, and this app's URL."""
+    root = str(config.PROJECT_ROOT)
+    url = request.host_url.rstrip("/")  # the app itself, not a proxy prefix: the MCP server calls /api directly
+    return jsonify({"command": ["uv", "run", "--project", root, "upstream-mcp"], "app_url": url, "project": root})
+
+
+
+@flask_app.route("/api/repo/<repo_id>/briefing")
+def api_briefing(repo_id):
+    """The repo's situation as Markdown, for a coding agent."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    return jsonify({"ok": True, "text": agent_context.briefing(repo)})
+
+
+@flask_app.route("/api/repo/<repo_id>/conflicts")
+def api_conflicts(repo_id):
+    """For ?upstream=<remote>: each conflicting file with both sides' changes since the merge base."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    try:
+        return jsonify(agent_context.conflicts(repo, request.args.get("upstream", "")))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@flask_app.route("/api/repo/<repo_id>/workspaces")
+def api_workspaces(repo_id):
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    return jsonify({"ok": True, "items": workspaces.list_workspaces(repo)})
+
+
+@flask_app.route("/api/repo/<repo_id>/workspaces", methods=["POST"])
+def api_open_workspace(repo_id):
+    """Start merging {"upstream": name} in a worktree of its own; conflicts are left to resolve there."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    try:
+        with _run_lock:
+            ws = workspaces.open_workspace(repo, (request.get_json(silent=True) or {}).get("upstream", ""))
+    except workspaces.WorkspaceError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    return jsonify({"ok": True, "workspace": ws})
+
+
+@flask_app.route("/api/repo/<repo_id>/workspaces/<name>")
+def api_workspace(repo_id, name):
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    try:
+        return jsonify({"ok": True, "workspace": workspaces.status(repo, name)})
+    except workspaces.WorkspaceError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+
+@flask_app.route("/api/repo/<repo_id>/workspaces/<name>/submit", methods=["POST"])
+def api_submit_workspace(repo_id, name):
+    """Raise an approval request to bring a finished workspace branch into the focus branch."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    try:
+        ws = workspaces.status(repo, name)
+    except workspaces.WorkspaceError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+    if not ws["ready"]:
+        return jsonify({"ok": False, "error": f"not ready: {ws['next_step']}", "workspace": ws}), 409
+    summary = ((request.get_json(silent=True) or {}).get("summary") or "").strip()[:2000]
+    focus = ws["focus_branch"]
+    rec = store.record_request({
+        "id": f"{repo['id']}:{focus}:{name}", "repo_id": repo["id"], "repo_name": repo["name"], "focus_branch": focus,
+        "workspace": name, "summary": summary or None,
+        "conflicts": [], "safe": True, "status": "pending", "created_at": config.now_iso(),
+        "comment": None, "decided_at": None,
+        "upstreams": [{"name": "workspace", "url": ws["path"], "branch": ws["branch"], "target": ws["head"],
+                       "upstream_sha": ws["head"], "behind": ws["commits_beyond_focus"], "ahead": ws["focus_commits_missing"],
+                       "conflict": False, "conflict_files": [],
+                       "reason": f"resolved merge from workspace {name}" + (f": {summary}" if summary else "")}],
+    })
+    return jsonify({"ok": True, "request": store.snapshot(rec)})
+
+
+@flask_app.route("/api/repo/<repo_id>/workspaces/<name>", methods=["DELETE"])
+def api_remove_workspace(repo_id, name):
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    try:
+        workspaces.remove(repo, name)
+    except workspaces.WorkspaceError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    return jsonify({"ok": True})
+
+
 # ----------------------------------------------------------- model edits
 def _edit_message(repo_id: str):
     data = request.get_json(force=True) or {}
@@ -830,6 +933,11 @@ def api_decide(req_id):
                            allow_merge_commit=True)}
                        for u in req.get("upstreams", [])]
         failed = not all(o["ok"] for o in outcome)
+        if req.get("workspace") and not failed:  # its branch is in the focus branch now
+            try:
+                workspaces.remove(repo, req["workspace"])
+            except Exception:
+                pass
     result = store.decide_request(req_id, decision, comment, outcome, failed)
     try:
         memory.remember(result["repo_id"], (

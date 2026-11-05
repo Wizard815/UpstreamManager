@@ -10,11 +10,16 @@ requires-python = ">=3.11"
 dependencies = [
     "flask>=3.0",
     "keyring>=25.7.0",
+    "mcp>=2.3,<3",
     "pynacl>=1.6.2",
     "pyyaml>=6.0.3",
     "requests>=2.31",
     "waitress>=3.0.2",
 ]
+
+[project.scripts]
+upstream-manager = "upstream_upkeep.run:main"
+upstream-mcp = "upstream_upkeep.mcp_server:main"
 
 [build-system]
 requires = ["uv_build>=0.12.9,<0.13.0"]
