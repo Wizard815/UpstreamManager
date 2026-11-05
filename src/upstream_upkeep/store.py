@@ -181,6 +181,19 @@ def decide_request(req_id: str, decision: str, comment: str | None = None, resul
 # --------------------------------------------------------------------- chat
 # Each repo keeps a list of chat sessions. Starting a new session resets what
 # the LLM sees of the conversation; long-term memory (memory.py) is unaffected.
+# Chats about no particular repo belong to GENERAL, kept beside the repos.
+GENERAL = "_general"
+TAG_TYPES = {"commit", "pr", "request", "push"}
+MAX_SESSION_TAGS = 8
+
+
+def chat_owner(repo_id: str) -> dict | None:
+    """The repo whose chats these are, or the general chat holder for GENERAL."""
+    if repo_id == GENERAL:
+        return _ensure().setdefault("general", {"id": GENERAL, "name": "General"})
+    return get_repo(repo_id)
+
+
 def _sessions(repo: dict) -> list[dict]:
     sessions = repo.setdefault("chat_sessions", [])
     legacy = repo.pop("chat_history", None)
@@ -194,18 +207,54 @@ def _sessions(repo: dict) -> list[dict]:
 
 @_locked
 def list_sessions(repo_id: str) -> list[dict]:
-    repo = get_repo(repo_id)
+    repo = chat_owner(repo_id)
     if not repo:
         return []
     active = repo.get("active_session")
-    return [{"id": s["id"], "title": s.get("title"), "created_at": s.get("created_at"),
-             "count": len(s.get("messages", [])), "active": s["id"] == active}
-            for s in _sessions(repo)]
+    return [_session_info(s, active) for s in _sessions(repo)]
+
+
+def _session_info(s: dict, active: str | None = None) -> dict:
+    msgs = s.get("messages", [])
+    return {"id": s["id"], "title": s.get("title"), "created_at": s.get("created_at"),
+            "updated_at": msgs[-1].get("timestamp") if msgs else s.get("created_at"),
+            "count": len(msgs), "active": s["id"] == active, "tags": s.get("tags", [])}
+
+
+@_locked
+def all_sessions() -> list[dict]:
+    """Every chat, of every repo and the general ones, newest first."""
+    out = []
+    for owner in [chat_owner(GENERAL), *all_repos()]:
+        for sess in _sessions(owner):
+            if sess.get("messages") or sess.get("tags"):
+                out.append({**_session_info(sess, owner.get("active_session")),
+                            "repo_id": owner["id"], "repo_name": owner.get("name") or owner["id"]})
+    return sorted(out, key=lambda x: x.get("updated_at") or "", reverse=True)
+
+
+@_locked
+def set_session_tags(repo_id: str, session_id: str, tags: list[dict]) -> list[dict]:
+    """What a chat is about: commits, pull requests, requests or pushes. Each tag is
+    {type, id, label} plus repo (for chats outside that repo) and url (for a PR)."""
+    session = get_session(repo_id, session_id)
+    clean = []
+    for t in tags[:MAX_SESSION_TAGS]:
+        if not isinstance(t, dict) or t.get("type") not in TAG_TYPES or not str(t.get("id") or "").strip():
+            continue
+        tag = {"type": t["type"], "id": str(t["id"])[:200], "label": str(t.get("label") or t["id"])[:120]}
+        for k in ("repo", "url"):
+            if t.get(k):
+                tag[k] = str(t[k])[:500]
+        clean.append(tag)
+    session["tags"] = clean
+    save_state()
+    return clean
 
 
 @_locked
 def new_session(repo_id: str) -> dict:
-    repo = get_repo(repo_id)
+    repo = chat_owner(repo_id)
     sessions = _sessions(repo)
     # abandoned empty chats are clutter: drop them when starting another
     sessions[:] = [s for s in sessions if s.get("messages")]
@@ -220,7 +269,7 @@ def new_session(repo_id: str) -> dict:
 @_locked
 def delete_session(repo_id: str, session_id: str) -> bool:
     """Delete one chat (its messages only; long-term memory is untouched)."""
-    repo = get_repo(repo_id)
+    repo = chat_owner(repo_id)
     sessions = _sessions(repo)
     kept = [s for s in sessions if s["id"] != session_id]
     if len(kept) == len(sessions):
@@ -241,7 +290,7 @@ def get_message(repo_id: str, session_id: str, index: int) -> dict | None:
 @_locked
 def get_session(repo_id: str, session_id: str | None = None) -> dict:
     """The requested session, else the active one, else a fresh one."""
-    repo = get_repo(repo_id)
+    repo = chat_owner(repo_id)
     want = session_id or repo.get("active_session")
     for s in _sessions(repo):
         if s["id"] == want:
@@ -252,7 +301,7 @@ def get_session(repo_id: str, session_id: str | None = None) -> dict:
 @_locked
 def set_active_session(repo_id: str, session_id: str) -> dict:
     session = get_session(repo_id, session_id)
-    get_repo(repo_id)["active_session"] = session["id"]
+    chat_owner(repo_id)["active_session"] = session["id"]
     save_state()
     return session
 

@@ -462,7 +462,7 @@ def write_due_logs() -> list[dict]:
                 WHERE a.day < ? AND NOT EXISTS (
                     SELECT 1 FROM items d WHERE d.kind='daylog' AND d.repo=a.repo AND d.day=a.day)
                 ORDER BY a.day""", (today,)).fetchall()
-        known = {r["id"] for r in store.all_repos()}
+        known = {r["id"] for r in store.all_repos()} | {store.GENERAL}
         done = []
         for row in due:
             if row["repo"] not in known:
