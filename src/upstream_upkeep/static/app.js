@@ -1174,6 +1174,8 @@ async function renderRequests() {
         (r.result || []).length ? el("div", { class: "muted" }, "Result: " + r.result.map(o => `${o.upstream}: ${o.detail}`).join("; ")) : null,
         (r.result || []).filter(o => o.url).map(o => el("div", {}, el("a", { href: o.url, target: "_blank", rel: "noopener", style: "color:#9fb4ff" }, `Open the pull request: ${o.url}`))),
         (r.result || []).filter(o => o.after_update).map(o => el("div", { style: "color:#e0a060;font-size:13px" }, `Now run for ${o.name}: `, el("code", {}, o.after_update))),
+        r.summary ? el("div", { style: "margin:6px 0;font-size:13px" }, el("strong", {}, "Agent's summary: "), r.summary) : null,
+        r.workspace ? el("div", { class: "muted", style: "font-size:12px" }, `Resolved in merge workspace ${r.workspace}; approving fast-forwards ${r.focus_branch} to it and removes the workspace.`) : null,
         r.comment ? el("div", { class: "muted" }, `Note: ${r.comment}`) : null,
         pending ? el("div", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px" }, ...(reportBtns.length ? reportBtns : [approveBtn]), denyBtn, commentIn,
           el("span", { class: "muted", style: "font-size:12px" }, isActions
@@ -1297,7 +1299,42 @@ async function renderSettings() {
         el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Write a log of each day with activity", dailySel),
         el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Automatic cleanup", cleanSel),
         memStatus, memSave))
+    card.append(await agentSetup())
   } catch (e) { card.replaceChildren(el("p", { class: "muted" }, `Could not load settings: ${e.message}`)) }
+}
+
+// Coding agents connect to Upstream Manager as an MCP server (mcp_server.py).
+// One config snippet per agent, filled in with this machine's paths.
+async function agentSetup() {
+  const box = el("div")
+  let s
+  try { s = await api(apiUrl("/api/agent-setup")) } catch (e) { box.append(el("p", { class: "muted" }, `Agent setup unavailable: ${e.message}`)); return box }
+  const [cmd, ...args] = s.command
+  const q = (x) => JSON.stringify(x)
+  const snippets = {
+    OpenCode: ["opencode.json (in the repo, or ~/.config/opencode/opencode.json)", JSON.stringify({
+      $schema: "https://opencode.ai/config.json",
+      mcp: { "upstream-manager": { type: "local", command: s.command, enabled: true, environment: { UPSTREAM_APP_URL: s.app_url } } },
+    }, null, 2)],
+    Codex: ["~/.codex/config.toml",
+      `[mcp_servers.upstream-manager]\ncommand = ${q(cmd)}\nargs = [${args.map(q).join(", ")}]\nenv = { UPSTREAM_APP_URL = ${q(s.app_url)} }`],
+    "Claude Code": ["run once in a terminal",
+      `claude mcp add upstream-manager -e UPSTREAM_APP_URL=${s.app_url} -- ${s.command.join(" ")}`],
+    Hermes: ["cli-config.yaml",
+      `mcp_servers:\n  upstream-manager:\n    command: ${cmd}\n    args: [${args.map(q).join(", ")}]\n    env:\n      UPSTREAM_APP_URL: ${s.app_url}`],
+  }
+  const pick = el("select", { "aria-label": "Coding agent" }, ...Object.keys(snippets).map(k => el("option", { value: k }, k)))
+  const where = el("div", { class: "muted", style: "font-size:12px" })
+  const code = el("pre", { style: "white-space:pre-wrap;word-break:break-all;background:#0f1115;border:1px solid #2a2f3a;border-radius:8px;padding:10px;margin:0;font-size:12px" })
+  const show = () => { where.textContent = `Put this in ${snippets[pick.value][0]}:`; code.textContent = snippets[pick.value][1] }
+  const copy = el("button", { class: "btn ghost" }, "Copy")
+  copy.onclick = () => { navigator.clipboard?.writeText(code.textContent); toast("Copied", "ok") }
+  pick.onchange = show; show()
+  box.append(el("h4", { style: "margin-top:20px" }, "Coding agents"),
+    el("div", { class: "muted" }, "Connect OpenCode, Codex, Claude Code or Hermes so the agent can read each repo's briefing, incoming commits, conflicts and memory, and resolve upstream merges in a separate merge workspace. It can raise requests but never approve, merge into your branch or push: those stay here. Keep this app running while the agent works."),
+    el("div", { style: "display:flex;flex-direction:column;gap:8px;margin-top:8px" },
+      el("div", { style: "display:flex;gap:8px;align-items:center" }, pick, copy), where, code))
+  return box
 }
 
 function currentView() {
