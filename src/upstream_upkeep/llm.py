@@ -262,7 +262,10 @@ def _history(session: dict) -> list[dict]:
         used += len(m["content"])
         if used > HISTORY_CHARS:
             break
-        out.append({"role": m["role"], "content": m["content"]})
+        if m["role"] == "agent":  # a coding agent's note: the model sees it as said in this chat
+            out.append({"role": "assistant", "content": f"[Note from the coding agent] {m['content']}"})
+        else:
+            out.append({"role": m["role"], "content": m["content"]})
     return list(reversed(out))
 
 

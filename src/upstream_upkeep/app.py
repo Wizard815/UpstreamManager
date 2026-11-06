@@ -26,6 +26,7 @@ Endpoints:
 from __future__ import annotations
 
 import os
+import re
 import threading
 from datetime import date
 from pathlib import Path
@@ -34,7 +35,7 @@ from urllib.parse import urlparse
 from flask import Flask, jsonify, request, render_template_string, abort
 
 from . import (actions, agent_context, components, config, credentials, daily_check, edits, github, gitops, memory,
-               pull_report, registry, store, upstream_check, workflows, workspaces)
+               pull_report, registry, stacks, store, upstream_check, workflows, workspaces)
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -45,6 +46,18 @@ _run_lock = threading.Lock()
 
 # Extra hosts (host:port) allowed to send changes, e.g. a proxy in front of the app.
 _ALLOWED_HOSTS = {h.strip() for h in os.environ.get("UPSTREAM_ALLOWED_HOSTS", "").split(",") if h.strip()}
+
+
+def _from_agent() -> bool:
+    """A request the MCP server made for a coding agent (it says so in a header)."""
+    return request.headers.get("X-Upstream-Client") == "agent"
+
+
+def _user_only(what: str):
+    """Things only the person decides: approvals, accounts, settings, letting stacks run."""
+    if _from_agent():
+        return jsonify({"ok": False, "error": f"{what} is up to the user, in Upstream Manager itself"}), 403
+    return None
 
 
 @flask_app.before_request
@@ -238,6 +251,8 @@ def api_credentials():
 
 @flask_app.route("/api/credentials", methods=["POST"])
 def api_credentials_save():
+    if (refused := _user_only("Changing accounts")):
+        return refused
     """Save any of github_token / dockerhub_username / dockerhub_token ("" removes it)."""
     data = request.get_json(force=True) or {}
     where = {k: credentials.set(k, str(v or "").strip()) for k, v in data.items() if k in credentials.FIELDS}
@@ -519,6 +534,94 @@ def api_request_pull(repo_id, name):
     return jsonify({"ok": True, "request": store.snapshot(rec)})
 
 
+# ------------------------------------------------------- demo stacks (stacks.py)
+def _stack_call(repo_id: str, fn):
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    try:
+        return jsonify({"ok": True, **fn(repo)})
+    except (stacks.StackError, workspaces.WorkspaceError) as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@flask_app.route("/api/repo/<repo_id>/stack")
+def api_stack(repo_id):
+    """A demo stack's settings, Docker's state and what runs (?ws= for a merge workspace's stack)."""
+    def fn(repo):
+        ok, docker = stacks.docker_ok()
+        return {"settings": stacks.settings(repo), "docker": {"ok": ok, "detail": docker},
+                "generated_env": sorted(repo.get("stack_generated") or {}),
+                **stacks.status(repo, request.args.get("ws") or None)}
+    return _stack_call(repo_id, fn)
+
+
+@flask_app.route("/api/repo/<repo_id>/stack/settings", methods=["POST"])
+def api_stack_settings(repo_id):
+    """{enabled, compose_file, profiles, env, services}. Turning stacks on or off is the user's call."""
+    data = request.get_json(force=True) or {}
+    if "enabled" in data and (refused := _user_only("Turning demo stacks on or off")):
+        return refused
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    s = stacks.settings(repo)
+    if "enabled" in data:
+        s["enabled"] = bool(data["enabled"])
+    if "compose_file" in data:
+        s["compose_file"] = str(data["compose_file"] or "").strip()
+    for key in ("profiles", "services"):
+        if key in data:
+            if not (isinstance(data[key], list) and all(isinstance(x, str) for x in data[key])):
+                return jsonify({"ok": False, "error": f"{key} must be a list of names"}), 400
+            s[key] = data[key]
+    if "env" in data:
+        if not isinstance(data["env"], dict):
+            return jsonify({"ok": False, "error": "env must be an object"}), 400
+        s["env"] = {str(k): str(v) for k, v in data["env"].items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(k))}
+    with store.lock:
+        repo["stack"] = s
+        store.save_repo(repo)
+    return jsonify({"ok": True, "settings": s})
+
+
+@flask_app.route("/api/repo/<repo_id>/stack/up", methods=["POST"])
+def api_stack_up(repo_id):
+    data = request.get_json(silent=True) or {}
+    return _stack_call(repo_id, lambda repo: stacks.up(repo, data.get("ws") or None, build=data.get("build", True) is not False))
+
+
+@flask_app.route("/api/repo/<repo_id>/stack/down", methods=["POST"])
+def api_stack_down(repo_id):
+    data = request.get_json(silent=True) or {}
+    return _stack_call(repo_id, lambda repo: stacks.down(repo, data.get("ws") or None, bool(data.get("reset"))))
+
+
+@flask_app.route("/api/repo/<repo_id>/stack/logs")
+def api_stack_logs(repo_id):
+    a = request.args
+    return _stack_call(repo_id, lambda repo: stacks.logs(repo, a.get("ws") or None, a.get("service") or None, int(a.get("tail", 200))))
+
+
+@flask_app.route("/api/repo/<repo_id>/stack/request", methods=["POST"])
+def api_stack_request(repo_id):
+    """Send an HTTP request to one of the stack's services: {service, path, method, port?, headers?, body?, ws?}."""
+    d = request.get_json(force=True) or {}
+    return _stack_call(repo_id, lambda repo: stacks.request(repo, d.get("ws") or None, d.get("service", ""), d.get("path") or "/",
+                                                          d.get("method") or "GET", d.get("port"), d.get("headers"), d.get("body")))
+
+
+@flask_app.route("/api/repo/<repo_id>/stack/exec", methods=["POST"])
+def api_stack_exec(repo_id):
+    """Run a command in a running service: {service, command (string or list), timeout?, ws?}."""
+    d = request.get_json(force=True) or {}
+
+    def fn(repo):
+        stacks._check_enabled(repo)
+        return stacks.exec_(repo, d.get("ws") or None, d.get("service", ""), d.get("command"), int(d.get("timeout", 120)))
+    return _stack_call(repo_id, fn)
+
+
 # ------------------------------------------------- coding agents (see mcp_server.py)
 @flask_app.route("/api/agent-setup")
 def api_agent_setup():
@@ -571,7 +674,8 @@ def api_open_workspace(repo_id):
         return jsonify({"ok": False, "error": "branches must be a list of names"}), 400
     try:
         with _run_lock:
-            ws = workspaces.open_workspace(repo, data.get("upstream") or None, branches)
+            ws = workspaces.open_workspace(repo, data.get("upstream") or None, branches,
+                                           (str(data.get("change") or "").strip()[:120] or None))
     except workspaces.WorkspaceError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     return jsonify({"ok": True, "workspace": ws})
@@ -624,8 +728,9 @@ def api_submit_workspace(repo_id, name):
         "upstreams": [{"name": "workspace", "url": ws["path"], "branch": ws["branch"], "target": ws["head"],
                        "upstream_sha": ws["head"], "behind": ws["commits_beyond_focus"], "ahead": ws["focus_commits_missing"],
                        "conflict": False, "conflict_files": [],
-                       "reason": f"merges {', '.join(s['label'] for s in ws['sources']) or 'the workspace'}"
-                                 f" (resolved in workspace {name})" + (f": {summary}" if summary else "")}],
+                       "reason": (f"change: {ws['change']}" if ws.get("change") and not ws["sources"] else
+                                  f"merges {', '.join(s['label'] for s in ws['sources']) or 'the workspace'}")
+                                 + f" (in workspace {name})" + (f": {summary}" if summary else "")}],
     })
     return jsonify({"ok": True, "request": store.snapshot(rec)})
 
@@ -1058,6 +1163,8 @@ def api_requests():
 
 @flask_app.route("/api/request/<req_id>/decide", methods=["POST"])
 def api_decide(req_id):
+    if (refused := _user_only("Approving or denying a request")):
+        return refused
     data = request.get_json(force=True) or {}
     decision = data.get("decision")  # 'approve' | 'deny'
     comment = data.get("comment")
@@ -1177,6 +1284,19 @@ def api_delete_session(repo_id, session_id):
 def api_all_chats():
     """Every chat with messages, of every repo and the general ones, newest first."""
     return jsonify(store.all_sessions())
+
+
+@flask_app.route("/api/repo/<repo_id>/sessions/<session_id>/agent-note", methods=["POST"])
+def api_agent_note(repo_id, session_id):
+    """A coding agent reports into a chat: {"text"}. Shown as the agent's message; no model call."""
+    if not store.chat_owner(repo_id):
+        abort(404)
+    text = ((request.get_json(silent=True) or {}).get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "empty note"}), 400
+    msg = store.add_chat_message(repo_id, session_id, "agent", text[:20000])
+    memory.record_message(repo_id, session_id, "agent", text[:20000], msg["timestamp"])
+    return jsonify({"ok": True, "message": msg})
 
 
 @flask_app.route("/api/repo/<repo_id>/sessions/<session_id>/tags", methods=["POST"])
@@ -1315,6 +1435,8 @@ def api_settings():
 
 @flask_app.route("/api/settings", methods=["POST"])
 def api_save_settings():
+    if (refused := _user_only("Changing settings")):
+        return refused
     data = request.get_json(force=True) or {}
     if isinstance(data.get("llm"), dict) and "api_key" in data["llm"]:
         data["llm"]["api_key"] = _unmask(data["llm"]["api_key"]) or ""
@@ -1531,6 +1653,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   .msg.bot pre.md-code code { background: none; border: 0; padding: 0; white-space: pre; }
   .msg.bot blockquote { border-left: 3px solid #3a4152; padding-left: 8px; color: var(--soft); }
   .msg.err { background: var(--bad-bg); }
+  .msg.agent { background: #102c33; border: 1px solid #1f5560; }
   .composer { border-top: 1px solid var(--line); padding: 8px; display: flex; flex-direction: column; gap: 6px; flex: none; }
   .composer textarea { width: 100%; resize: vertical; min-height: 44px; max-height: 40vh; }
   .tray { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12px; }
