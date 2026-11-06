@@ -156,18 +156,23 @@ def _advance(ws: Path, meta: dict, focus: str) -> None:
         return
 
 
-def open_workspace(repo: dict, upstream: str | None = None, branches: list[str] | None = None) -> dict:
-    """Create (or return) a workspace merging `upstream`, or the set `branches`, into the focus branch."""
+def open_workspace(repo: dict, upstream: str | None = None, branches: list[str] | None = None,
+                   change: str | None = None) -> dict:
+    """Create (or return) a workspace merging `upstream`, or the set `branches`, into the focus branch;
+    or, with `change` (a short title), an empty one to make and test a change of your own in."""
     focus = repo.get("focus_branch") or "main"
     if not gitops.ref_exists(repo["path"], f"refs/heads/{focus}"):
         raise WorkspaceError(f"focus branch {focus} does not exist")
     wanted = [upstream] if upstream else list(dict.fromkeys(b for b in (branches or []) if b))
-    if not wanted:
-        raise WorkspaceError("name an upstream or at least one branch")
+    if not wanted and not change:
+        raise WorkspaceError("name an upstream, at least one branch, or the change you want to make")
     if len(wanted) > MAX_SOURCES:
         raise WorkspaceError(f"at most {MAX_SOURCES} branches in one set")
     sources = [_resolve(repo, s) for s in wanted]
-    if len(sources) == 1 and upstream:
+    if change and not sources:
+        slug = re.sub(r"[^a-z0-9]+", "-", change.lower()).strip("-")[:40] or "change"
+        name = f"merge-change-{slug}"
+    elif len(sources) == 1 and upstream:
         name = f"merge-{re.sub(r'[^A-Za-z0-9._-]', '-', upstream)}-{sources[0]['sha'][:10]}"
     else:
         digest = hashlib.sha1("|".join(s["label"] + s["sha"] for s in sources).encode()).hexdigest()[:10]
@@ -188,7 +193,7 @@ def open_workspace(repo: dict, upstream: str | None = None, branches: list[str] 
         res = _git(repo["path"], "worktree", "add", "-b", branch, str(ws), focus)
     if res.returncode != 0:
         raise WorkspaceError((res.stderr or res.stdout).strip() or "could not create the worktree")
-    meta = {"sources": [{**s, "state": "pending"} for s in sources], "focus_branch": focus,
+    meta = {"sources": [{**s, "state": "pending"} for s in sources], "focus_branch": focus, "change": change,
             "base": gitops.short_sha(repo["path"], f"refs/heads/{focus}"), "created_at": config.now_iso()}
     _advance(ws, meta, focus)
     _save(ws, meta)
@@ -261,11 +266,13 @@ def status(repo: dict, name: str) -> dict:
     elif dirty:
         step = "commit or discard the uncommitted changes"
     elif behind == 0:
-        step = "nothing to bring in: the branch has no commits beyond the focus branch"
+        step = ("make your change here and commit it" if meta.get("change")
+                else "nothing to bring in: the branch has no commits beyond the focus branch")
     else:
         step = "ready: submit it for approval"
     ready = not merging and not pending and not unresolved and not markers and not dirty and behind > 0
     return {"name": name, "path": str(ws), "branch": branch, "focus_branch": focus, "merging": merging,
+            "change": meta.get("change"),
             "sources": sources, "unresolved": unresolved, "conflict_markers": markers, "uncommitted": dirty[:50],
             "commits_beyond_focus": behind, "focus_commits_missing": ahead, "ready": ready, "next_step": step,
             "head": gitops.short_sha(str(ws), "HEAD")}

@@ -98,9 +98,9 @@ def test_mcp_discard_removes_the_workspace(client, conflicted, monkeypatch):
 
 def _route_to(client, monkeypatch):
     """Send the MCP server's HTTP calls to the Flask test client."""
-    def fake(method, url, params=None, json=None, timeout=None):
+    def fake(method, url, params=None, json=None, timeout=None, headers=None):
         path = url[len(mcp_server.APP):]
-        r = client.open(path, method=method, query_string=params, json=json)
+        r = client.open(path, method=method, query_string=params, json=json, headers=headers)
         return SimpleNamespace(status_code=r.status_code, json=lambda: r.get_json())
     monkeypatch.setattr(mcp_server.requests, "request", fake)
 
@@ -152,3 +152,41 @@ def test_agent_setup_endpoint(client):
     s = client.get("/api/agent-setup").get_json()
     assert s["command"][:3] == ["uv", "run", "--project"] and s["command"][-1] == "upstream-mcp"
     assert s["app_url"].startswith("http://")
+
+
+def test_agent_tools_see_components_chats_and_settings(client, conflicted, monkeypatch):
+    from upstream_upkeep import llm
+    _route_to(client, monkeypatch)
+    sid = client.post("/api/repo/mine/sessions", json={}).get_json()["session"]
+    store.add_chat_message("mine", sid, "user", "Please keep HOST on 0.0.0.0 when you merge.")
+
+    async def steps(c):
+        chats = await c.call_tool("list_chats", {"repo": "mine"})
+        chat = await c.call_tool("read_chat", {"repo": "mine", "session": sid})
+        note = await c.call_tool("post_chat_note", {"repo": "mine", "session": sid, "text": "Merged upstream; HOST kept."})
+        comps = await c.call_tool("components_status", {"repo": "mine"})
+        focus = await c.call_tool("set_focus_branch", {"repo": "mine", "branch": "main"})
+        off = await c.call_tool("set_upstream_enabled", {"repo": "mine", "upstream": "origin", "enabled": False})
+        stack = await c.call_tool("stack_status", {"repo": "mine"})
+        on = await c.call_tool("stack_set", {"repo": "mine", "env": {"A": "1"}})
+        return chats, chat, note, comps, focus, off, stack, on
+    chats, chat, note, comps, focus, off, stack, on = _run(steps)
+    assert sid in chats.content[0].text and "keep HOST" in chat.content[0].text
+    assert not note.is_error
+    msgs = client.get(f"/api/chat/mine?session={sid}").get_json()["messages"]
+    assert msgs[-1]["role"] == "agent" and msgs[-1]["content"] == "Merged upstream; HOST kept."
+    hist = llm._history(store.get_session("mine", sid))
+    assert hist[-1] == {"role": "assistant", "content": "[Note from the coding agent] Merged upstream; HOST kept."}
+    assert not comps.is_error and not focus.is_error and not off.is_error and not stack.is_error and not on.is_error
+    assert registry.get_repo("mine")["upstreams"][0]["enabled"] is False
+
+
+def test_agent_requests_are_marked_and_user_only_things_refused(client, conflicted, monkeypatch):
+    _route_to(client, monkeypatch)
+    # Even if an agent calls the app directly through the MCP helper, approving is refused.
+    with pytest.raises(mcp_server.AppError, match="up to the user"):
+        mcp_server._call("POST", "/api/request/mine:main/decide", {"decision": "approve"})
+    with pytest.raises(mcp_server.AppError, match="up to the user"):
+        mcp_server._call("POST", "/api/repo/mine/stack/settings", {"enabled": True})
+    names = [t.name for t in _run(lambda c: c.list_tools()).tools]
+    assert {"stack_up", "stack_request", "stack_exec", "components_status", "read_chat", "post_chat_note"} <= set(names)

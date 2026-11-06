@@ -109,3 +109,19 @@ def test_untracked_files_do_not_block_approval_but_tracked_changes_do(client, fe
     out = client.post(f"/api/request/{req['id']}/decide", json={"decision": "approve"}).get_json()
     assert out["ok"], out
     assert Path(mine, "a_feature.py").exists() and Path(mine, "scratch.txt").read_text() == "notes\n"
+
+
+def test_change_workspace_for_your_own_change(client, features):
+    mine = features
+    ws = client.post("/api/repo/mine/workspaces", json={"change": "Bump app version"}).get_json()["workspace"]
+    assert ws["name"] == "merge-change-bump-app-version" and ws["sources"] == [] and not ws["ready"]
+    assert "make your change" in ws["next_step"]
+    Path(ws["path"], "VERSION").write_text("2.0\n")
+    git(ws["path"], "add", "VERSION")
+    git(ws["path"], "-c", "user.email=a@a", "-c", "user.name=A", "commit", "-qm", "bump version")
+    ws = client.get(f"/api/repo/mine/workspaces/{ws['name']}").get_json()["workspace"]
+    assert ws["ready"]
+    req = client.post(f"/api/repo/mine/workspaces/{ws['name']}/submit", json={"summary": "tested"}).get_json()["request"]
+    assert req["upstreams"][0]["reason"].startswith("change: Bump app version")
+    assert client.post(f"/api/request/{req['id']}/decide", json={"decision": "approve"}).get_json()["ok"]
+    assert Path(mine, "VERSION").read_text() == "2.0\n"

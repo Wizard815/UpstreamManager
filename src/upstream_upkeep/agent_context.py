@@ -35,6 +35,26 @@ def _memories(repo_id: str) -> list[str]:
     return lines
 
 
+def _stack_lines(repo: dict) -> list[str]:
+    from . import stacks
+    s = stacks.settings(repo)
+    try:
+        cf = stacks.compose_file(repo)
+    except Exception:
+        cf = None
+    if not cf:
+        return []
+    if not s["enabled"]:
+        return ["## Demo stack", f"The repo has {cf.name}, but demo stacks are off for it (only the user can turn them on).", ""]
+    st = stacks.status(repo)
+    out = ["## Demo stack", f"{cf.name}: {st.get('summary') or 'not started'}. Start it with stack_up (repo, or a workspace to test",
+           "a change), then stack_status, stack_logs, stack_request (HTTP to a service) and stack_exec."]
+    for svc in st.get("services", []):
+        out.append(f"- {svc['service']}: {svc['state']}{' (' + svc['health'] + ')' if svc.get('health') else ''}"
+                   + "".join(f", port {p['target']} -> {p['url']}" for p in svc["ports"]))
+    return out + [""]
+
+
 def briefing(repo: dict) -> str:
     lines = ["# Upstream Manager briefing", "", "## Repository", llm.repo_facts(repo), ""]
     reqs = [r for r in store.get_requests() if r.get("repo_id") == repo["id"] and r.get("status") == "pending"]
@@ -50,6 +70,12 @@ def briefing(repo: dict) -> str:
     if ws:
         lines.append("## Merge workspaces")
         lines += [f"- {w['name']} at {w['path']}: {w.get('next_step') or w.get('error')}" for w in ws]
+        lines.append("")
+    lines += _stack_lines(repo)
+    chats = [c for c in store.all_sessions() if c["repo_id"] == repo["id"]][:5]
+    if chats:
+        lines.append("## Recent chats (read one with read_chat)")
+        lines += [f"- {c['id']}: {c.get('title') or 'untitled'} ({c['count']} messages, {c.get('updated_at', '')[:16]})" for c in chats]
         lines.append("")
     lines += _memories(repo["id"])
     lines += ["", RULES]

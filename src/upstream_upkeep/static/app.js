@@ -680,9 +680,10 @@ function chatPanel(repoId, opts = {}) {
     const box = el("div", { class: "chat-box", role: "log", "aria-live": "polite", "aria-label": "Conversation", tabindex: "0" })
     const setReply = (d, text) => { d.innerHTML = renderMarkdown(text) }
     const addMsg = (m, index) => {
-      const d = el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.error ? " err" : ""}` })
+      const d = el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.role === "agent" ? " agent" : ""}${m.error ? " err" : ""}` })
       if (m.role === "user" || m.error) d.textContent = m.content
       else setReply(d, m.content)
+      if (m.role === "agent") d.prepend(el("div", { class: "small", style: "color:var(--info);font-weight:600;margin-bottom:4px" }, "Coding agent"))
       if (m.edits?.length && repoId !== GENERAL) d.append(editCard(repoId, sessionId, index, m))
       if (m.attachments?.length) d.append(el("div", { class: "small", style: "margin-top:4px;opacity:.8" }, "📎 " + m.attachments.map(a => a.label).join(", ")))
       box.append(d)
@@ -994,12 +995,12 @@ async function renderActions(wrap, repoId, refresh = false) {
 
 // Right-hand tools: commits, files, memory, publish, actions.
 function renderTools(wrap, repoId, { extra } = {}) {
-  const names = ["Chat", "Commits", "Files", "Merges", "Memory", "Publish", "Actions"]
+  const names = ["Chat", "Commits", "Files", "Merges", "Stack", "Memory", "Publish", "Actions"]
   const bar = el("div", { class: "tabs", role: "tablist", "aria-label": "Repo tools" })
   const panes = {}, tabs = {}, built = {}
   let filesScope = null  // a merge workspace name, or null for the repo itself
   const builders = {
-    Chat: async () => {}, Commits: renderCommits, Merges: renderMerges, Memory: renderMemory, Publish: renderPublish, Actions: renderActions,
+    Chat: async () => {}, Commits: renderCommits, Merges: renderMerges, Stack: (pane, id) => renderStack(pane, id), Memory: renderMemory, Publish: renderPublish, Actions: renderActions,
     Files: (pane, id) => renderFiles(pane, id, { ws: filesScope, onScope: (ws) => { filesScope = ws } }),
   }
   const flush = new Set(["Files", "Chat"])
@@ -1226,6 +1227,135 @@ async function showPullReport(repoId, { upstream, component }) {
 }
 
 // Files: a read-only tree plus a line-numbered viewer with find.
+// Stack: run the repo's (or a merge workspace's) compose stack as an isolated demo,
+// see what runs, read its logs and try requests against it. See stacks.py.
+async function renderStack(wrap, repoId, scope = { ws: null }) {
+  const q = () => (scope.ws ? `?ws=${encodeURIComponent(scope.ws)}` : "")
+  let st
+  try { st = await api(apiUrl(`/api/repo/${repoId}/stack${q()}`)) }
+  catch (e) { wrap.replaceChildren(el("p", { class: "muted" }, e.message)); return }
+  wrap.innerHTML = ""
+  const again = () => renderStack(wrap, repoId, scope)
+  const body = (x) => JSON.stringify({ ...(scope.ws ? { ws: scope.ws } : {}), ...x })
+
+  // header: docker, on/off, scope
+  const head = el("div", { class: "row", style: "margin-bottom:10px" }, el("h3", {}, "Demo stack"),
+    st.docker.ok ? badge("up", `Docker ${st.docker.detail}`) : badge("bad", "Docker not running"),
+    st.compose_file ? badge("", st.compose_file) : badge("warn", "no compose file"),
+    el("div", { class: "spacer" }))
+  const wsList = await api(apiUrl(`/api/repo/${repoId}/workspaces`)).then(r => r.items.filter(w => !w.error)).catch(() => [])
+  if (wsList.length || scope.ws) {
+    const sel = el("select", { "aria-label": "Run" }, el("option", { value: "" }, "This repo"),
+      ...wsList.map(w => el("option", { value: w.name }, `Workspace: ${w.branch.replace("upkeep/", "")}`)))
+    sel.value = scope.ws || ""
+    sel.onchange = () => { scope.ws = sel.value || null; again() }
+    head.append(el("label", { class: "row muted", style: "gap:6px" }, "Run", sel))
+  }
+  const toggle = el("button", { class: `btn ${st.enabled ? "ghost" : ""} small` }, st.enabled ? "Turn off" : "Turn on demo stacks")
+  toggle.onclick = () => {
+    if (!st.enabled && !confirm("A demo stack builds and runs this project's own code in Docker on this machine (isolated: its own network, random local ports, demo data). Agents you connect can then start it, read its logs and send it requests. Turn it on?")) return
+    return busy(toggle, null, async () => { await api(apiUrl(`/api/repo/${repoId}/stack/settings`), { method: "POST", body: JSON.stringify({ enabled: !st.enabled }) }); await again() })
+  }
+  head.append(toggle)
+  wrap.append(head)
+  if (!st.compose_file) { wrap.append(el("p", { class: "muted" }, st.error || "This project has no compose.yaml or docker-compose.yml, so there is nothing to run.")); return }
+  if (!st.enabled) {
+    wrap.append(el("p", { class: "muted" }, "Off. When on, Upstream Manager runs a copy of this compose stack that cannot clash with the real one: no fixed container names, every port moved to a random port on 127.0.0.1, its own network, data folders outside the project replaced by a demo folder, and missing secrets filled with generated demo values. You and connected coding agents can then check it runs, read its logs and send it requests, including from a merge workspace to test a change before approving it."))
+    return
+  }
+  if (!st.docker.ok) wrap.append(el("p", { style: "color:var(--bad)" }, st.docker.detail))
+
+  // controls
+  const up = el("button", { class: "btn small", disabled: st.busy ? "" : null }, st.services.length ? "Rebuild & restart" : "Start")
+  up.onclick = () => busy(up, "Starting…", async () => { await api(apiUrl(`/api/repo/${repoId}/stack/up`), { method: "POST", body: body({}) }); toast("Starting: pulling and building can take a few minutes.", "info"); await again() })
+  const down = el("button", { class: "btn ghost small", disabled: st.busy || !st.services.length ? "" : null }, "Stop")
+  down.onclick = () => busy(down, "Stopping…", async () => { await api(apiUrl(`/api/repo/${repoId}/stack/down`), { method: "POST", body: body({}) }); await again() })
+  const reset = el("button", { class: "btn ghost small", disabled: st.busy ? "" : null, title: "Stop and delete the demo data and generated secrets" }, "Stop & reset data")
+  reset.onclick = () => { if (confirm("Stop the stack and delete its demo data and generated secrets?")) return busy(reset, "Resetting…", async () => { await api(apiUrl(`/api/repo/${repoId}/stack/down`), { method: "POST", body: body({ reset: true }) }); await again() }) }
+  const refresh = el("button", { class: "btn ghost small", onclick: () => again() }, "Refresh")
+  wrap.append(el("div", { class: "row", style: "margin-bottom:10px" }, up, down, reset, refresh,
+    el("span", { class: "muted" }, st.busy ? "working…" : (st.summary || "not started"))))
+
+  // services
+  if (st.services.length) {
+    const tb = el("tbody")
+    for (const s of st.services) {
+      const cls = s.state === "running" ? (s.health === "unhealthy" ? "bad" : "up") : s.state === "exited" ? "bad" : "warn"
+      tb.append(el("tr", {},
+        el("td", {}, el("strong", {}, s.service), el("div", { class: "muted small mono" }, s.image || "")),
+        el("td", {}, badge(cls, s.state), s.health ? badge(s.health === "healthy" ? "up" : s.health === "unhealthy" ? "bad" : "", s.health) : ""),
+        el("td", {}, ...(s.ports.length ? s.ports.map(p => el("div", {}, el("a", { href: p.url, target: "_blank", rel: "noopener" }, p.url), el("span", { class: "muted small" }, ` → ${p.target}`))) : [el("span", { class: "muted" }, "internal")])),
+        el("td", { class: "muted small" }, s.status || "")))
+    }
+    wrap.append(el("div", { class: "table-box" }, el("table", { class: "list", style: "min-width:600px" },
+      el("thead", {}, el("tr", {}, el("th", {}, "Service"), el("th", {}, "State"), el("th", {}, "Open"), el("th", {}, "Status"))), tb)))
+  }
+  if (st.op_log?.length) wrap.append(el("details", { style: "margin-top:8px", open: st.busy ? "" : null }, el("summary", { class: "muted small" }, "Start/stop log"),
+    el("pre", { class: "code-pre", style: "padding:8px;white-space:pre-wrap" }, st.op_log.join("\n"))))
+
+  // demo settings
+  const s = st.settings
+  const envIn = el("textarea", { rows: "3", style: "width:100%;font:12px var(--mono)", placeholder: "KEY=value, one per line (overrides the generated demo values)" },
+    Object.entries(s.env || {}).map(([k, v]) => `${k}=${v}`).join("\n"))
+  const svcIn = el("input", { style: "width:100%", placeholder: "all services (or a few, comma separated; their dependencies come along)", value: (s.services || []).join(", ") })
+  const profIn = el("input", { style: "width:100%", placeholder: "compose profiles, comma separated", value: (s.profiles || []).join(", ") })
+  const save = el("button", { class: "btn ghost small" }, "Save")
+  save.onclick = () => busy(save, "Saving…", async () => {
+    const env = Object.fromEntries(envIn.value.split("\n").map(l => l.trim()).filter(l => l && l.includes("=")).map(l => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1)]))
+    const list = (x) => x.value.split(",").map(v => v.trim()).filter(Boolean)
+    await api(apiUrl(`/api/repo/${repoId}/stack/settings`), { method: "POST", body: JSON.stringify({ env, services: list(svcIn), profiles: list(profIn) }) })
+    toast("Saved. Restart the stack to use it.", "ok"); await again()
+  })
+  wrap.append(el("details", { style: "margin-top:10px" }, el("summary", {}, "Demo settings"),
+    el("div", { class: "col", style: "margin-top:8px" },
+      st.generated_env?.length ? el("div", { class: "muted small" }, `Generated demo values for: ${st.generated_env.join(", ")} (kept until you reset).`) : null,
+      el("label", { class: "col", style: "gap:4px" }, "Environment", envIn),
+      el("label", { class: "col", style: "gap:4px" }, "Services", svcIn),
+      el("label", { class: "col", style: "gap:4px" }, "Profiles", profIn),
+      st.meta?.moved_mounts?.length ? el("div", { class: "muted small" }, `Data folders replaced by demo folders: ${[...new Set(st.meta.moved_mounts.map(m => m.from))].join(", ")}`) : null,
+      el("div", {}, save))))
+
+  if (!st.services.length) { if (st.busy) setTimeout(() => wrap.isConnected && again(), 3000); return }
+
+  // logs
+  const svcNames = st.services.map(x => x.service)
+  const logSvc = el("select", { "aria-label": "Logs of" }, el("option", { value: "" }, "All services"), ...svcNames.map(n => el("option", { value: n }, n)))
+  const logBox = el("pre", { class: "code-pre", style: "padding:8px;max-height:320px;white-space:pre-wrap" }, "")
+  const errBox = el("div", { class: "row small", style: "gap:6px" })
+  const loadLogs = async () => {
+    logBox.textContent = "Loading…"
+    try {
+      const r = await api(apiUrl(`/api/repo/${repoId}/stack/logs${q() ? q() + "&" : "?"}tail=300&service=${encodeURIComponent(logSvc.value)}`))
+      logBox.textContent = r.text || "(no output)"; logBox.scrollTop = logBox.scrollHeight
+      errBox.replaceChildren(...Object.entries(r.errors || {}).map(([k, v]) => badge("bad", `${k}: ${v.count} error line${v.count > 1 ? "s" : ""}`)))
+      if (!Object.keys(r.errors || {}).length) errBox.replaceChildren(badge("up", "no error lines"))
+    } catch (e) { logBox.textContent = e.message }
+  }
+  logSvc.onchange = loadLogs
+  wrap.append(el("h4", {}, "Logs"), el("div", { class: "row" }, logSvc, el("button", { class: "btn ghost small", onclick: loadLogs }, "Reload"), errBox), logBox)
+  loadLogs()
+
+  // try a request
+  const reqSvc = el("select", { "aria-label": "Service" }, ...st.services.filter(x => x.ports.length).map(x => el("option", { value: x.service }, `${x.service} (:${x.ports.map(p => p.target).join(", ")})`)))
+  const method = el("select", { "aria-label": "Method" }, ...["GET", "POST", "PUT", "PATCH", "DELETE"].map(m => el("option", {}, m)))
+  const path = el("input", { value: "/", "aria-label": "Path", style: "flex:1;min-width:120px" })
+  const hdrs = el("textarea", { rows: "2", placeholder: '{"Authorization": "Bearer …"}', style: "width:100%;font:12px var(--mono)" })
+  const bodyIn = el("textarea", { rows: "3", placeholder: '{"title": "demo"} or plain text', style: "width:100%;font:12px var(--mono)" })
+  const out = el("pre", { class: "code-pre", style: "padding:8px;white-space:pre-wrap;max-height:300px" }, "")
+  const send = el("button", { class: "btn small" }, "Send")
+  send.onclick = () => busy(send, "Sending…", async () => {
+    let headers = {}, b = bodyIn.value.trim() || null
+    try { headers = hdrs.value.trim() ? JSON.parse(hdrs.value) : {} } catch { return toast("Headers must be JSON", "error") }
+    if (b) { try { b = JSON.parse(b) } catch { /* plain text */ } }
+    const r = await api(apiUrl(`/api/repo/${repoId}/stack/request`), { method: "POST", body: body({ service: reqSvc.value, method: method.value, path: path.value, headers, body: b }) })
+    out.textContent = r.error ? `Error: ${r.error}` : `${r.status} · ${r.ms} ms · ${r.url}\n${Object.entries(r.headers || {}).map(([k, v]) => `${k}: ${v}`).join("\n")}\n\n${r.json ? JSON.stringify(r.json, null, 2) : r.body}`
+  })
+  if (reqSvc.options.length) wrap.append(el("h4", {}, "Try a request"),
+    el("div", { class: "row" }, reqSvc, method, path, send),
+    el("details", {}, el("summary", { class: "muted small" }, "Headers and body"), hdrs, bodyIn), out)
+  if (st.busy) setTimeout(() => wrap.isConnected && again(), 3000)
+}
+
 // Files: a small VS Code-like editor. Explorer (tree with change marks and a
 // right-click menu), tabs, CodeMirror with syntax colours, Ctrl+S to save. It can
 // edit the repo itself or a merge workspace (to resolve conflicts by hand).
