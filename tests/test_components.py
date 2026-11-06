@@ -178,3 +178,50 @@ def test_cross_repo_memory_needs_a_strong_match():
     assert not llm._relevant({"score": 0.62}, llm.OTHER_REPO_MIN_SCORE)
     assert llm._relevant({"score": 0.85}, llm.OTHER_REPO_MIN_SCORE)
     assert llm._relevant({"score": None}, llm.OTHER_REPO_MIN_SCORE)
+
+
+def test_components_can_follow_releases_instead_of_the_branch(hub):
+    h, a, _ = hub
+    git(a, "tag", "v1.0.0")  # the hub's pin is this release
+    commit_file(a, "src/model.js", "export const v = 2\n", "unreleased 1")
+    commit_file(a, "README.md", "app 2\n", "unreleased 2")
+    repo = store.get_repo("hub")
+    comp = repo["components"][0]
+    st = components.compare(str(h), comp, do_fetch=True)
+    assert st["behind"] == 2 and st["pin_tag"] == "v1.0.0" and "follow releases" in st["suggest_releases"]
+
+    components.update_settings(comp, {"follow": "releases"})
+    st = components.compare(str(h), comp)
+    assert (st["status"], st["release"], st["unreleased"], st["behind"]) == ("up_to_date", "v1.0.0", 2, 0)
+    assert "suggest_releases" not in st
+    assert components.sync(repo)[0]["follow"] == "releases"  # kept when .gitmodules is re-read
+
+    git(a, "tag", "v1.1.0", "HEAD~1")  # a new release, with one more commit after it
+    st = components.compare(str(h), comp, do_fetch=True)
+    assert (st["behind"], st["release"], st["unreleased"]) == (1, "v1.1.0", 1)
+    res = components.bump(repo, ["apps/a"], "main")
+    assert res["ok"] and res["results"][0]["release"] == "v1.1.0"
+    assert git(h, "ls-tree", "HEAD", "apps/a").split()[2] == git(a, "rev-parse", "v1.1.0^{commit}")
+
+
+def test_release_mode_without_tags_falls_back_to_the_branch(hub):
+    h, a, _ = hub
+    commit_file(a, "x.txt", "x\n", "more")
+    comp = store.get_repo("hub")["components"][0]
+    components.update_settings(comp, {"follow": "releases"})
+    st = components.compare(str(h), comp, do_fetch=True)
+    assert st["behind"] == 1 and "no release tags" in st["detail"]
+
+
+def test_releases_are_version_tags_only(hub):
+    h, a, _ = hub
+    git(a, "tag", "v1.0.0")
+    commit_file(a, "x.txt", "x\n", "work")
+    git(a, "tag", "vue3")          # a branch-like tag that matches v*: not a release
+    git(a, "tag", "v2.0.0-rc.1")   # a pre-release: not a release
+    comp = store.get_repo("hub")["components"][0]
+    components.update_settings(comp, {"follow": "releases"})
+    st = components.compare(str(h), comp, do_fetch=True)
+    assert st["release"] == "v1.0.0" and st["status"] == "up_to_date" and st["unreleased"] == 1
+    components.update_settings(comp, {"tag_pattern": "v*-rc*"})  # a pattern of your own is taken as given
+    assert components.compare(str(h), comp)["release"] == "v2.0.0-rc.1"

@@ -42,6 +42,31 @@ OpenAI-compatible server, such as llama-server, llama-swap or Argos.
   need nothing; private ones need the GitHub token in Settings → Accounts
   (no GitHub password or server login is involved).
 
+## Demo stacks (Stack tab)
+
+A repo with a compose file can run as a **demo stack**: a copy that can run
+next to the real install and never touches it. No fixed container names; every
+port moves to a random port on 127.0.0.1; its own network; restarts off; data
+folders outside the project (like `/mnt/user/appdata/...`) are replaced by a
+demo folder; images it builds get demo-only names, so they never replace the
+images your real stack runs; missing secrets and env files are filled with
+generated demo values (kept until you reset). Override files can be layered on
+(e.g. `docker/compose.proxy-ca.yml` when building behind a proxy).
+
+You turn it on per repo; then you or a connected agent can start it (for the
+repo, or for a merge workspace to test a change), see each service's state and
+health, open it, read its logs with an error count, send it requests and run
+commands in its containers. It needs Docker on the machine running the app.
+
+## Components that follow releases
+
+A hub that runs release images (one image tag per submodule pin) should
+compare its pins with the newest **release**, not the branch head: set the
+component to *follow releases* (Settings on its row). It then shows "on the
+latest release v2.14.0 · 6 unreleased upstream" instead of "6 behind", and a
+bump moves the pin to the next release. A component whose pin sits exactly on a
+release tag while following the branch shows a one-click suggestion.
+
 ## Coding agents (OpenCode, Codex, Claude Code, Hermes)
 
 Upstream Manager is also an MCP server, so a coding agent can work with what
@@ -68,6 +93,17 @@ The agent gets:
 - **Branch sets**: `list_branches`, then `open_branch_set` with several
   branches; after resolving a conflict, `continue_merge_workspace` commits it
   and merges the rest. One submit covers the whole set.
+- **Components**: `components_status`, `fetch_components`, `set_component`
+  (follow releases, watched paths, ...) and `request_component_update`.
+- **Testing what it changes**: `open_change_workspace` for a change of its
+  own, then `stack_up` (repo or workspace), `stack_status`, `stack_logs`,
+  `stack_request` (HTTP to a service: seed demo data, call the API) and
+  `stack_exec`; `stack_down` when done.
+- **Your chats**: `list_chats`, `read_chat`, and `post_chat_note` to report
+  back (the chat model sees those notes too).
+- **Settings it may change**: focus branch, upstreams on/off or new ones,
+  component settings, demo stack env/services. Approving requests, pushing,
+  accounts, app settings and turning demo stacks on are refused for agents.
 - `fetch_upstreams`, `add_note` and `request_clean_pull`.
 
 It has no tool that approves, merges into your branch or pushes: those stay

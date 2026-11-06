@@ -18,6 +18,9 @@ AGENT = {"X-Upstream-Client": "agent"}
 
 COMPOSE = """
 services:
+  api:
+    build: ./api
+    image: myorg/api:latest
   web:
     image: busybox:1.36
     container_name: real-web
@@ -41,6 +44,8 @@ def project(repos, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CONFIG_PATH", tmp_path / "state" / "state.json")
     _, mine = repos
     Path(mine, "site").mkdir()
+    Path(mine, "api").mkdir()
+    Path(mine, "api", "Dockerfile").write_text("FROM busybox:1.36\n")
     Path(mine, "site", "x.txt").write_text("x\n")
     commit_file(mine, "docker-compose.yml", COMPOSE, "compose")
     registry.add_repo(str(mine), None, "mine")
@@ -72,9 +77,11 @@ def test_agents_cannot_approve_or_change_settings_or_accounts(client, project):
 def test_rewrite_isolates_the_stack(client, project):
     enable(client)
     meta = stacks.prepare(registry.get_repo("mine"))
-    assert meta["generated_env"] == ["SECRET_KEY"] and meta["services"] == ["web"]
+    assert meta["generated_env"] == ["SECRET_KEY"] and meta["services"] == ["api", "web"]
     model = json.loads((config.CONFIG_PATH.parent / "stacks" / "mine" / "main" / "compose.json").read_text())
     web = model["services"]["web"]
+    # a demo build never takes the name of an image the real install runs
+    assert model["services"]["api"]["image"] == "upkeep-mine-main-api:demo"
     assert "container_name" not in web and web["restart"] == "no"
     assert web["ports"] == [{"target": 8080, "protocol": "tcp", "host_ip": "127.0.0.1"}]
     binds = {v["target"]: v["source"] for v in web["volumes"]}
@@ -98,7 +105,8 @@ def test_request_needs_a_running_service(client, project):
 def test_a_demo_stack_runs_answers_and_stops(client, project):
     enable(client)
     try:
-        assert client.post("/api/repo/mine/stack/up", json={"build": False}).get_json()["ok"]
+        client.post("/api/repo/mine/stack/settings", json={"services": ["web"]})
+        assert client.post("/api/repo/mine/stack/up", json={}).get_json()["ok"]
         for _ in range(120):
             st = client.get("/api/repo/mine/stack").get_json()
             if not st["busy"]:
@@ -118,3 +126,18 @@ def test_a_demo_stack_runs_answers_and_stops(client, project):
     finally:
         client.post("/api/repo/mine/stack/down", json={"reset": True})
     assert client.get("/api/repo/mine/stack").get_json()["services"] == []
+
+
+@pytest.mark.skipif(not HAVE_COMPOSE, reason="docker compose is not installed")
+def test_extra_compose_files_are_layered_on(client, project):
+    Path(project, "docker").mkdir()
+    commit_file(project, "docker/override.yml", "services:\n  web:\n    environment:\n      - EXTRA=from-override\n", "override")
+    enable(client)
+    assert client.post("/api/repo/mine/stack/settings", json={"extra_files": ["docker/override.yml"]}).get_json()["ok"]
+    meta = stacks.prepare(registry.get_repo("mine"))
+    assert meta["extra_files"] == ["docker/override.yml"]
+    model = json.loads((config.CONFIG_PATH.parent / "stacks" / "mine" / "main" / "compose.json").read_text())
+    assert model["services"]["web"]["environment"]["EXTRA"] == "from-override"
+    client.post("/api/repo/mine/stack/settings", json={"extra_files": ["../outside.yml"]})
+    with pytest.raises(stacks.StackError, match="not found in the project"):
+        stacks.prepare(registry.get_repo("mine"))

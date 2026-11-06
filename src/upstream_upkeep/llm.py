@@ -137,12 +137,18 @@ def _component_facts(repo: dict) -> list[str]:
         elif s["status"] in ("not_checked_out", "not_fetched", "error"):
             out.append(head + f" - {s['detail']}")
         elif s["status"] == "up_to_date":
-            out.append(head + f" branch {s['branch']}: pinned {s['pin'][:8]}, up to date with upstream")
+            rel = (f"up to date with the latest release {s['release']}"
+                   + (f" ({s['unreleased']} unreleased commit(s) upstream after it)" if s.get("unreleased") else "")) \
+                if s.get("release") else "up to date with upstream"
+            out.append(head + f" branch {s['branch']}: pinned {s.get('pin_tag') or s['pin'][:8]}, {rel}")
         else:
-            out.append(head + f" branch {s['branch']}: pinned {s['pin'][:8]}, {s['behind']} commit(s) BEHIND upstream "
+            target = f"the release {s['release']}" if s.get("release") else "upstream"
+            out.append(head + f" branch {s['branch']}: pinned {s.get('pin_tag') or s['pin'][:8]}, {s['behind']} commit(s) BEHIND {target} "
                        f"{(s.get('upstream') or '')[:8]}"
                        + (f"; WARNING: the pin also has {s['local']} commit(s) of the user's own that are not upstream"
                           if s["local"] else "; no local changes in the pin, so it can move straight to upstream"))
+            if s.get("suggest_releases"):
+                out.append("    NOTE: " + s["suggest_releases"])
             if s["missing"]:
                 out.append("    example upstream changes not in the pin: " + "; ".join(m["subject"] for m in s["missing"][:3]))
             if s["watched_changes"]:

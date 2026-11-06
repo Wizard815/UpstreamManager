@@ -190,3 +190,20 @@ def test_agent_requests_are_marked_and_user_only_things_refused(client, conflict
         mcp_server._call("POST", "/api/repo/mine/stack/settings", {"enabled": True})
     names = [t.name for t in _run(lambda c: c.list_tools()).tools]
     assert {"stack_up", "stack_request", "stack_exec", "components_status", "read_chat", "post_chat_note"} <= set(names)
+
+
+def test_mcp_tool_parameters_cover_every_editable_setting():
+    """A setting the API accepts but a tool can't send is dropped silently: keep them in step."""
+    from upstream_upkeep import components
+    tools = {t.name: t for t in _run(lambda c: c.list_tools()).tools}
+    params = set(tools["set_component"].input_schema["properties"])
+    assert set(components._EDITABLE) <= params, set(components._EDITABLE) - params
+
+
+def test_stack_set_merges_env_and_null_removes(client, conflicted, monkeypatch):
+    _route_to(client, monkeypatch)
+    _run(lambda c: c.call_tool("stack_set", {"repo": "mine", "env": {"A": "1", "B": "2"}}))
+    _run(lambda c: c.call_tool("stack_set", {"repo": "mine", "env": {"B": None, "C": "3"}}))
+    assert registry.get_repo("mine")["stack"]["env"] == {"A": "1", "C": "3"}
+    client.post("/api/repo/mine/stack/settings", json={"env": {"X": None, "Y": "y"}})
+    assert registry.get_repo("mine")["stack"]["env"] == {"Y": "y"}

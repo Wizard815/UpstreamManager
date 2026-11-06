@@ -579,18 +579,21 @@ async function renderComponents(wrap, repoId) {
     const branchIn = el("input", { value: c.branch && c.status !== "not_fetched" ? c.branch : "", placeholder: "default branch", "aria-label": `${c.name} branch`, style: "width:150px" })
     const watchIn = el("input", { value: (c.watch_paths || []).join(", "), placeholder: "watched paths, comma separated", "aria-label": `${c.name} watched paths`, style: "width:320px" })
     const hintIn = el("input", { value: c.after_update || "", placeholder: "command to run after bumping (shown, never run)", "aria-label": `${c.name} follow-up command`, style: "width:360px" })
+    const followIn = el("select", { "aria-label": `${c.name} follows` }, el("option", { value: "branch" }, "follow the branch head"), el("option", { value: "releases" }, "follow releases (tags)"))
+    followIn.value = c.follow || "branch"
     const enabledIn = el("input", { type: "checkbox", "aria-label": `Track ${c.name}` })
     enabledIn.checked = c.enabled !== false
     const saveBtn = el("button", { class: "btn ghost" }, "Save")
     saveBtn.onclick = () => busy(saveBtn, "Saving…", async () => {
       await api(apiUrl(`/api/repo/${repoId}/components/${encodeURIComponent(c.name)}`), { method: "POST", body: JSON.stringify({
-        branch: branchIn.value.trim(), watch_paths: watchIn.value, after_update: hintIn.value.trim(), enabled: enabledIn.checked }) })
+        branch: branchIn.value.trim(), watch_paths: watchIn.value, after_update: hintIn.value.trim(), enabled: enabledIn.checked, follow: followIn.value }) })
       toast(`${c.name} settings saved`, "ok")
       await renderComponents(wrap, repoId)
     })
     const status = c.status === "disabled" ? [badge("", "not tracked")]
       : ["not_checked_out", "not_fetched", "error"].includes(c.status) ? [badge(c.status === "error" ? "bad" : "warn", c.status.replace(/_/g, " "), c.detail)]
-      : [c.behind ? badge("warn", `↓ ${c.behind} behind`, "upstream commits newer than the pin") : badge("up", "up to date"),
+      : [c.behind ? badge("warn", `↓ ${c.behind} behind${c.release ? ` release ${c.release}` : ""}`, "upstream commits newer than the pin") : badge("up", c.release ? `on the latest release ${c.release}` : "up to date"),
+         c.unreleased ? badge("", `${c.unreleased} unreleased upstream`, "commits on the branch after the latest release; they are not compared") : null,
          c.local ? badge("bad", `${c.local} pinned commits not upstream`, "your own commits inside the submodule; bump needs a merge there first") : null,
          c.moved ? badge("warn", "checked out ≠ pin") : null,
          c.dirty ? badge("warn", `${c.dirty} uncommitted`) : null,
@@ -602,13 +605,17 @@ async function renderComponents(wrap, repoId) {
           c.behind ? (() => { const b = el("button", { class: "btn ghost", "aria-label": `Pull report for ${c.name}` }, "Pull report"); b.onclick = () => busy(b, "Analysing…", () => showPullReport(repoId, { component: c.name })); return b })() : null,
           c.behind ? (() => { const b = el("button", { class: "btn ghost", "aria-label": `Request update for ${c.name}` }, "Request update"); b.onclick = () => raise(b, [c.name]); return b })() : null,
           fetchBtn)),
-      el("div", { class: "muted" }, `${c.url}` + (c.pin ? ` · pinned ${c.pin.slice(0, 8)}` : "") + (c.upstream ? ` · upstream ${c.upstream.slice(0, 8)}` : "")),
+      el("div", { class: "muted" }, `${c.url}` + (c.pin ? ` · pinned ${c.pin_tag || c.pin.slice(0, 8)}` : "") + (c.upstream ? ` · ${c.release ? "release" : "upstream"} ${c.release || c.upstream.slice(0, 8)}` : "")),
+      c.suggest_releases ? el("div", { class: "row small", style: "margin-top:4px;color:var(--info)" }, c.suggest_releases,
+        el("button", { class: "btn ghost small", onclick: (e) => busy(e.currentTarget, "Saving…", async () => {
+          await api(apiUrl(`/api/repo/${repoId}/components/${encodeURIComponent(c.name)}`), { method: "POST", body: JSON.stringify({ follow: "releases" }) })
+          await renderComponents(wrap, repoId) }) }, "Follow releases")) : null,
       (c.watched_changes || []).length ? el("div", { style: "color:#e0a060;font-size:13px;margin-top:4px" },
         `Upstream changed files this repo depends on: ${c.watched_changes.slice(0, 8).join(", ")}${c.watched_changes.length > 8 ? " …" : ""}`,
         c.after_update ? el("div", {}, "After bumping, run: ", el("code", {}, c.after_update)) : null) : null,
       el("details", { style: "margin-top:6px" }, el("summary", { class: "muted" }, "Settings"),
         el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px" },
-          el("label", { class: "muted" }, enabledIn, " track"), branchIn, watchIn, hintIn, saveBtn))
+          el("label", { class: "muted" }, enabledIn, " track"), followIn, branchIn, watchIn, hintIn, saveBtn))
     ))
   }
 }
@@ -1267,7 +1274,7 @@ async function renderStack(wrap, repoId, scope = { ws: null }) {
 
   // controls
   const up = el("button", { class: "btn small", disabled: st.busy ? "" : null }, st.services.length ? "Rebuild & restart" : "Start")
-  up.onclick = () => busy(up, "Starting…", async () => { await api(apiUrl(`/api/repo/${repoId}/stack/up`), { method: "POST", body: body({}) }); toast("Starting: pulling and building can take a few minutes.", "info"); await again() })
+  up.onclick = () => busy(up, "Starting…", async () => { await api(apiUrl(`/api/repo/${repoId}/stack/up`), { method: "POST", body: body({ build: !!st.services.length }) }); toast("Starting: pulling and building can take a few minutes.", "info"); await again() })
   const down = el("button", { class: "btn ghost small", disabled: st.busy || !st.services.length ? "" : null }, "Stop")
   down.onclick = () => busy(down, "Stopping…", async () => { await api(apiUrl(`/api/repo/${repoId}/stack/down`), { method: "POST", body: body({}) }); await again() })
   const reset = el("button", { class: "btn ghost small", disabled: st.busy ? "" : null, title: "Stop and delete the demo data and generated secrets" }, "Stop & reset data")
@@ -1299,11 +1306,12 @@ async function renderStack(wrap, repoId, scope = { ws: null }) {
     Object.entries(s.env || {}).map(([k, v]) => `${k}=${v}`).join("\n"))
   const svcIn = el("input", { style: "width:100%", placeholder: "all services (or a few, comma separated; their dependencies come along)", value: (s.services || []).join(", ") })
   const profIn = el("input", { style: "width:100%", placeholder: "compose profiles, comma separated", value: (s.profiles || []).join(", ") })
+  const extraIn = el("input", { style: "width:100%", placeholder: "override files in the project, comma separated (e.g. docker/compose.proxy-ca.yml)", value: (s.extra_files || []).join(", ") })
   const save = el("button", { class: "btn ghost small" }, "Save")
   save.onclick = () => busy(save, "Saving…", async () => {
     const env = Object.fromEntries(envIn.value.split("\n").map(l => l.trim()).filter(l => l && l.includes("=")).map(l => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1)]))
     const list = (x) => x.value.split(",").map(v => v.trim()).filter(Boolean)
-    await api(apiUrl(`/api/repo/${repoId}/stack/settings`), { method: "POST", body: JSON.stringify({ env, services: list(svcIn), profiles: list(profIn) }) })
+    await api(apiUrl(`/api/repo/${repoId}/stack/settings`), { method: "POST", body: JSON.stringify({ env, services: list(svcIn), profiles: list(profIn), extra_files: list(extraIn) }) })
     toast("Saved. Restart the stack to use it.", "ok"); await again()
   })
   wrap.append(el("details", { style: "margin-top:10px" }, el("summary", {}, "Demo settings"),
@@ -1312,7 +1320,9 @@ async function renderStack(wrap, repoId, scope = { ws: null }) {
       el("label", { class: "col", style: "gap:4px" }, "Environment", envIn),
       el("label", { class: "col", style: "gap:4px" }, "Services", svcIn),
       el("label", { class: "col", style: "gap:4px" }, "Profiles", profIn),
+      el("label", { class: "col", style: "gap:4px" }, "Override files", extraIn),
       st.meta?.moved_mounts?.length ? el("div", { class: "muted small" }, `Data folders replaced by demo folders: ${[...new Set(st.meta.moved_mounts.map(m => m.from))].join(", ")}`) : null,
+      st.meta?.outside_files?.length ? el("div", { class: "small", style: "color:var(--warn)" }, `Builds read these files from outside the project: ${st.meta.outside_files.join(", ")}`) : null,
       el("div", {}, save))))
 
   if (!st.services.length) { if (st.busy) setTimeout(() => wrap.isConnected && again(), 3000); return }
