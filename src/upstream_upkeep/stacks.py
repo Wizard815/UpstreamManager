@@ -74,6 +74,7 @@ def settings(repo: dict) -> dict:
     s.setdefault("profiles", [])
     s.setdefault("env", {})
     s.setdefault("services", [])
+    s.setdefault("extra_files", [])  # overrides layered on top, e.g. docker/compose.proxy-ca.yml
     return s
 
 
@@ -139,24 +140,32 @@ def prepare(repo: dict, ws: str | None = None) -> dict:
         raise StackError("no compose file in this project (compose.yaml or docker-compose.yml)")
     root = _scope_dir(repo, ws).resolve()
     home = _home(repo, ws)
-    source = yaml.safe_load(cf.read_text()) or {}
     demo_env = home / "demo.env"
-    # env files that are not in the checkout (secrets kept outside git) -> the generated demo env
-    for svc in (source.get("services") or {}).values():
-        ef = svc.get("env_file")
-        if ef is None:
-            continue
-        items = ef if isinstance(ef, list) else [ef]
-        kept = []
-        for it in items:
-            path = it.get("path") if isinstance(it, dict) else it
-            if path and (cf.parent / path).is_file():
-                kept.append(str((cf.parent / path).resolve()))
-        svc["env_file"] = kept + [str(demo_env)]
-    src = home / "source.yml"
-    src.write_text(yaml.safe_dump(source, sort_keys=False))
+    files = [cf]
+    for extra in settings(repo)["extra_files"]:
+        p = (root / extra).resolve()
+        if root not in p.parents or not p.is_file():
+            raise StackError(f"extra compose file {extra} not found in the project")
+        files.append(p)
+    sources = []
+    for n, f in enumerate(files):
+        source = yaml.safe_load(f.read_text()) or {}
+        # env files that are not in the checkout (secrets kept outside git) -> the generated demo env
+        for svc in (source.get("services") or {}).values():
+            ef = svc.get("env_file") if isinstance(svc, dict) else None
+            if ef is None:
+                continue
+            kept = []
+            for it in (ef if isinstance(ef, list) else [ef]):
+                path = it.get("path") if isinstance(it, dict) else it
+                if path and (f.parent / path).is_file():
+                    kept.append(str((f.parent / path).resolve()))
+            svc["env_file"] = kept + [str(demo_env)]
+        src = home / f"source-{n}.yml"
+        src.write_text(yaml.safe_dump(source, sort_keys=False))
+        sources += ["-f", str(src)]
     profiles = sum((["--profile", p] for p in settings(repo)["profiles"]), [])
-    base = ["docker", "compose", "--project-directory", str(root), "-f", str(src), *profiles]
+    base = ["docker", "compose", "--project-directory", str(root), *sources, *profiles]
     generated = {}
     for _ in range(30):
         env = _env_values(repo) | generated
@@ -189,6 +198,10 @@ def prepare(repo: dict, ws: str | None = None) -> dict:
     moved = []
     for name, svc in services.items():
         svc.pop("container_name", None)
+        if svc.get("build"):
+            # Built images get the demo's own name: a demo (or workspace) build must never replace
+            # an image the real install runs, like allglance/gateway:latest.
+            svc["image"] = f"{_name(repo, ws)}-{name}:demo"
         svc["restart"] = "no"
         svc.pop("env_file", None)  # already inlined into environment by config
         ports = []
@@ -218,12 +231,17 @@ def prepare(repo: dict, ws: str | None = None) -> dict:
     for net in (model.get("networks") or {}).values():
         if isinstance(net, dict) and not net.get("external"):
             net.pop("name", None)
+    # Secret and config files outside the project (a proxy CA for builds, say): Docker's builder
+    # refuses to read those unless allowed. They are listed so the Stack tab can show them.
+    outside = sorted({str(Path(x["file"])) for kind in ("secrets", "configs") for x in (model.get(kind) or {}).values()
+                      if isinstance(x, dict) and x.get("file") and root not in Path(x["file"]).resolve().parents})
     model["name"] = _name(repo, ws)
     out = home / "compose.json"
     out.write_text(json.dumps(model, indent=1))
-    meta = {"compose_file": str(cf.relative_to(root)), "project": _name(repo, ws), "root": str(root),
+    meta = {"compose_file": str(cf.relative_to(root)), "extra_files": [str(f.relative_to(root)) for f in files[1:]],
+            "project": _name(repo, ws), "root": str(root),
             "services": sorted(services), "generated_env": sorted(generated) or sorted(repo.get("stack_generated") or {}),
-            "moved_mounts": moved}
+            "moved_mounts": moved, "outside_files": outside}
     (home / "meta.json").write_text(json.dumps(meta, indent=1))
     return meta
 
@@ -233,9 +251,12 @@ def _compose(repo: dict, ws: str | None, *args: str, timeout: int = 120) -> subp
     home = _home(repo, ws)
     if not (home / "compose.json").is_file():
         raise StackError("the stack has not been prepared yet: start it first")
-    root = json.loads((home / "meta.json").read_text())["root"]
+    meta = json.loads((home / "meta.json").read_text())
+    root = meta["root"]
+    # Builds may read the listed outside files (meta["outside_files"]); nothing else changes.
+    env = {"BUILDX_BAKE_ENTITLEMENTS_FS": "0"} if meta.get("outside_files") else None
     return _run(["docker", "compose", "-p", _name(repo, ws), "--project-directory", root, "-f", str(home / "compose.json"), *args],
-                cwd=root, timeout=timeout)
+                cwd=root, env=env, timeout=timeout)
 
 
 def _check_enabled(repo: dict) -> None:
@@ -247,8 +268,10 @@ def _lock(key: str) -> threading.Lock:
     return _locks.setdefault(key, threading.Lock())
 
 
-def up(repo: dict, ws: str | None = None, build: bool = True) -> dict:
-    """Prepare and start the stack in the background. Progress goes to the stack's op log."""
+def up(repo: dict, ws: str | None = None, build: bool = False) -> dict:
+    """Prepare and start the stack in the background. Progress goes to the stack's op log.
+
+    Images that are missing are built either way; build=True rebuilds them (after changing code)."""
     _check_enabled(repo)
     ok, msg = docker_ok()
     if not ok:
@@ -259,15 +282,24 @@ def up(repo: dict, ws: str | None = None, build: bool = True) -> dict:
     if not lock.acquire(blocking=False):
         raise StackError("this stack is already starting or stopping")
     log = home / "op.log"
-    log.write_text(f"{config.now_iso()} starting {meta['project']} ({', '.join(meta['services'])})\n")
+    with log.open("a") as f:  # keep earlier runs: the reason a previous start failed matters
+        f.write(f"\n{config.now_iso()} starting {meta['project']} ({', '.join(meta['services'])})\n")
 
     def run():
         try:
-            res = _compose(repo, ws, "up", "-d", *(["--build"] if build else []), "--wait", "--wait-timeout", "300",
-                           timeout=1500)
-            with log.open("a") as f:
-                f.write((res.stdout or "") + (res.stderr or ""))
-                f.write(f"\n{config.now_iso()} {'started' if res.returncode == 0 else 'FAILED (exit %d)' % res.returncode}\n")
+            for attempt in range(3):
+                res = _compose(repo, ws, "up", "-d", *(["--build"] if build else []), "--wait", "--wait-timeout", "300",
+                               timeout=1500)
+                out = (res.stdout or "") + (res.stderr or "")
+                with log.open("a") as f:
+                    f.write(out)
+                    f.write(f"\n{config.now_iso()} {'started' if res.returncode == 0 else 'FAILED (exit %d)' % res.returncode}\n")
+                # A registry saying "too many requests" is temporary (Docker Hub limits anonymous pulls).
+                if res.returncode == 0 or "429 Too Many Requests" not in out or attempt == 2:
+                    break
+                with log.open("a") as f:
+                    f.write(f"{config.now_iso()} the registry is rate limiting; trying again in {30 * (attempt + 1)}s\n")
+                time.sleep(30 * (attempt + 1))
         finally:
             lock.release()
     threading.Thread(target=run, daemon=True).start()

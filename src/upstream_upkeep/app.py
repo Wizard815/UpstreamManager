@@ -570,7 +570,7 @@ def api_stack_settings(repo_id):
         s["enabled"] = bool(data["enabled"])
     if "compose_file" in data:
         s["compose_file"] = str(data["compose_file"] or "").strip()
-    for key in ("profiles", "services"):
+    for key in ("profiles", "services", "extra_files"):
         if key in data:
             if not (isinstance(data[key], list) and all(isinstance(x, str) for x in data[key])):
                 return jsonify({"ok": False, "error": f"{key} must be a list of names"}), 400
@@ -578,7 +578,9 @@ def api_stack_settings(repo_id):
     if "env" in data:
         if not isinstance(data["env"], dict):
             return jsonify({"ok": False, "error": "env must be an object"}), 400
-        s["env"] = {str(k): str(v) for k, v in data["env"].items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(k))}
+        # replaces the whole set; a null value leaves that name out (it is never saved as "None")
+        s["env"] = {str(k): str(v) for k, v in data["env"].items()
+                    if v is not None and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(k))}
     with store.lock:
         repo["stack"] = s
         store.save_repo(repo)
@@ -588,7 +590,7 @@ def api_stack_settings(repo_id):
 @flask_app.route("/api/repo/<repo_id>/stack/up", methods=["POST"])
 def api_stack_up(repo_id):
     data = request.get_json(silent=True) or {}
-    return _stack_call(repo_id, lambda repo: stacks.up(repo, data.get("ws") or None, build=data.get("build", True) is not False))
+    return _stack_call(repo_id, lambda repo: stacks.up(repo, data.get("ws") or None, build=bool(data.get("build"))))
 
 
 @flask_app.route("/api/repo/<repo_id>/stack/down", methods=["POST"])

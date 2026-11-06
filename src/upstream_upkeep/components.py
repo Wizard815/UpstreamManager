@@ -19,12 +19,16 @@ watch_paths, after_update. Everything else is re-read from git every time.
 """
 from __future__ import annotations
 
+import re
+
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import gitops
 
-_EDITABLE = ("enabled", "branch", "watch_paths", "after_update")
+# Without a tag_pattern, a release is a plain version (v2.8.0, 3.6.0): not "vue3", not v1.0.0-rc.1.
+_RELEASE = re.compile(r"^v?\d+(\.\d+){1,3}$")
+_EDITABLE = ("enabled", "branch", "watch_paths", "after_update", "follow", "tag_pattern")
 
 
 def _git(cwd, *args):
@@ -68,6 +72,8 @@ def sync(repo: dict) -> list[dict]:
             "branch": prev.get("branch") or c.get("branch") or "",
             "watch_paths": prev.get("watch_paths") or [],
             "after_update": prev.get("after_update") or "",
+            "follow": prev.get("follow") or "branch",
+            "tag_pattern": prev.get("tag_pattern") or "",
         })
     return merged
 
@@ -81,6 +87,8 @@ def update_settings(comp: dict, patch: dict) -> dict:
             v = [p.strip().strip("/") for p in (v if isinstance(v, list) else str(v).split(",")) if p.strip()]
         elif k == "enabled":
             v = bool(v)
+        elif k == "follow":
+            v = "releases" if v == "releases" else "branch"
         else:
             v = str(v or "").strip()
         comp[k] = v
@@ -129,7 +137,7 @@ def fetch(repo_path: str, comp: dict) -> tuple[bool, str]:
         if res.returncode != 0:
             return False, (res.stderr or res.stdout).strip()
     sub = _sub(repo_path, comp)
-    res = _git(sub, "fetch", "--prune", "origin")
+    res = _git(sub, "fetch", "--prune", "--tags", "origin")
     if res.returncode != 0:
         return False, (res.stderr or res.stdout).strip()
     if not comp.get("branch"):
@@ -168,8 +176,26 @@ def compare(repo_path: str, comp: dict, do_fetch: bool = False, light: bool = Fa
     if not gitops.ref_exists(sub, ref) or not gitops.ref_exists(sub, out["pin"]):
         out.update(status="not_fetched", detail=f"origin/{br} not fetched yet - press Fetch")
         return out
+    out["follow"] = comp.get("follow") or "branch"
+    out["pin_tag"] = _out(sub, "describe", "--tags", "--exact-match", out["pin"])
+    if out["follow"] == "releases":
+        # Compare against the newest release on the branch, not its head: hubs that run
+        # release images (one tag per pin) must only move to commits that were released.
+        pattern = comp.get("tag_pattern") or "*"
+        tags = [t for t in (_out(sub, "tag", "--merged", ref, "--sort=-v:refname", "--list", pattern) or "").split()
+                if comp.get("tag_pattern") or _RELEASE.match(t)]
+        if not tags:
+            out["detail"] = (f"no release tags {'matching ' + pattern if comp.get('tag_pattern') else '(like v1.2.3)'} "
+                             f"on origin/{br}: comparing with the branch")
+        else:
+            out["release"] = tags[0]
+            out["unreleased"] = gitops.behind_ahead(sub, f"{tags[0]}^{{commit}}", ref)[0]
+            ref = f"refs/tags/{tags[0]}^{{commit}}"
     out["upstream"] = gitops.short_sha(sub, ref)
     out["behind"], out["local"] = gitops.behind_ahead(sub, out["pin"], ref)
+    if out["follow"] == "branch" and out["behind"] and out["pin_tag"]:
+        out["suggest_releases"] = (f"The pin is the release {out['pin_tag']} and the {out['behind']} newer commits are not released yet. "
+                                   "If this hub runs release images, set it to follow releases.")
     if out["behind"]:
         # Real changes, not "Merge pull request ..." lines, which say little.
         if not light:
@@ -248,14 +274,15 @@ def bump(repo: dict, names: list[str], focus: str) -> dict:
         elif st["moved"]:
             results.append({"name": name, "ok": False, "detail": "the submodule is checked out at a different commit than the pin"})
         else:
-            target = gitops.short_sha(sub, f"refs/remotes/origin/{st['branch']}")
+            target = st["upstream"]  # the branch head, or the newest release when following releases
             res = _git(sub, "checkout", "-q", "--detach", target)
             if res.returncode != 0:
                 results.append({"name": name, "ok": False, "detail": (res.stderr or res.stdout).strip()})
                 continue
             moved.append((comp, st["pin"], target, st["behind"]))
             results.append({"name": name, "ok": True, "from": st["pin"][:10], "to": target[:10], "behind": st["behind"],
-                            "detail": f"{st['pin'][:8]} -> {target[:8]} ({st['behind']} commits)",
+                            "detail": f"{st.get('pin_tag') or st['pin'][:8]} -> {st.get('release') or target[:8]} ({st['behind']} commits)",
+                            "release": st.get("release"),
                             "watched_changes": st["watched_changes"],
                             "after_update": comp.get("after_update") if st["watched_changes"] else ""})
     if not moved:

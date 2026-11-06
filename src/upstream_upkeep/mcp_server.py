@@ -257,11 +257,15 @@ def request_component_update(repo: str, names: list[str] | None = None) -> dict:
 
 @server.tool(annotations=WRITE)
 def set_component(repo: str, name: str, enabled: bool | None = None, branch: str | None = None,
-                  watch_paths: list[str] | None = None, after_update: str | None = None) -> dict:
+                  watch_paths: list[str] | None = None, after_update: str | None = None,
+                  follow: str | None = None, tag_pattern: str | None = None) -> dict:
     """Change one submodule's settings: compare it or not, its upstream branch, the paths to watch
-    (git pathspecs) and the command to suggest after a bump (never run for you)."""
+    (git pathspecs), the command to suggest after a bump (never run for you), and what it follows:
+    "branch" (the branch head) or "releases" (the newest tag matching tag_pattern, default v*) for
+    hubs that run release images pinned to each submodule's release."""
     patch = {k: v for k, v in {"enabled": enabled, "branch": branch, "watch_paths": watch_paths,
-                               "after_update": after_update}.items() if v is not None}
+                               "after_update": after_update, "follow": follow, "tag_pattern": tag_pattern}.items()
+             if v is not None}
     return _call("POST", _r(repo) + f"/components/{quote(name, safe='/')}", patch)["item"]
 
 
@@ -336,18 +340,24 @@ def stack_status(repo: str, workspace: str = "") -> dict:
 
 @server.tool(annotations=WRITE)
 def stack_set(repo: str, env: dict | None = None, services: list[str] | None = None, profiles: list[str] | None = None,
-              compose_file: str | None = None) -> dict:
-    """Tune the demo stack: extra env values, only some services (their dependencies come along),
-    compose profiles, or another compose file. Turning stacks on is the user's."""
-    patch = {k: v for k, v in {"env": env, "services": services, "profiles": profiles, "compose_file": compose_file}.items()
-             if v is not None}
+              compose_file: str | None = None, extra_files: list[str] | None = None) -> dict:
+    """Tune the demo stack: env values (merged into those already set; null removes one), only some
+    services (their dependencies come along),
+    compose profiles, another compose file, or override files layered on top (paths in the project,
+    e.g. one that passes a proxy CA to builds). Turning stacks on is the user's."""
+    if env is not None:  # merge into what is set; a null value removes that name
+        current = _stack(repo, "").get("settings", {}).get("env", {})
+        env = {k: v for k, v in {**current, **env}.items() if v is not None}
+    patch = {k: v for k, v in {"env": env, "services": services, "profiles": profiles, "compose_file": compose_file,
+                               "extra_files": extra_files}.items() if v is not None}
     return _call("POST", _r(repo) + "/stack/settings", patch)["settings"]
 
 
 @server.tool(annotations=WRITE)
-def stack_up(repo: str, workspace: str = "", build: bool = True, wait_seconds: int = 240) -> dict:
-    """Start the isolated demo stack of the repo or of a merge workspace (to test your change), building
-    images the compose file builds. Waits up to `wait_seconds` for it to be up, then returns its status."""
+def stack_up(repo: str, workspace: str = "", build: bool = False, wait_seconds: int = 240) -> dict:
+    """Start the isolated demo stack of the repo or of a merge workspace (to test your change). Images
+    it builds are built when missing; build=True rebuilds them, after you changed their code. Waits up
+    to `wait_seconds` for it to be up, then returns its status (op_log says why if it failed)."""
     import time
     _call("POST", _r(repo) + "/stack/up", {"ws": workspace or None, "build": build})
     deadline = time.time() + max(0, min(wait_seconds, 1200))
