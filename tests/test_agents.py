@@ -207,3 +207,50 @@ def test_stack_set_merges_env_and_null_removes(client, conflicted, monkeypatch):
     assert registry.get_repo("mine")["stack"]["env"] == {"A": "1", "C": "3"}
     client.post("/api/repo/mine/stack/settings", json={"env": {"X": None, "Y": "y"}})
     assert registry.get_repo("mine")["stack"]["env"] == {"Y": "y"}
+
+
+def test_mcp_every_parameter_is_described_and_unknown_ones_are_refused():
+    tools = _run(lambda c: c.list_tools()).tools
+    bare = [f"{t.name}.{k}" for t in tools for k, p in (t.input_schema.get("properties") or {}).items() if not p.get("description")]
+    assert bare == []
+    assert all(t.input_schema.get("additionalProperties") is False for t in tools)
+    res = _run(lambda c: c.call_tool("repo_briefing", {"repo": "mine", "repoo": "x"}))
+    assert res.is_error and "does not take repoo" in res.content[0].text
+
+
+def test_mcp_bad_arguments_never_reach_the_app(monkeypatch):
+    """A view typo used to read as "all" (the app's default) and return the whole history as if it were
+    what the upstream brings; an empty workspace name built DELETE .../workspaces/; limit -1 sliced off a day."""
+    calls = []
+    monkeypatch.setattr(mcp_server.requests, "request", lambda *a, **k: calls.append(a) or pytest.fail("reached the app"))
+    bad = [
+        ("list_commits", {"repo": "mine", "view": "behnd"}),
+        ("list_commits", {"repo": "mine", "limit": 0}),
+        ("day_logs", {"repo": "mine", "limit": -1}),
+        ("repo_briefing", {"repo": ""}),
+        ("discard_merge_workspace", {"repo": "mine", "name": ""}),
+        ("add_note", {"repo": "mine", "text": "   "}),
+        ("submit_merge_workspace", {"repo": "mine", "name": "w", "summary": ""}),
+        ("set_component", {"repo": "mine", "name": "sub", "follow": "release"}),
+        ("stack_request", {"repo": "mine", "service": "web", "method": "GTE"}),
+        ("stack_request", {"repo": "mine", "service": "web", "path": "health"}),
+        ("stack_exec", {"repo": "mine", "service": "web", "command": "ls", "timeout": 0}),
+    ]
+    for name, args in bad:
+        res = _run(lambda c, name=name, args=args: c.call_tool(name, args))
+        assert res.is_error, (name, args)
+    assert calls == []
+
+
+def test_mcp_deletes_and_demo_commands_are_marked_destructive():
+    tools = {t.name: t for t in _run(lambda c: c.list_tools()).tools}
+    for name in ("discard_merge_workspace", "stack_down", "stack_exec", "stack_request"):
+        assert tools[name].annotations.destructive_hint is True, name
+    assert tools["list_commits"].annotations.read_only_hint is True
+
+
+def test_mcp_stack_request_method_is_case_insensitive(client, conflicted, monkeypatch):
+    sent = {}
+    monkeypatch.setattr(mcp_server, "_call", lambda method, path, body=None, **p: sent.update(body or {}) or {})
+    _run(lambda c: c.call_tool("stack_request", {"repo": "mine", "service": "web", "method": "post"}))
+    assert sent["method"] == "POST"
