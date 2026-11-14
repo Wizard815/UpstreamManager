@@ -103,11 +103,12 @@ async function refreshPendingCount() {
 async function refreshModelStatus() {
   const box = $("#model-status")
   try {
-    const s = await api(apiUrl('/api/settings'))
-    const ok = !!(s.llm?.base_url && s.llm?.model)
+    const s = await api(apiUrl('/api/llm/status'))
+    const ok = s.up && !!s.model
     box.className = `status-dot ${ok ? "ok" : "bad"}`
-    box.lastChild.textContent = ok ? `Model: ${s.llm.model}` : "No model set"
-    box.title = ok ? s.llm.base_url : "Set the model connection in Settings"
+    box.lastChild.textContent = !s.base_url ? "No model set" : !s.up ? "Model server down" : s.model ? `Model: ${s.model}` : "No model chosen"
+    const others = Object.entries(s.servers || {}).filter(([u]) => u !== s.base_url).map(([u, v]) => `${u}: ${v.up ? "up" : "down"}`)
+    box.title = s.base_url ? `${s.base_url}${s.up && s.model && !s.serves_model ? " (doesn't list this model)" : ""}${others.length ? "\n" + others.join("\n") : ""}` : "Set the model connection in Settings"
   } catch { box.className = "status-dot" }
 }
 
@@ -1734,7 +1735,15 @@ async function renderMemory(wrap, repoId) {
     await load()
   })
   head.append(el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" }, logBtn, cleanBtn, idxBtn))
-  wrap.append(head, statusEl,
+  const wikiBox = el("div")
+  api(apiUrl(`/api/repo/${repoId}/wiki`)).then(r => {
+    if (!r.notes?.length) return
+    wikiBox.append(el("details", { style: "margin:8px 0" }, el("summary", {}, `Your LLM wiki says (${r.notes.length} note${r.notes.length > 1 ? "s" : ""})`),
+      ...r.notes.map(n => el("div", { class: "mem" }, el("span", { class: `badge ${n.status === "draft" ? "warn" : "info"}` }, n.status || "note"),
+        el("div", { style: "flex:1;min-width:0" }, el("strong", {}, n.note), el("div", { class: "muted small mono" }, n.path),
+          ...n.lines.map(l => el("div", { style: "overflow-wrap:anywhere" }, l)))))))
+  }).catch(() => {})
+  wrap.append(head, wikiBox, statusEl,
     el("div", { style: "display:flex;gap:6px;margin-top:8px" }, qIn, scopeSel, kindSel),
     el("div", { style: "display:flex;gap:6px;margin-top:6px" }, noteIn, noteBtn),
     list)
@@ -1846,6 +1855,16 @@ async function renderSettings() {
     const urlIn = el("input", { value: llm.base_url || "http://127.0.0.1:8080/v1", placeholder: "http://host:8080/v1", style: "width:420px" })
     // The server only ever sends a masked key ("••••1234"); sending it back unchanged keeps the saved key.
     const keyIn = el("input", { value: llm.api_key || "", type: "password", autocomplete: "off", placeholder: "optional", style: "width:320px" })
+    const fallIn = el("textarea", { rows: "3", style: "width:420px;max-width:100%;font:12px var(--mono)", placeholder: "http://host:8001/v1\nhttp://host:8002/v1",
+      "aria-label": "Fallback server URLs" }, (llm.fallback_urls || []).join("\n"))
+    const liveEl = el("div", { class: "muted small" })
+    const showLive = async (refresh) => {
+      const s = await api(apiUrl(`/api/llm/status${refresh ? "?refresh=1" : ""}`)).catch(() => null)
+      if (!s) return
+      liveEl.replaceChildren(...Object.entries(s.servers || {}).map(([u, v]) => el("div", {},
+        badge(v.up ? (u === s.base_url ? "up" : "") : "bad", u === s.base_url ? "in use" : v.up ? "up" : "down"), ` ${u}`,
+        v.up ? el("span", { class: "muted" }, ` · ${v.models.length} model(s)${s.model && v.models.includes(s.model) ? `, serves ${s.model}` : ""}`) : "")))
+    }
     const modelSel = el("select", { style: "width:420px" })
     const modelStatus = el("div", { class: "muted" }, "")
     const loadModels = async () => {
@@ -1865,21 +1884,26 @@ async function renderSettings() {
     refreshBtn.onclick = () => busy(refreshBtn, "Loading…", loadModels)
     const saveBtn = el("button", { class: "btn" }, "Save")
     saveBtn.onclick = () => busy(saveBtn, "Saving…", async () => {
-      const res = await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ llm: { model: modelSel.value, base_url: urlIn.value.trim(), api_key: keyIn.value } }) })
+      const fallback_urls = fallIn.value.split("\n").map(u => u.trim()).filter(Boolean)
+      const res = await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ llm: { model: modelSel.value, base_url: urlIn.value.trim(), api_key: keyIn.value, fallback_urls } }) })
       keyIn.value = res.settings?.llm?.api_key || ""
       toast("Model connection saved", "ok")
+      await showLive(true); refreshModelStatus()
     })
     card.append(
       el("div", { style: "display:flex;flex-direction:column;gap:12px" },
         el("div", { class: "muted" }, "Any OpenAI-compatible server (llama-swap, llama-server, Argos). Independent of hermes-agent."),
         el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Server URL", urlIn),
         el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "API key", keyIn),
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Fallback URLs (one per line; used when the server above is down, e.g. on-demand llama.cpp ports)", fallIn),
+        liveEl,
         el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Model", modelSel),
         modelStatus,
         el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, refreshBtn, saveBtn)
       )
     )
     loadModels()
+    showLive(false)
     // Accounts: GitHub token and Docker Hub login, stored in the OS keychain
     // (or env vars / a private file on servers), never shown again in full.
     const accounts = await api(apiUrl('/api/credentials'))
@@ -1941,7 +1965,50 @@ async function renderSettings() {
         el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Automatic cleanup", cleanSel),
         memStatus, memSave))
     card.append(await agentSetup())
+    card.append(await wikiSetup())
   } catch (e) { card.replaceChildren(el("p", { class: "muted" }, `Could not load settings: ${e.message}`)) }
+}
+
+// The LLM wiki (an Obsidian vault kept by agents): read wiki/, write today's daily note. See wiki.py.
+async function wikiSetup() {
+  const box = el("div")
+  let st
+  try { st = await api(apiUrl("/api/wiki")) } catch (e) { box.append(el("p", { class: "muted" }, `LLM wiki settings unavailable: ${e.message}`)); return box }
+  const on = el("input", { type: "checkbox", style: "height:auto" }); on.checked = st.enabled
+  const mode = el("select", { "aria-label": "How to reach the vault" }, el("option", { value: "folder" }, "A folder on this machine"), el("option", { value: "rest" }, "Obsidian Local REST API"))
+  mode.value = st.mode
+  const path = el("input", { value: st.path || "", placeholder: "/path/to/LLMWIKI (the vault folder)", style: "width:100%" })
+  const url = el("input", { value: st.url || "", placeholder: "http://192.168.20.5:27123", style: "width:100%" })
+  const key = el("input", { type: "password", placeholder: st.key_set ? "•••• saved (type to replace)" : "the plugin's API key", style: "width:100%", autocomplete: "off" })
+  const pub = el("input", { type: "checkbox", style: "height:auto" }); pub.checked = st.publish
+  const read = el("input", { type: "checkbox", style: "height:auto" }); read.checked = st.read
+  const pathRow = el("label", { class: "col", style: "gap:4px" }, "Vault folder", path)
+  const restRows = el("div", { class: "col" }, el("label", { class: "col", style: "gap:4px" }, "REST API URL", url),
+    el("label", { class: "col", style: "gap:4px" }, "API key (kept with your accounts, never shown again)", key))
+  const sync = () => { pathRow.hidden = mode.value !== "folder"; restRows.hidden = mode.value !== "rest" }
+  mode.onchange = sync; sync()
+  const state = el("div", { class: "small", style: `color:${st.ok ? "var(--good)" : st.enabled ? "var(--bad)" : "var(--muted)"}` },
+    !st.enabled ? "Off." : st.ok ? `Connected: ${st.notes} long-term notes; today's note is ${st.today}.` : `Not connected: ${st.error}`)
+  const save = el("button", { class: "btn" }, "Save")
+  save.onclick = () => busy(save, "Saving…", async () => {
+    if (key.value.trim()) await api(apiUrl("/api/credentials"), { method: "POST", body: JSON.stringify({ wiki_api_key: key.value.trim() }) })
+    const r = await api(apiUrl("/api/wiki/settings"), { method: "POST", body: JSON.stringify({ enabled: on.checked, mode: mode.value, path: path.value, url: url.value, publish: pub.checked, read: read.checked }) })
+    toast(r.ok || !r.enabled ? "Saved" : `Saved, but: ${r.error}`, r.ok || !r.enabled ? "ok" : "error")
+    box.replaceWith(await wikiSetup())
+  })
+  const now = el("button", { class: "btn ghost", disabled: st.ok ? null : "" }, "Write today's section now")
+  now.onclick = () => busy(now, "Writing…", async () => {
+    const r = await api(apiUrl("/api/wiki/publish"), { method: "POST", body: "{}" })
+    toast(r.written ? `Wrote ${r.lines} line(s) to ${r.path}` : (r.detail || r.error || "nothing written"), r.ok ? "ok" : "error")
+  })
+  box.append(el("h4", { style: "margin-top:20px" }, "LLM wiki"),
+    el("div", { class: "muted" }, "Your agent-kept Obsidian vault (like LLMWIKI). Upstream Manager reads only its long-term notes (wiki/), to tell chats and coding agents what you wrote about each repo, and writes only its own section of today's daily note (merges, requests, agent notes, day logs), which your Rollover/Ingest then files. It never writes to wiki/ or raw/, never edits a rolled-over note, and redacts anything that looks like a secret."),
+    el("div", { class: "col", style: "margin-top:8px" },
+      el("label", { class: "row" }, on, "Use the LLM wiki"), el("label", { class: "col", style: "gap:4px" }, "Reach it through", mode), pathRow, restRows,
+      el("label", { class: "row" }, read, "Give chats and agents what wiki/ says about a repo"),
+      el("label", { class: "row" }, pub, "Write Upstream Manager's section of today's daily note"),
+      state, el("div", { class: "row" }, save, now)))
+  return box
 }
 
 // Coding agents connect to Upstream Manager as an MCP server (mcp_server.py).

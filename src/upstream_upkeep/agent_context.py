@@ -72,6 +72,10 @@ def briefing(repo: dict) -> str:
         lines += [f"- {w['name']} at {w['path']}: {w.get('next_step') or w.get('error')}" for w in ws]
         lines.append("")
     lines += _stack_lines(repo)
+    from . import wiki
+    noted = wiki.about_text(repo)
+    if noted:
+        lines += ["## The user's LLM wiki says", noted, ""]
     chats = [c for c in store.all_sessions() if c["repo_id"] == repo["id"]][:5]
     if chats:
         lines.append("## Recent chats (read one with read_chat)")

@@ -412,6 +412,21 @@ def post_chat_note(
     return "posted"
 
 
+# ------------------------------------------------------------------ the user's LLM wiki
+@server.tool(annotations=READ)
+def wiki_notes(repo: Repo) -> dict:
+    """What the user's LLM wiki (an Obsidian vault) says about a repo in its long-term notes (wiki/):
+    each note's name, its quality status (draft = unverified) and the lines that mention the repo."""
+    return _call("GET", _r(repo) + "/wiki")
+
+
+@server.tool(annotations=WRITE)
+def wiki_publish_today() -> dict:
+    """Write Upstream Manager's section (merges, requests, agent notes, day logs) into today's daily
+    note of the user's LLM wiki. Only the short-term daily/ tier is ever written."""
+    return _call("POST", "/api/wiki/publish", {})
+
+
 # ------------------------------------------------------------------ demo stacks
 def _stack(repo: str, workspace: str) -> dict:
     return _call("GET", _r(repo) + "/stack", ws=workspace)

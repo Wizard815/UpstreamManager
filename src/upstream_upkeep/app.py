@@ -35,7 +35,7 @@ from urllib.parse import urlparse
 from flask import Flask, jsonify, request, render_template_string, abort
 
 from . import (actions, agent_context, components, config, credentials, daily_check, edits, github, gitops, memory,
-               pull_report, registry, stacks, store, upstream_check, workflows, workspaces)
+               pull_report, registry, stacks, store, upstream_check, wiki, workflows, workspaces)
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -532,6 +532,55 @@ def api_request_pull(repo_id, name):
                        "reason": f"pull the clean part: {behind} commit(s) up to {target[:10]} (merges without conflicts)"}],
     })
     return jsonify({"ok": True, "request": store.snapshot(rec)})
+
+
+# ------------------------------------------------------- the LLM wiki (wiki.py)
+@flask_app.route("/api/wiki")
+def api_wiki():
+    return jsonify(wiki.status())
+
+
+@flask_app.route("/api/wiki/settings", methods=["POST"])
+def api_wiki_settings():
+    """{enabled, mode: folder|rest, path, url, publish, read}. The API key is saved under Accounts."""
+    if (refused := _user_only("Connecting the LLM wiki")):
+        return refused
+    data = request.get_json(force=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "send an object"}), 400
+    s = wiki.settings()
+    for k in ("enabled", "publish", "read"):
+        if k in data:
+            s[k] = bool(data[k])
+    if "mode" in data:
+        s["mode"] = "rest" if data["mode"] == "rest" else "folder"
+    for k in ("path", "url"):
+        if k in data:
+            s[k] = str(data[k] or "").strip()
+    save_settings({"wiki": s})
+    wiki._CACHE.clear()
+    return jsonify({"ok": True, **wiki.status()})
+
+
+@flask_app.route("/api/wiki/publish", methods=["POST"])
+def api_wiki_publish():
+    """Write Upstream Manager's section of today's daily note now."""
+    try:
+        return jsonify(wiki.publish())
+    except wiki.WikiError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@flask_app.route("/api/repo/<repo_id>/wiki")
+def api_repo_wiki(repo_id):
+    """What the vault's long-term notes (wiki/) say about this repo."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    try:
+        return jsonify({"ok": True, "notes": wiki.about(repo)})
+    except wiki.WikiError as e:
+        return jsonify({"ok": False, "error": str(e), "notes": []})
 
 
 # ------------------------------------------------------- demo stacks (stacks.py)
@@ -1100,6 +1149,7 @@ def api_run_daily():
     for r in results:
         _remember_daily(r)
     memory.write_due_logs_soon()  # log any finished day that has no log yet
+    threading.Thread(target=wiki.publish_quietly, daemon=True).start()
     return jsonify({"ok": True, "results": results})
 
 
@@ -1512,6 +1562,22 @@ def _branches(repo: dict):
     except gitops.GitError:
         return jsonify({"branches": []})
     return jsonify({"branches": [l.strip() for l in out.splitlines() if l.strip()]})
+
+
+@flask_app.route("/api/llm/status")
+def api_llm_status():
+    """Which server the app talks to now (with fallbacks: the first that is up and serves the model)."""
+    from . import llm
+    if request.args.get("refresh"):
+        llm._picked["at"] = 0
+    cfg = llm.config()
+    servers = cfg.get("servers") or {}
+    if not servers and cfg["base_url"]:
+        ids, err = llm.list_models(cfg["base_url"], cfg["api_key"], timeout=4)
+        servers = {cfg["base_url"]: {"up": not err, "models": ids[:30], "error": err}}
+    live = servers.get(cfg["base_url"], {})
+    return jsonify({"base_url": cfg["base_url"], "model": cfg["model"], "up": bool(live.get("up")),
+                    "serves_model": cfg["model"] in (live.get("models") or []), "servers": servers})
 
 
 @flask_app.route("/api/models")

@@ -442,6 +442,8 @@ def write_day_log(repo_id: str, day: str | None = None) -> dict:
         db.commit()
     # Link the log to everything the day's material mentions, not only what the summary kept.
     item = remember(repo_id, f"Log for {day}:\n\n{summary}", kind="daylog", day=day, link=refs(material))
+    from . import wiki
+    wiki.publish_quietly()  # the vault's daily note gets the new log (short-term tier only)
     return {"ok": True, "day": day, "sources": count, "item": item[0] if item else None}
 
 
