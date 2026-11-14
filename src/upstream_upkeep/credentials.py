@@ -24,8 +24,9 @@ FIELDS = {
     "github_token": "UPSTREAM_GITHUB_TOKEN",
     "dockerhub_username": "UPSTREAM_DOCKERHUB_USERNAME",
     "dockerhub_token": "UPSTREAM_DOCKERHUB_TOKEN",
+    "wiki_api_key": "UPSTREAM_WIKI_API_KEY",  # the vault's Obsidian Local REST API key
 }
-SECRET_FIELDS = {"github_token", "dockerhub_token"}  # usernames are not secret
+SECRET_FIELDS = {"github_token", "dockerhub_token", "wiki_api_key"}  # usernames are not secret
 
 
 def _file() -> Path:

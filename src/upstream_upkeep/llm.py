@@ -15,6 +15,7 @@ Starting a new session drops layer 3 only.
 from __future__ import annotations
 
 import os
+import time
 
 import requests
 
@@ -30,17 +31,54 @@ MAX_TOKENS = 2048
 TIMEOUT = int(os.environ.get("UPSTREAM_LLM_TIMEOUT", "900"))
 
 
+_picked: dict = {"at": 0.0, "key": None, "url": None, "seen": {}}
+PICK_SECONDS = 60
+
+
+def _candidates(local: dict) -> list[str]:
+    """The main server URL, then the fallbacks (servers that start models on demand, so a port may be dark)."""
+    urls = [os.environ.get("UPSTREAM_LLM_BASE_URL") or local.get("base_url") or ""]
+    extra = os.environ.get("UPSTREAM_LLM_FALLBACK_URLS")
+    urls += [u for u in (extra.split(",") if extra else local.get("fallback_urls") or []) if isinstance(u, str)]
+    out = []
+    for u in urls:
+        u = u.strip().rstrip("/")
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
+def _pick(urls: list[str], api_key: str, model: str) -> tuple[str, dict]:
+    """The first URL that is up, preferring one that serves `model`. Probed in parallel, cached for a minute."""
+    key = (tuple(urls), api_key, model)
+    if _picked["key"] == key and time.time() - _picked["at"] < PICK_SECONDS:
+        return _picked["url"], _picked["seen"]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+        seen = dict(zip(urls, pool.map(lambda u: list_models(u, api_key, timeout=4), urls)))
+    up = [u for u in urls if not seen[u][1]]
+    serving = [u for u in up if model and model in seen[u][0]]
+    url = (serving or up or urls)[0]
+    _picked.update(at=time.time(), key=key, url=url,
+                   seen={u: {"up": not err, "models": ids[:30], "error": err} for u, (ids, err) in seen.items()})
+    return url, _picked["seen"]
+
+
 def config() -> dict:
     """The LLM connection: env override, then the app's saved settings.
 
-    With no model chosen, the first one the server lists is used.
+    With fallback URLs, the first server that is up is used, preferring one that
+    serves the chosen model. With no model chosen, the first one it lists is used.
     """
     local = store.load_llm_config()
+    urls = _candidates(local)
     cfg = {
         "model": os.environ.get("UPSTREAM_LLM_MODEL") or local.get("model") or "",
-        "base_url": (os.environ.get("UPSTREAM_LLM_BASE_URL") or local.get("base_url") or "").rstrip("/"),
+        "base_url": urls[0] if urls else "",
         "api_key": os.environ.get("UPSTREAM_LLM_API_KEY") or local.get("api_key") or "",
     }
+    if len(urls) > 1:
+        cfg["base_url"], cfg["servers"] = _pick(urls, cfg["api_key"], cfg["model"])
     if not cfg["model"]:
         models, _ = list_models(cfg["base_url"], cfg["api_key"])
         cfg["model"] = models[0] if models else ""
@@ -338,6 +376,11 @@ def build_messages(repo: dict, session: dict, message: str, attachments: list[di
     about = session_tags_block(repo, session)
     if about:
         system += "\n\n" + about
+    if repo["id"] != store.GENERAL:
+        from . import wiki
+        noted = wiki.about_text(repo)
+        if noted:
+            system += "\n\n" + noted
     user_mem, repo_mem, other_mem = _memories(repo["id"], message)  # one search per message
     mem = _memory_block(repo_mem, other_mem)
     if mem:
@@ -397,14 +440,14 @@ def chat(repo_id: str, message: str, session_id: str | None = None, attachments:
     return {"ok": True, "reply": reply, "session": session["id"], "edits": msg.get("edits", []), "index": index}
 
 
-def list_models(base_url: str | None = None, api_key: str | None = None) -> tuple[list[str], str | None]:
+def list_models(base_url: str | None = None, api_key: str | None = None, timeout: int = 10) -> tuple[list[str], str | None]:
     """Model ids the server offers, as (ids, error). Defaults to the saved connection."""
     if base_url is None:
         local = store.load_llm_config()
         base_url = os.environ.get("UPSTREAM_LLM_BASE_URL") or local.get("base_url") or ""
         api_key = os.environ.get("UPSTREAM_LLM_API_KEY") or local.get("api_key") or ""
     try:
-        resp = requests.get(f"{base_url.rstrip('/')}/models", headers=_headers(api_key or ""), timeout=10)
+        resp = requests.get(f"{base_url.rstrip('/')}/models", headers=_headers(api_key or ""), timeout=timeout)
         resp.raise_for_status()
         return [m["id"] for m in resp.json().get("data", []) if m.get("id")], None
     except Exception as e:
