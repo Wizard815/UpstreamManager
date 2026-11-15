@@ -1,4 +1,4 @@
-"""Configuration and persistence for Upstream Management.
+"""Configuration and persistence for Upstream Manager.
 
 State (tracked repos, detected changes, approvals, chat history) is kept in a
 single JSON file under the data dir so the app is easy to back up and to inspect.

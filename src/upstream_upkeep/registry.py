@@ -1,6 +1,6 @@
 """Repo registry: watch folders, git-URL repos, per-repo branch focus + multiple upstreams.
 
-A Repo entry describes what Upstream Management tracks:
+A Repo entry describes what Upstream Manager tracks:
 
   id          stable slug (used as the HTML id / API key)
   path        local working-tree root (for a URL repo we clone into the watch folder)
@@ -53,6 +53,8 @@ def _free_id(base: str, path: str) -> str:
 
 def _focus(path: str, wanted: str | None) -> str:
     """The branch checked out, or with a detached HEAD the remote's default (else main/master)."""
+    if gitops._run(["git", "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=path).returncode != 0:
+        raise ValueError("the repo has no commits yet: commit something first, then add it")
     if wanted:
         return wanted
     cur = gitops.current_branch(path)
@@ -160,6 +162,7 @@ def add_repo(path: str | None, url: str | None, name: str | None,
             ],
         }
         repo["components"] = components.sync({**(store.get_repo(repo["id"]) or {}), **repo})
+        repo["root_commits"] = sorted(gitops._run(["git", "rev-list", "--max-parents=0", "--all"], cwd=str(p)).stdout.split())[:5]
         return store.upsert_repo(repo)
 
     if url:
