@@ -2010,9 +2010,8 @@ async function wikiSetup() {
   const mode = el("select", { "aria-label": "How to reach the vault" }, el("option", { value: "folder" }, "A folder on this machine"), el("option", { value: "rest" }, "Obsidian Local REST API"))
   mode.value = st.mode
   const path = el("input", { value: st.path || "", placeholder: "/path/to/LLMWIKI (the vault folder)", style: "width:100%" })
-  const url = el("input", { value: st.url || "", placeholder: "http://192.168.20.5:27123", style: "width:100%" })
-  const key = el("input", { type: "password", placeholder: st.key_set ? "•••• saved (type to replace)" : "the plugin's API key", style: "width:100%", autocomplete: "off" })
-  const pub = el("input", { type: "checkbox", style: "height:auto" }); pub.checked = st.publish
+  const url = el("input", { value: st.url || "", placeholder: st.rest_url || "http://192.168.20.5:27123", style: "width:100%" })
+  const key = el("input", { type: "password", placeholder: st.key_set ? "•••• set (type to replace)" : "the plugin's API key", style: "width:100%", autocomplete: "off" })
   const read = el("input", { type: "checkbox", style: "height:auto" }); read.checked = st.read
   const pathRow = el("label", { class: "col", style: "gap:4px" }, "Vault folder", path)
   const restRows = el("div", { class: "col" }, el("label", { class: "col", style: "gap:4px" }, "REST API URL", url),
@@ -2024,22 +2023,19 @@ async function wikiSetup() {
   const save = el("button", { class: "btn" }, "Save")
   save.onclick = () => busy(save, "Saving…", async () => {
     if (key.value.trim()) await api(apiUrl("/api/credentials"), { method: "POST", body: JSON.stringify({ wiki_api_key: key.value.trim() }) })
-    const r = await api(apiUrl("/api/wiki/settings"), { method: "POST", body: JSON.stringify({ enabled: on.checked, mode: mode.value, path: path.value, url: url.value, publish: pub.checked, read: read.checked }) })
+    const r = await api(apiUrl("/api/wiki/settings"), { method: "POST", body: JSON.stringify({ enabled: on.checked, mode: mode.value, path: path.value, url: url.value, read: read.checked }) })
     toast(r.ok || !r.enabled ? "Saved" : `Saved, but: ${r.error}`, r.ok || !r.enabled ? "ok" : "error")
     box.replaceWith(await wikiSetup())
   })
-  const now = el("button", { class: "btn ghost", disabled: st.ok ? null : "" }, "Write today's section now")
-  now.onclick = () => busy(now, "Writing…", async () => {
-    const r = await api(apiUrl("/api/wiki/publish"), { method: "POST", body: "{}" })
-    toast(r.written ? `Wrote ${r.lines} line(s) to ${r.path}` : (r.detail || r.error || "nothing written"), r.ok ? "ok" : "error")
-  })
   box.append(el("h4", { style: "margin-top:20px" }, "LLM wiki"),
-    el("div", { class: "muted" }, "Your agent-kept Obsidian vault (like LLMWIKI). Upstream Manager reads only its long-term notes (wiki/), to tell chats and coding agents what you wrote about each repo, and writes only its own section of today's daily note (merges, requests, agent notes, day logs), which your Rollover/Ingest then files. It never writes to wiki/ or raw/, never edits a rolled-over note, and redacts anything that looks like a secret."),
+    el("div", { class: "muted" }, "Your agent-kept Obsidian vault (like LLMWIKI). Reading: Upstream Manager gives chats and coding agents what its long-term notes (wiki/) say about each repo, citing the note. It never reads the short-term tier as fact and never writes here."),
     el("div", { class: "col", style: "margin-top:8px" },
       el("label", { class: "row" }, on, "Use the LLM wiki"), el("label", { class: "col", style: "gap:4px" }, "Reach it through", mode), pathRow, restRows,
       el("label", { class: "row" }, read, "Give chats and agents what wiki/ says about a repo"),
-      el("label", { class: "row" }, pub, "Write Upstream Manager's section of today's daily note"),
-      state, el("div", { class: "row" }, save, now)))
+      state, el("div", { class: "row" }, save),
+      el("div", { class: "small", style: `margin-top:6px;color:${st.writer ? "var(--good)" : "var(--muted)"}` }, st.writer
+        ? `Writing: on. After each daily check one line goes to today's daily note, and each finished day's logs become a source for the vault's Ingest, through its MCP at ${st.writer_url}.`
+        : "Writing: off. Start Upstream Manager with LLMWIKI_MCP_URL (e.g. http://192.168.20.5:27123/mcp) and LLMWIKI_API_KEY to send it each daily check and each finished day's logs (short-term tier only).")))
   return box
 }
 

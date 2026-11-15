@@ -614,14 +614,15 @@ def api_wiki():
 
 @flask_app.route("/api/wiki/settings", methods=["POST"])
 def api_wiki_settings():
-    """{enabled, mode: folder|rest, path, url, publish, read}. The API key is saved under Accounts."""
+    """Reading the vault: {enabled, mode: folder|rest, path, url, read}. The REST key is saved under Accounts
+    (or comes from LLMWIKI_API_KEY). Writing to it is set up with LLMWIKI_MCP_URL, see wiki.py."""
     if (refused := _user_only("Connecting the LLM wiki")):
         return refused
     data = request.get_json(force=True) or {}
     if not isinstance(data, dict):
         return jsonify({"ok": False, "error": "send an object"}), 400
     s = wiki.settings()
-    for k in ("enabled", "publish", "read"):
+    for k in ("enabled", "read"):
         if k in data:
             s[k] = bool(data[k])
     if "mode" in data:
@@ -632,15 +633,6 @@ def api_wiki_settings():
     save_settings({"wiki": s})
     wiki._CACHE.clear()
     return jsonify({"ok": True, **wiki.status()})
-
-
-@flask_app.route("/api/wiki/publish", methods=["POST"])
-def api_wiki_publish():
-    """Write Upstream Manager's section of today's daily note now."""
-    try:
-        return jsonify(wiki.publish())
-    except wiki.WikiError as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
 
 
 @flask_app.route("/api/repo/<repo_id>/wiki")
@@ -1250,8 +1242,8 @@ def api_run_daily():
                 results.append({"repo_id": repo["id"], "status": "error", "error": str(e)})
     for r in results:
         _remember_daily(r)
+    wiki.log_daily(results)  # one line in the LLMWIKI daily note, when it is set up
     memory.write_due_logs_soon()  # log any finished day that has no log yet
-    threading.Thread(target=wiki.publish_quietly, daemon=True).start()
     return jsonify({"ok": True, "results": results})
 
 

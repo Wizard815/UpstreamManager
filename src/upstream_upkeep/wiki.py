@@ -1,33 +1,157 @@
-"""The LLM wiki (an Obsidian vault kept by agents, like LLMWIKI): read it, and feed its daily note.
+"""Sends Upstream Manager's days to the LLMWIKI vault's short-term memory.
 
-The vault keeps two tiers. ``wiki/`` is long-term, curated memory: Upstream
-Manager only reads it, to give the chat and coding agents what the user wrote
-down about a repo (where it runs, why it is a fork, ...), always with the note
-it came from. ``daily/`` is short-term memory: Upstream Manager writes there,
-and only there, into its own section of today's note (merges, requests,
-what agents did, the day logs). The vault's own Rollover/Ingest workflow
-decides what of that becomes long-term. Upstream Manager never writes to
-``wiki/`` or ``raw/``, never edits a rolled-over daily note, and redacts
-anything that looks like a secret before writing.
+The vault (an Obsidian vault behind the Local REST API plugin) keeps a long-term
+wiki that only its Ingest workflow writes, and a short-term tier that tools like
+this one feed. Through the vault's MCP endpoint and its memory tools:
 
-Two ways to reach the vault:
-  * folder: a path to the vault on disk (a clone, a mounted share);
-  * rest:   the Obsidian Local REST API plugin (http://host:27123), with its API
-            key kept like the other accounts (keychain, or UPSTREAM_WIKI_API_KEY).
+- after the daily check, one line in today's daily note (memory_log), e.g.
+  "Upkeep: omi-local fast-forwarded 12; argos request raised (2 conflicts)"
+- once a finished day's repo logs are written, one new source for Ingest
+  (memory_add_source), "raw/sources/<day> - Upstream Manager.md"
+
+Off unless LLMWIKI_MCP_URL is set (e.g. http://192.168.20.5:27123/mcp). The key
+comes from LLMWIKI_API_KEY and is never stored. Everything runs in the
+background and only logs a failure: the wiki being down never breaks the app.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
+import threading
+
+log = logging.getLogger(__name__)
+
+SOURCE = "upstream-manager"
+TIMEOUT = 30
+
+
+def enabled() -> bool:
+    return bool(os.environ.get("LLMWIKI_MCP_URL", "").strip())
+
+
+class WikiError(Exception):
+    """The vault refused or failed a call; the message is its own."""
+
+
+async def _call(name: str, arguments: dict) -> str:
+    import httpx2
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    url = os.environ["LLMWIKI_MCP_URL"].strip()
+    key = os.environ.get("LLMWIKI_API_KEY", "").strip()
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    async with httpx2.AsyncClient(headers=headers, timeout=TIMEOUT) as http, \
+            streamable_http_client(url, http_client=http) as streams:
+        async with ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            result = await session.call_tool(name, arguments)
+    text = "\n".join(getattr(c, "text", "") for c in result.content or [])
+    if result.is_error:
+        raise WikiError(text or f"{name} failed")
+    return text
+
+
+def call_tool(name: str, arguments: dict) -> str:
+    """One tool call on the vault's MCP endpoint (blocking)."""
+    return asyncio.run(asyncio.wait_for(_call(name, arguments), TIMEOUT * 2))
+
+
+def _in_background(what: str, fn, *args) -> None:
+    if not enabled():
+        return
+
+    def run():
+        try:
+            fn(*args)
+        except Exception as e:  # the wiki is an extra: say why, carry on
+            log.warning("LLMWIKI: %s failed: %s", what, e)
+
+    threading.Thread(target=run, daemon=True, name=f"llmwiki-{what}").start()
+
+
+def summarize_daily(results: list[dict]) -> str:
+    """The daily check in one line, or "" when nothing happened worth a line."""
+    merged = [f"{r.get('repo_name') or r['repo_id']} fast-forwarded {r.get('behind', 0)}"
+              for r in results if r.get("status") == "merged"]
+    raised = []
+    for r in results:
+        if r.get("status") == "request_raised":
+            n = len(r.get("conflicts") or [])
+            raised.append(f"{r.get('repo_name') or r['repo_id']} request raised" + (f" ({n} conflicts)" if n else ""))
+    failed = [f"{r.get('repo_name') or r['repo_id']} failed" for r in results if r.get("status") == "error"]
+    parts = merged + raised + failed
+    return ("Upkeep: " + "; ".join(parts)) if parts else ""
+
+
+def log_daily(results: list[dict]) -> None:
+    """After the daily check: one line in today's daily note, if anything changed."""
+    line = summarize_daily(results)
+    if line:
+        _in_background("daily line", call_tool, "memory_log", {"text": line, "source": SOURCE})
+
+
+def day_source(day: str, logs: list[tuple[str, str]]) -> str:
+    """Markdown for one finished day: each repo's day log under its name."""
+    parts = [f"Upstream Manager's day logs for {day}, one per repository that had activity."]
+    for name, text in logs:
+        body = text.split("\n\n", 1)[1] if text.startswith("Log for ") and "\n\n" in text else text
+        parts.append(f"## {name}\n\n{body.strip()}")
+    return "\n\n".join(parts) + "\n"
+
+
+def _send_day(day: str, logs: list[tuple[str, str]]) -> None:
+    try:
+        call_tool("memory_add_source", {"title": "Upstream Manager", "content": day_source(day, logs), "date": day})
+    except WikiError as e:
+        if "already exists" not in str(e):  # sent before: sources are never overwritten
+            raise
+
+
+def send_days(days: dict[str, list[tuple[str, str]]]) -> None:
+    """Hand each finished day's logs to the vault once, for its Ingest workflow."""
+    if not days or not enabled():
+        return
+
+    def run():
+        for day in sorted(days):
+            _send_day(day, days[day])
+
+    _in_background("day logs", run)
+
+
+# ======================================================================
+# Reading: what the vault's long-term notes (wiki/) say about a repo.
+#
+# Chats, agent briefings and the Memory tab get it, citing the note and
+# marking drafts. Only wiki/ is read: daily/, inbox/ and raw/ are the
+# short-term tier and not something to cite. Reached as a folder (a clone or
+# mounted share) or through the Local REST API, whose key and address default
+# to the ones the writer above uses (LLMWIKI_API_KEY, LLMWIKI_MCP_URL).
+# Nothing here writes to the vault.
+# ======================================================================
 import re
 import time
-from datetime import date
 from pathlib import Path
 from urllib.parse import quote
 
 import requests
 
-from . import credentials, memory, store
+from . import credentials, store
 
-SECTION = "## Upstream Manager"
+
+def rest_key() -> str:
+    return credentials.get("wiki_api_key") or os.environ.get("LLMWIKI_API_KEY", "").strip()
+
+
+def rest_url() -> str:
+    """The Local REST API: the saved address, else the writer's MCP address without /mcp."""
+    saved = (store.settings().get("wiki") or {}).get("url") or ""
+    mcp = os.environ.get("LLMWIKI_MCP_URL", "").strip()
+    return (saved or re.sub(r"/mcp/?$", "", mcp)).rstrip("/")
+
+
 _SECRET = re.compile(
     r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|xox[abpr]-[A-Za-z0-9-]{10,}"
     r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"            # JWTs
@@ -37,17 +161,12 @@ _CACHE: dict[str, tuple[float, object]] = {}
 CACHE_SECONDS = 600
 
 
-class WikiError(RuntimeError):
-    pass
-
-
 def settings() -> dict:
     s = dict(store.settings().get("wiki") or {})
     s.setdefault("enabled", False)
     s.setdefault("mode", "folder")          # folder | rest
     s.setdefault("path", "")
     s.setdefault("url", "")
-    s.setdefault("publish", True)           # write to today's daily note
     s.setdefault("read", True)              # give chats and agents what wiki/ says about a repo
     return s
 
@@ -131,7 +250,7 @@ def vault():
     if not s["enabled"]:
         raise WikiError("the LLM wiki is off (Settings → LLM wiki)")
     if s["mode"] == "rest":
-        return _Rest(s["url"], credentials.get("wiki_api_key"))
+        return _Rest(rest_url(), rest_key())
     if not s["path"]:
         raise WikiError("set the vault's folder (Settings → LLM wiki)")
     return _Folder(s["path"])
@@ -139,13 +258,13 @@ def vault():
 
 def status() -> dict:
     s = settings()
-    out = {**s, "ok": False, "error": None, "key_set": bool(credentials.get("wiki_api_key"))}
+    out = {**s, "ok": False, "error": None, "key_set": bool(rest_key()), "rest_url": rest_url(),
+           "writer": enabled(), "writer_url": os.environ.get("LLMWIKI_MCP_URL", "").strip() or None}
     if not s["enabled"]:
         return out
     try:
         v = vault()
         out["notes"] = len(v.notes("wiki"))
-        out["today"] = _daily_path()
         out["ok"] = True
     except WikiError as e:
         out["error"] = str(e)
@@ -211,88 +330,3 @@ def about_text(repo: dict) -> str:
         out.append(f"[[{n['note']}]]" + (" (draft)" if n["status"] == "draft" else "") + ":")
         out += [f"  {l}" for l in n["lines"]]
     return "\n".join(out)
-
-
-# ------------------------------------------------------------------ writing daily/
-def _daily_path(day: str | None = None) -> str:
-    return f"daily/{day or date.today().isoformat()}.md"
-
-
-def _template(v, day: str) -> str:
-    t = None
-    try:
-        t = v.read("schema/templates/DAILY.md")
-    except WikiError:
-        pass
-    t = t or ("---\ntitle: \"{{date}}\"\ntype: daily\ntags: [daily]\ncreated: {{date}}\nstatus: open\nrelated: []\n---\n\n"
-              "# {{date}}\n\n## Worked on\n\n- \n")
-    return t.replace("{{date}}", day)
-
-
-def _section(day: str) -> str:
-    """Today's Upstream Manager material: day logs where written, else the day's events and agent notes."""
-    db = memory.get()
-    lines = []
-    for repo in store.snapshot(store.all_repos()) + [{"id": store.GENERAL, "name": "General chats"}]:
-        logs = memory.day_logs(repo["id"], [day]) if db is not None else []
-        name = repo.get("name") or repo["id"]
-        if logs:
-            body = logs[0]["memory"].split("\n", 2)[-1].strip()
-            lines.append(f"- **{name}**: " + " ".join(l.strip() for l in body.splitlines() if l.strip())[:900])
-            continue
-        if db is None:
-            continue
-        with memory._lock:
-            rows = db.execute("SELECT kind, text FROM items WHERE repo=? AND day=? AND kind IN ('event','decision','note') "
-                              "ORDER BY created_at", (repo["id"], day)).fetchall()
-            agent = db.execute("SELECT content FROM messages WHERE repo=? AND day=? AND role='agent' ORDER BY ts",
-                               (repo["id"], day)).fetchall()
-        items = [re.sub(r"^\d{4}-\d{2}-\d{2}: ", "", r["text"]) for r in rows] + [f"agent: {a['content']}" for a in agent]
-        if items:
-            lines.append(f"- **{name}**: " + "; ".join(i.replace("\n", " ")[:300] for i in items[:8]))
-    pending = [r for r in store.get_requests() if r.get("status") == "pending"]
-    if pending:
-        lines.append("- Waiting for approval: " + "; ".join(f"{r.get('repo_name') or r.get('repo_id')} ({r.get('type') or 'merge'})"
-                                                           for r in pending[:10]))
-    return "\n".join(lines)
-
-
-def publish(day: str | None = None) -> dict:
-    """Put Upstream Manager's section into the daily note (creating today's from the template).
-
-    Only daily/; only a note that is still open; only our own section (rewritten
-    each time, so publishing twice is harmless). Returns what was written.
-    """
-    s = settings()
-    if not s["publish"]:
-        return {"ok": False, "error": "publishing to the wiki is off"}
-    day = day or date.today().isoformat()
-    v = vault()
-    rel = _daily_path(day)
-    text = v.read(rel)
-    if text is None:
-        if day != date.today().isoformat():
-            return {"ok": False, "error": f"there is no daily note for {day} (only today's is created)"}
-        text = _template(v, day)
-    meta, _ = _front(text)
-    if meta.get("status", "open") != "open":
-        return {"ok": False, "error": f"{rel} is {meta.get('status')}: rolled-over notes are never edited"}
-    body = _section(day)
-    if not body:
-        return {"ok": True, "path": rel, "written": False, "detail": "nothing from Upstream Manager today"}
-    block = (f"{SECTION}\n\n> [!info] Written by Upstream Manager (rewritten on each publish; edit above or below it).\n\n"
-             f"{redact(body)}\n")
-    pat = re.compile(rf"^{re.escape(SECTION)}\n.*?(?=^## |\Z)", re.S | re.M)
-    new = pat.sub(lambda _: block + "\n", text, count=1) if pat.search(text) else text.rstrip("\n") + "\n\n" + block
-    v.write(rel, new)
-    return {"ok": True, "path": rel, "written": True, "lines": body.count("\n") + 1}
-
-
-def publish_quietly() -> None:
-    """After a day log or daily check: publish if the wiki is set up; never fail the caller."""
-    try:
-        s = settings()
-        if s["enabled"] and s["publish"]:
-            publish()
-    except Exception:
-        pass
