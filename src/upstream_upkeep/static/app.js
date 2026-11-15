@@ -639,6 +639,7 @@ async function renderComponents(wrap, repoId) {
           c.behind ? (() => { const b = el("button", { class: "btn ghost", "aria-label": `Request update for ${c.name}` }, "Request update"); b.onclick = () => raise(b, [c.name]); return b })() : null,
           fetchBtn)),
       el("div", { class: "muted" }, `${c.url}` + (c.pin ? ` · pinned ${c.pin_tag || c.pin.slice(0, 8)}` : "") + (c.upstream ? ` · ${c.release ? "release" : "upstream"} ${c.release || c.upstream.slice(0, 8)}` : "")),
+      c.status === "error" && c.detail ? el("div", { class: "small", style: "margin-top:4px;color:var(--bad)" }, c.detail) : null,
       c.suggest_releases ? el("div", { class: "row small", style: "margin-top:4px;color:var(--info)" }, c.suggest_releases,
         el("button", { class: "btn ghost small", onclick: (e) => busy(e.currentTarget, "Saving…", async () => {
           await api(apiUrl(`/api/repo/${repoId}/components/${encodeURIComponent(c.name)}`), { method: "POST", body: JSON.stringify({ follow: "releases" }) })
@@ -1546,14 +1547,16 @@ async function renderFiles(wrap, repoId, { ws = null, onScope } = {}) {
     try { res = await api(apiUrl(`/api/repo/${repoId}/tree?${q({ path })}`)) }
     catch (e) { container.replaceChildren(el("div", { class: "muted", style: "padding:6px 8px" }, e.message)); return }
     container.innerHTML = ""
+    if (res.note) container.append(el("div", { class: "muted", style: `padding:4px 8px 4px ${8 + depth * 14}px;font-size:12px` }, res.note))
     for (const e of res.entries || []) {
       const isDir = e.type === "dir"
       const mark = markFor(e.path, isDir)
       const row = el("div", { class: `trow${mark && !isDir ? ` ch-${mark === "?" ? "q" : mark}` : ""}${mark && isDir ? " has-ch" : ""}`, role: "treeitem", tabindex: "-1",
         "aria-level": String(depth + 1), "data-path": e.path, "data-type": e.type, style: `padding-left:${8 + depth * 14}px`, title: e.path },
         el("span", { "aria-hidden": "true", style: "width:12px;color:var(--muted)" }, isDir ? "▸" : ""),
-        el("span", { "aria-hidden": "true" }, isDir ? "📁" : "📄"),
+        el("span", { "aria-hidden": "true" }, e.submodule ? "📦" : isDir ? "📁" : "📄"),
         el("span", { class: "nm" }, e.name),
+        e.submodule ? el("span", { class: "muted", style: "font-size:11px;margin-left:6px" }, e.checked_out ? "component" : "component · not checked out") : null,
         mark ? el("span", { class: "st", title: { M: "modified", A: "added", D: "deleted", R: "renamed", U: "conflicted", "?": "untracked" }[mark] || "changed" }, mark === "?" ? "U" : mark) : null)
       container.append(row)
       if (isDir) {
@@ -1998,7 +2001,38 @@ async function renderSettings() {
         memStatus, memSave))
     card.append(await agentSetup())
     card.append(await wikiSetup())
+    card.append(await storageSetup())
   } catch (e) { card.replaceChildren(el("p", { class: "muted" }, `Could not load settings: ${e.message}`)) }
+}
+
+// Disk use and cleanup of Upstream Manager's own data. See storage.py.
+const fmtBytes = b => b >= 2 ** 30 ? `${(b / 2 ** 30).toFixed(1)} GB` : b >= 2 ** 20 ? `${(b / 2 ** 20).toFixed(1)} MB` : `${Math.ceil((b || 0) / 1024)} KB`
+async function storageSetup() {
+  const box = el("div")
+  box.append(el("h4", { style: "margin-top:20px" }, "Storage"), el("div", { class: "muted" }, "Measuring…"))
+  let st
+  try { st = await api(apiUrl("/api/storage")) } catch (e) { box.replaceChildren(el("h4", { style: "margin-top:20px" }, "Storage"), el("p", { class: "muted" }, `Unavailable: ${e.message}`)); return box }
+  const total = st.repos.reduce((n, r) => n + (r.git || 0) + (r.component_copies || 0), 0)
+  const c = st.cleanup, n = c.requests.length + c.component_copies.length + c.workspaces.length
+  const rows = st.repos.map(r => el("tr", {},
+    el("td", {}, r.name || r.id), el("td", { class: "muted", title: r.path, style: "max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, r.path),
+    el("td", { style: "text-align:right" }, r.missing ? "missing" : fmtBytes(r.git)),
+    el("td", { style: "text-align:right" }, r.component_copies ? fmtBytes(r.component_copies) : "–"),
+    el("td", { style: "text-align:right" }, r.workspaces ? fmtBytes(r.workspaces) : "–"),
+    el("td", {}, r.partial ? "on demand" : r.missing ? "" : "full")))
+  const clean = el("button", { class: "btn", disabled: n ? null : "" }, n ? `Clean up ${n} item${n > 1 ? "s" : ""} (${fmtBytes(c.freed)})` : "Nothing to clean up")
+  clean.onclick = () => busy(clean, "Cleaning…", async () => {
+    const r = await api(apiUrl("/api/storage/cleanup"), { method: "POST", body: JSON.stringify({}) })
+    toast(`Freed ${fmtBytes(r.freed)}`, "ok"); box.replaceWith(await storageSetup())
+  })
+  box.replaceChildren(el("h4", { style: "margin-top:20px" }, "Storage"),
+    el("div", { class: "muted" }, `Upstream Manager's own data (${st.data_dir}): ${fmtBytes(st.app_total)} — settings ${fmtBytes(st.app["state.json"])}, memory ${fmtBytes(st.app.memory)}, workspaces ${fmtBytes(st.app.workspaces)}. Your repos stay where they are; their git folders take ${fmtBytes(total)}. "On demand" repos download file contents only when needed. Component copies are history-only (no files) and live inside each repo's .git.`),
+    el("div", { style: "overflow:auto;max-height:320px;margin-top:8px" }, el("table", { class: "tbl", style: "width:100%;font-size:12px" },
+      el("thead", {}, el("tr", {}, ...["Repo", "Location", "Git", "Components", "Workspaces", "Contents"].map(h => el("th", { style: "text-align:left" }, h)))),
+      el("tbody", {}, ...rows))),
+    el("div", { class: "row", style: "margin-top:8px;gap:8px;align-items:center" }, clean,
+      el("span", { class: "muted small" }, `Removes decided requests older than 30 days, component copies nothing uses, and workspace folders of removed repos. Never your files, branches or commits.`)))
+  return box
 }
 
 // The LLM wiki (an Obsidian vault kept by agents): read wiki/, write today's daily note. See wiki.py.

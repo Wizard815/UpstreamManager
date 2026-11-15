@@ -168,8 +168,7 @@ def fetch(repo_path: str, comp: dict) -> tuple[bool, str]:
                           cwd=str(m), timeout=gitops.FETCH_TIMEOUT)
         if res.returncode != 0:
             return False, (res.stderr or res.stdout).strip()
-        if not comp.get("branch"):
-            _git(m, "remote", "set-head", "origin", "--auto")
+        _git(m, "remote", "set-head", "origin", "--auto")  # the default branch, also named when a pinned branch is gone
         return True, ""
     sub = _sub(repo_path, comp)
     # .gitmodules says where the upstream is; the submodule's own origin only follows after a sync.
@@ -180,8 +179,7 @@ def fetch(repo_path: str, comp: dict) -> tuple[bool, str]:
                       cwd=str(sub), timeout=gitops.FETCH_TIMEOUT)
     if res.returncode != 0:
         return False, (res.stderr or res.stdout).strip()
-    if not comp.get("branch"):
-        _git(sub, "remote", "set-head", "origin", "--auto")
+    _git(sub, "remote", "set-head", "origin", "--auto")  # the default branch, also named when a pinned branch is gone
     return True, ""
 
 

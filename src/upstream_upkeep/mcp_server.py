@@ -147,7 +147,7 @@ def list_commits(
     repo: Repo,
     view: Annotated[Literal["behind", "ahead", "all"], Field(
         description='"behind": commits the upstream has that you lack; "ahead": only your own; "all": the focus branch history.')] = "behind",
-    upstream: Annotated[str, Field(description="For behind/ahead: which upstream (name from list_repos); empty for the first.")] = "",
+    upstream: Annotated[str, Field(description="For behind/ahead: which upstream (name from list_repos); empty for the first enabled one that is not origin.")] = "",
     query: Annotated[str, Field(description="Only commits whose message contains this.")] = "",
     limit: Annotated[int, Field(ge=1, le=200, description="At most this many commits (1-200).")] = 30,
 ) -> list[dict]:

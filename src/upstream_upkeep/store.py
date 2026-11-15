@@ -165,6 +165,14 @@ def get_request(req_id: str) -> dict | None:
 
 
 @_locked
+def forget_requests(ids: set) -> None:
+    """Drop these requests from the list (old decided ones, during cleanup)."""
+    reqs = requests_store()
+    reqs[:] = [r for r in reqs if r.get("id") not in ids]
+    save_state()
+
+
+@_locked
 def decide_request(req_id: str, decision: str, comment: str | None = None, result: list | None = None,
                    failed: bool = False) -> dict | None:
     for r in requests_store():
