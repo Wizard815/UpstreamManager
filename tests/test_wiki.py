@@ -1,14 +1,128 @@
-"""The LLM wiki: read long-term notes (wiki/), write only Upstream Manager's section of today's daily note."""
-import json
+"""Upstream Manager feeds the LLMWIKI vault's short-term memory through its MCP memory tools."""
+import socket
 import threading
+import time
+
+import pytest
+import uvicorn
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+
+from upstream_upkeep import memory, store, wiki
+
+
+def test_summarize_daily_names_what_changed():
+    results = [
+        {"repo_id": "omi", "repo_name": "omi-local", "status": "merged", "behind": 12},
+        {"repo_id": "argos", "repo_name": "argos", "status": "request_raised", "conflicts": ["upstream", "fork"]},
+        {"repo_id": "x", "repo_name": "x", "status": "skipped"},
+        {"repo_id": "y", "status": "error", "error": "boom"},
+    ]
+    assert wiki.summarize_daily(results) == "Upkeep: omi-local fast-forwarded 12; argos request raised (2 conflicts); y failed"
+    assert wiki.summarize_daily([{"repo_id": "x", "status": "skipped"}]) == ""
+
+
+def test_day_source_puts_each_repo_under_its_name():
+    text = wiki.day_source("2026-11-14", [("argos", "Log for 2026-11-14:\n\n**Worked on** - MCP"), ("General chats", "plain")])
+    assert "## argos\n\n**Worked on** - MCP" in text and "## General chats\n\nplain" in text
+    assert "Log for" not in text
+
+
+def test_off_without_a_url(monkeypatch):
+    monkeypatch.delenv("LLMWIKI_MCP_URL", raising=False)
+    monkeypatch.setattr(wiki, "call_tool", lambda *a: pytest.fail("called the wiki while it is off"))
+    wiki.log_daily([{"repo_id": "a", "status": "merged", "behind": 1}])
+    wiki.send_days({"2026-11-14": [("a", "x")]})
+
+
+def test_due_logs_go_to_the_wiki_once_every_log_of_the_day_is_written(monkeypatch, tmp_path):
+    sent = []
+    monkeypatch.setattr(memory, "_settings", lambda: {"enabled": True, "auto_cleanup": True, "daily_log": True})
+    monkeypatch.setattr(wiki, "send_days", lambda days: sent.append(days))
+    monkeypatch.setattr(memory, "get", lambda: _FakeDB())
+    monkeypatch.setattr(store, "all_repos", lambda: [{"id": "a"}, {"id": "b"}])
+    ok = {"a": True, "b": False}
+    monkeypatch.setattr(memory, "write_day_log", lambda repo, day: {"ok": ok[repo], "error": "" if ok[repo] else "model call failed: down"})
+    monkeypatch.setattr(memory, "logs_of_day", lambda day: [("a", f"log {day}")])
+    memory.write_due_logs()
+    assert sent == [{"2026-11-12": [("a", "log 2026-11-12")]}], "a day with a failed log waits for the next pass"
+
+
+class _FakeDB:
+    def execute(self, sql, params=()):
+        rows = [{"repo": "a", "day": "2026-11-12"}, {"repo": "a", "day": "2026-11-13"}, {"repo": "b", "day": "2026-11-13"}]
+        return type("C", (), {"fetchall": lambda self: rows})()
+
+
+@pytest.fixture
+def vault(monkeypatch):
+    """A stand-in for the vault's MCP endpoint, served over real streamable HTTP."""
+    calls, keys = [], []
+    fake = MCPServer("llmwiki")
+    sources = set()
+
+    @fake.tool()
+    def memory_log(text: str, section: str = "worked_on", source: str = "") -> str:
+        calls.append(("memory_log", text, source))
+        return "Logged"
+
+    @fake.tool()
+    def memory_add_source(title: str, content: str, date: str = "") -> str:
+        path = f"raw/sources/{date} - {title}.md"
+        if path in sources:
+            raise ToolError(f"{path} already exists and sources are never overwritten; use another title.")
+        sources.add(path)
+        calls.append(("memory_add_source", path, content))
+        return f"Added {path}"
+
+    app = fake.streamable_http_app(stateless_http=True, json_response=True)
+
+    async def check_key(scope, receive, send):
+        if scope["type"] == "http":
+            keys.append(dict(scope["headers"]).get(b"authorization", b"").decode())
+        await app(scope, receive, send)
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    server = uvicorn.Server(uvicorn.Config(check_key, host="127.0.0.1", port=port, log_level="error"))
+    threading.Thread(target=server.run, daemon=True).start()
+    while not server.started:
+        time.sleep(0.02)
+    monkeypatch.setenv("LLMWIKI_MCP_URL", f"http://127.0.0.1:{port}/mcp")
+    monkeypatch.setenv("LLMWIKI_API_KEY", "k-test")
+    yield calls, keys
+    server.should_exit = True
+
+
+def test_calls_reach_the_vault_over_mcp_with_the_key(vault):
+    calls, keys = vault
+    assert wiki.call_tool("memory_log", {"text": "Upkeep: argos fast-forwarded 3", "source": wiki.SOURCE}) == "Logged"
+    assert calls == [("memory_log", "Upkeep: argos fast-forwarded 3", "upstream-manager")]
+    assert keys and all(k == "Bearer k-test" for k in keys)
+
+
+def test_a_day_is_sent_once_and_a_repeat_is_not_an_error(vault):
+    calls, _ = vault
+    wiki._send_day("2026-11-14", [("argos", "Log for 2026-11-14:\n\nMCP fixes")])
+    wiki._send_day("2026-11-14", [("argos", "again")])  # already there: fine
+    assert [c[1] for c in calls] == ["raw/sources/2026-11-14 - Upstream Manager.md"]
+    assert "## argos\n\nMCP fixes" in calls[0][2]
+
+
+# ---------------------------------------------------------------- reading wiki/ (folder or Local REST API)
+import json as _json
+import threading as _threading
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-import pytest
+from upstream_upkeep import config, credentials, llm, registry, store
 
-from upstream_upkeep import config, credentials, llm, memory, registry, store, wiki
+json = _json
+threading = _threading
 
 TODAY = date.today().isoformat()
 TEMPLATE = """---
@@ -44,7 +158,7 @@ def make_vault(root: Path) -> Path:
 
 
 @pytest.fixture
-def vault(tmp_path, repos, monkeypatch, client):
+def folder_vault(tmp_path, repos, monkeypatch, client):
     monkeypatch.setattr(config, "CONFIG_PATH", tmp_path / "state" / "state.json")
     _, mine = repos
     registry.add_repo(str(mine), None, "mine")
@@ -54,7 +168,7 @@ def vault(tmp_path, repos, monkeypatch, client):
     return v
 
 
-def test_reads_only_the_long_term_tier(vault):
+def test_reads_only_the_long_term_tier(folder_vault):
     notes = wiki.about(registry.get_repo("mine"))
     assert [n["note"] for n in notes] == ["mine", "GitHub Repos"]  # its own note first
     assert notes[0]["status"] == "draft" and "Ships on Fridays." in notes[0]["lines"]
@@ -64,44 +178,11 @@ def test_reads_only_the_long_term_tier(vault):
     assert "[[mine]] (draft)" in text and "raw source" not in text and "touched mine" not in text
 
 
-def test_chat_and_agent_briefing_get_the_wiki_facts(vault, client):
+def test_chat_and_agent_briefing_get_the_wiki_facts(folder_vault, client):
     msgs = llm.build_messages(registry.get_repo("mine"), {"messages": []}, "where does this run?")
     assert "From the user's LLM wiki" in msgs[0]["content"] and "mine-app" in msgs[0]["content"]
     brief = client.get("/api/repo/mine/briefing").get_json()["text"]
     assert "The user's LLM wiki says" in brief and "[[GitHub Repos]]" in brief
-
-
-def test_publish_creates_today_from_the_template_and_keeps_human_text(vault, client, monkeypatch):
-    monkeypatch.setenv("UPSTREAM_MEMORY", "on")
-    memory.reload()
-    try:
-        memory.remember("mine", f"{TODAY}: Daily check brought in 2 commit(s) from upstream origin.", kind="event")
-        r = client.post("/api/wiki/publish", json={}).get_json()
-        assert r["ok"] and r["written"] and r["path"] == f"daily/{TODAY}.md"
-        note = (vault / "daily" / f"{TODAY}.md").read_text()
-        assert note.startswith('---\ntitle: "' + TODAY) and "status: open" in note
-        assert "## Upstream Manager" in note and "**mine**: Daily check brought in 2 commit(s)" in note
-        # a person writes under their own heading; publishing again rewrites only our section
-        edited = note.replace("## Worked on\n\n-", "## Worked on\n\n- my own line", 1)
-        assert edited != note
-        (vault / "daily" / f"{TODAY}.md").write_text(edited)
-        memory.remember("mine", f"{TODAY}: Merge request for branch main was approved.", kind="decision")
-        client.post("/api/wiki/publish", json={})
-        note = (vault / "daily" / f"{TODAY}.md").read_text()
-        assert "- my own line" in note and note.count("## Upstream Manager") == 1 and "was approved" in note
-        assert not any(p.name.startswith(TODAY) for p in (vault / "wiki").rglob("*"))  # never into wiki/
-    finally:
-        memory.reload()
-        monkeypatch.setenv("UPSTREAM_MEMORY", "off")
-
-
-def test_rolled_over_notes_and_past_days_are_left_alone(vault):
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
-    (vault / "daily" / f"{TODAY}.md").write_text(TEMPLATE.replace("{{date}}", TODAY).replace("status: open", "status: rolled-over"))
-    r = wiki.publish()
-    assert not r["ok"] and "rolled-over" in r["error"]
-    r = wiki.publish(yesterday)
-    assert not r["ok"] and not (vault / "daily" / f"{yesterday}.md").exists()
 
 
 def test_secrets_never_reach_the_vault():
@@ -113,7 +194,7 @@ def test_secrets_never_reach_the_vault():
     assert out.count("[redacted]") == 5
 
 
-def test_wiki_settings_are_the_users(vault, client):
+def test_wiki_settings_are_the_users(folder_vault, client):
     r = client.post("/api/wiki/settings", json={"enabled": False}, headers={"X-Upstream-Client": "agent"})
     assert r.status_code == 403 and wiki.settings()["enabled"]
 
@@ -179,3 +260,15 @@ def test_rest_mode_talks_to_the_local_rest_api(tmp_path, repos, client, monkeypa
     finally:
         srv.shutdown()
         credentials.set("wiki_api_key", "")
+
+
+def test_reading_reuses_the_writers_address_and_key(monkeypatch):
+    from upstream_upkeep import wiki
+    monkeypatch.setenv("UPSTREAM_SECRETS_BACKEND", "file")
+    monkeypatch.setenv("LLMWIKI_MCP_URL", "http://192.168.20.5:27123/mcp")
+    monkeypatch.setenv("LLMWIKI_API_KEY", "from-env")
+    store.save_settings({"wiki": {"enabled": True, "mode": "rest"}})
+    assert wiki.rest_url() == "http://192.168.20.5:27123" and wiki.rest_key() == "from-env"
+    st = wiki.status()
+    assert st["writer"] is True and st["writer_url"].endswith("/mcp") and st["key_set"]
+    assert "from-env" not in _json.dumps(st)

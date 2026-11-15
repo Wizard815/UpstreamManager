@@ -148,3 +148,12 @@ def test_daylog_endpoint(client, mem, repos, monkeypatch):
     assert client.post("/api/repo/mine/memory/daylog", json={}).get_json()["ok"]
     items = client.get("/api/repo/mine/memory?kind=daylog").get_json()["items"]
     assert len(items) == 1 and items[0]["kind"] == "daylog"
+
+
+def test_logs_of_day_names_repos_with_general_chats_last(mem, monkeypatch):
+    monkeypatch.setattr(store, "get_repo", lambda rid: {"zeta": {"name": "Zeta"}, "alpha": {"name": "alpha"}}.get(rid))
+    for repo in ("zeta", store.GENERAL, "alpha"):
+        mem.remember(repo, f"Log for 2026-11-14:\n\n{repo} work", kind="daylog", day="2026-11-14")
+    mem.remember("alpha", "Log for 2026-11-13:\n\nother day", kind="daylog", day="2026-11-13")
+    names = [name for name, _ in mem.logs_of_day("2026-11-14")]
+    assert names == ["alpha", "Zeta", "General chats"]

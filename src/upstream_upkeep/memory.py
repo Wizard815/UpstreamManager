@@ -36,7 +36,7 @@ import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from . import config, store
+from . import config, store, wiki
 
 log = logging.getLogger(__name__)
 
@@ -442,8 +442,6 @@ def write_day_log(repo_id: str, day: str | None = None) -> dict:
         db.commit()
     # Link the log to everything the day's material mentions, not only what the summary kept.
     item = remember(repo_id, f"Log for {day}:\n\n{summary}", kind="daylog", day=day, link=refs(material))
-    from . import wiki
-    wiki.publish_quietly()  # the vault's daily note gets the new log (short-term tier only)
     return {"ok": True, "day": day, "sources": count, "item": item[0] if item else None}
 
 
@@ -473,9 +471,24 @@ def write_due_logs() -> list[dict]:
             done.append({"repo": row["repo"], "day": row["day"], **{k: res.get(k) for k in ("ok", "error")}})
             if not res["ok"] and res.get("error", "").startswith("model call failed"):
                 break  # model is down: try again on the next pass
+        # A day goes to the wiki once all of its logs are written: not while the model is down.
+        finished = {d["day"] for d in done if d["ok"]} - {d["day"] for d in done if not d["ok"]}
+        wiki.send_days({day: logs_of_day(day) for day in finished})
         return done
     finally:
         _due_lock.release()
+
+
+def logs_of_day(day: str) -> list[tuple[str, str]]:
+    """Every repo's log of one day, as (repo name, log text), general chats last."""
+    db = get()
+    if db is None:
+        return []
+    with _lock:
+        rows = db.execute("SELECT repo, text FROM items WHERE kind='daylog' AND day=? ORDER BY repo", (day,)).fetchall()
+    named = [((store.get_repo(r["repo"]) or {}).get("name") or ("General chats" if r["repo"] == store.GENERAL else r["repo"]),
+              r["text"], r["repo"] == store.GENERAL) for r in rows]
+    return [(name, text) for name, text, _ in sorted(named, key=lambda x: (x[2], x[0].lower()))]
 
 
 def write_due_logs_soon() -> None:

@@ -420,13 +420,6 @@ def wiki_notes(repo: Repo) -> dict:
     return _call("GET", _r(repo) + "/wiki")
 
 
-@server.tool(annotations=WRITE)
-def wiki_publish_today() -> dict:
-    """Write Upstream Manager's section (merges, requests, agent notes, day logs) into today's daily
-    note of the user's LLM wiki. Only the short-term daily/ tier is ever written."""
-    return _call("POST", "/api/wiki/publish", {})
-
-
 # ------------------------------------------------------------------ demo stacks
 def _stack(repo: str, workspace: str) -> dict:
     return _call("GET", _r(repo) + "/stack", ws=workspace)
