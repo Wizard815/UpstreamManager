@@ -89,7 +89,7 @@ def _headers(api_key: str) -> dict:
     return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
-SYSTEM_PROMPT = """You are the assistant inside Upstream Management, a web app that watches one git repository and its upstreams.
+SYSTEM_PROMPT = """You are the assistant inside Upstream Manager, a web app that watches one git repository and its upstreams.
 
 What you can and cannot do:
 - You cannot run commands, open files or browse. You only know what is written in this message: the live repo facts, your memories, and any items the user attached (commits, files).
@@ -313,7 +313,7 @@ def _history(session: dict) -> list[dict]:
     return list(reversed(out))
 
 
-GENERAL_PROMPT = """You are the assistant inside Upstream Management, a web app that watches the user's git
+GENERAL_PROMPT = """You are the assistant inside Upstream Manager, a web app that watches the user's git
 repositories and their upstreams. This chat is not about one repository: below is a short overview of
 every watched repo. You cannot run commands or open files; you only know what is in this message.
 Answer from these facts, say when you would need more (the user can open the repo's own chat or tag

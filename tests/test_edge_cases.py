@@ -183,3 +183,42 @@ def test_wrong_shapes_are_400_not_500(client, repos, method, path, body):
     registry.add_repo(str(mine), None, "mine")
     r = getattr(client, method)(path, json=body) if body is not None else getattr(client, method)(path)
     assert 400 <= r.status_code < 500, (r.status_code, r.get_data(as_text=True)[:200])
+
+
+def test_an_empty_repo_says_so(client, tmp_path):
+    git(tmp_path, "init", "-q", "-b", "main", "empty")
+    r = client.post("/api/add", json={"path": str(tmp_path / "empty")})
+    assert r.status_code == 400 and "no commits yet" in r.get_json()["error"]
+
+
+def test_removing_a_repo_leaves_its_folder_alone(client, repos):
+    _, mine = repos
+    registry.add_repo(str(mine), None, "mine")
+    client.post("/api/repo/mine/workspaces", json={"change": "something"})
+    assert client.delete("/api/repo/mine", json={}, headers={"X-Upstream-Client": "agent"}).status_code == 403
+    assert client.delete("/api/repo/mine", json={}).get_json()["ok"]
+    assert registry.get_repo("mine") is None and (mine / ".git").is_dir() and (mine / "a.txt").exists()
+    assert client.get("/api/repo/mine").status_code == 404
+
+
+def test_a_moved_repo_can_be_pointed_at_its_new_folder(client, repos, tmp_path):
+    up, mine = repos
+    registry.add_repo(str(mine), None, "mine")
+    moved = tmp_path / "elsewhere"
+    mine.rename(moved)
+    assert client.get("/api/repo/mine").get_json()["missing"] is True
+    assert client.post("/api/repo/mine/path", json={"path": str(tmp_path / "nope")}).status_code == 400
+    stranger = tmp_path / "stranger"
+    git(tmp_path, "init", "-q", "-b", "main", "stranger")
+    commit_file(stranger, "s.txt", "s\n", "unrelated")
+    r = client.post("/api/repo/mine/path", json={"path": str(stranger)})
+    assert r.status_code == 409 and "different project" in r.get_json()["error"]
+    assert client.post("/api/repo/mine/path", json={"path": str(moved)}).get_json()["ok"]
+    assert client.get("/api/repo/mine").get_json()["missing"] is False
+
+
+def test_unknown_pages_get_the_app_and_unknown_api_paths_a_404(client):
+    r = client.get("/no/such/page")
+    assert r.status_code == 200 and b"Upstream Manager" in r.data
+    assert client.get("/api/no-such-thing").status_code == 404
+    assert client.get("/static/no-such-file.js").status_code == 404

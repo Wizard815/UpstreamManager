@@ -1,4 +1,4 @@
-"""Upstream Management — Flask web server.
+"""Upstream Manager — Flask web server.
 
 Serves the GUI (repo list, upstream comparisons, per-repo chat, LLM settings,
 approval/request page) and a JSON API the frontend calls.
@@ -96,6 +96,7 @@ def _refuse_cross_site_writes():
     return None
 
 
+@flask_app.route("/<path:anything>")
 @flask_app.route("/")
 @flask_app.route("/chats")
 @flask_app.route("/workflows")
@@ -103,7 +104,9 @@ def _refuse_cross_site_writes():
 @flask_app.route("/requests")
 @flask_app.route("/settings")
 @flask_app.route("/repo/<repo_id>")
-def index(repo_id: str | None = None):
+def index(repo_id: str | None = None, anything: str | None = None):
+    if anything and (anything.startswith(("api/", "static/")) or anything in ("api", "static")):
+        abort(404)  # an unknown API or file stays a real 404; any other path gets the app
     # View paths all serve the same shell; app.js renders from location.pathname.
     base = request.headers.get("X-Upstream-Base", "").rstrip("/")
     return render_template_string(TEMPLATE, base_url=base)
@@ -120,7 +123,61 @@ def api_repo(repo_id):
     repo = registry.get_repo(repo_id)
     if not repo:
         abort(404)
-    return jsonify(store.snapshot(repo))
+    return jsonify({**store.snapshot(repo), "missing": not gitops.is_git_repo(repo["path"])})
+
+
+@flask_app.route("/api/repo/<repo_id>", methods=["DELETE"])
+def api_remove_repo(repo_id):
+    """Stop tracking a repo. Its folder and git history are not touched; its demo stacks are stopped and
+    its merge workspaces discarded (they live in Upstream Manager's own folder)."""
+    if (refused := _user_only("Removing a repo")):
+        return refused
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    import shutil
+    for ws in [None, *[w["name"] for w in workspaces.list_workspaces(repo)]]:
+        try:
+            stacks.down(repo, ws, reset_data=True)
+        except Exception:
+            pass
+    for w in workspaces.list_workspaces(repo):
+        try:
+            workspaces.remove(repo, w["name"])
+        except Exception:
+            pass
+    shutil.rmtree(config.CONFIG_PATH.parent / "workspaces" / repo_id, ignore_errors=True)
+    shutil.rmtree(config.CONFIG_PATH.parent / "stacks" / repo_id, ignore_errors=True)
+    with store.lock:
+        store.remove_repo(repo_id)
+    store.save_state()
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/repo/<repo_id>/path", methods=["POST"])
+def api_repo_path(repo_id):
+    """Point a repo whose folder moved at its new place: {"path"}. It must be the same repo (shares history)."""
+    if (refused := _user_only("Moving a repo")):
+        return refused
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    new = (request.get_json(force=True) or {}).get("path")
+    if not isinstance(new, str) or not new.strip() or not gitops.is_git_repo(new.strip()):
+        return jsonify({"ok": False, "error": "that folder is not the top of a git repository"}), 400
+    new = str(Path(new.strip()).resolve())
+    other = next((r for r in store.all_repos() if r["id"] != repo_id and Path(r["path"]).resolve() == Path(new)), None)
+    if other:
+        return jsonify({"ok": False, "error": f"that folder is already tracked as {other['name']}"}), 409
+    roots = lambda p: set(gitops._run(["git", "rev-list", "--max-parents=0", "--all"], cwd=p).stdout.split())
+    old_roots = set(repo.get("root_commits") or [])
+    if old_roots and not (old_roots & roots(new)):
+        return jsonify({"ok": False, "error": "that folder holds a different project (no shared history)"}), 409
+    with store.lock:
+        repo["path"] = new
+        repo["root_commits"] = sorted(roots(new))[:5]
+        store.save_repo(repo)
+    return jsonify({"ok": True, "repo": store.snapshot(repo)})
 
 
 @flask_app.route("/api/add", methods=["POST"])

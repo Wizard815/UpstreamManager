@@ -1,4 +1,4 @@
-"""JSON-file persistence for Upstream Management.
+"""JSON-file persistence for Upstream Manager.
 
 Single source of truth lives in `data/state.json` (override with the
 UPSTREAM_STATE_FILE env var). It holds tracked repos + their chat/upstream state,

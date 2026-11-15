@@ -1,4 +1,4 @@
-"""Run the Upstream Management web app.
+"""Run the Upstream Manager web app.
 
     uv run python -m upstream_upkeep.run   # or:  python run.py
 

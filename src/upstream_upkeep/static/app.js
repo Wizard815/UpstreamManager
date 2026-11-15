@@ -1,4 +1,4 @@
-// Upstream Management frontend — single-page app that talks to the Flask API.
+// Upstream Manager frontend — single-page app that talks to the Flask API.
 // Pages: /repos (repo list + per-repo detail), /requests (approvals), /settings (LLM).
 //
 // Path-based routing (not hash) so it works both standalone (port 5001) and
@@ -26,7 +26,7 @@ async function api(path, opts = {}) {
   try {
     r = await fetch(url, { headers: { "Content-Type": "application/json", ...opts.headers }, ...opts })
   } catch {
-    throw new Error("Can't reach the Upstream Management server. Is it running?")
+    throw new Error("Can't reach Upstream Manager's server. Is it running?")
   }
   const data = await r.json().catch(() => null)
   if (!r.ok) {
@@ -292,8 +292,36 @@ async function renderRepoPage(repoId) {
   content.replaceChildren(loading())
   let repo, branches
   try { [repo, branches] = await Promise.all([api(apiUrl(`/api/repo/${repoId}`)), repoBranches(repoId)]) }
-  catch (e) { content.replaceChildren(el("p", { class: "muted" }, e.status === 404 ? "Repo not found." : e.message)); return }
+  catch (e) {
+    content.replaceChildren(el("div", { class: "card", style: "max-width:520px;margin:40px auto;text-align:center" },
+      el("h1", { class: "page" }, e.status === 404 ? "Repo not found" : "Could not load this repo"),
+      el("p", { class: "muted" }, e.status === 404 ? `No repo has the id “${repoId}”. It may have been removed.` : e.message),
+      el("a", { href: `${BASE}/repos`, class: "btn" }, "Go to your repos")))
+    return
+  }
   content.innerHTML = ""
+  const removeRepo = async () => {
+    if (!confirm(`Stop tracking ${repo.name || repoId}? Its folder and git history are left as they are; its chats, requests, demo stacks and merge workspaces in Upstream Manager are removed.`)) return
+    await api(apiUrl(`/api/repo/${repoId}`), { method: "DELETE", body: "{}" })
+    toast(`${repo.name || repoId} removed`, "ok"); route("/repos")
+  }
+  if (repo.missing) {
+    const pathIn = el("input", { placeholder: "/where/it/is/now", "aria-label": "New folder", style: "flex:1;min-width:200px" })
+    const move = el("button", { class: "btn" }, "Use this folder")
+    move.onclick = () => busy(move, "Checking…", async () => {
+      await api(apiUrl(`/api/repo/${repoId}/path`), { method: "POST", body: JSON.stringify({ path: pathIn.value }) })
+      toast("Folder updated", "ok"); await renderRepoPage(repoId)
+    })
+    content.append(el("div", { class: "repo-head" }, el("a", { href: `${BASE}/repos`, class: "muted", style: "text-decoration:none" }, "Repos"),
+      el("span", { class: "muted" }, "/"), el("h1", { class: "page" }, repo.name || repoId)),
+      el("section", { class: "notice attention", style: "margin-top:14px" },
+        el("h2", {}, "This repo's folder is missing"),
+        el("div", {}, "Nothing is at ", el("code", {}, repo.path), " any more, or it is no longer a git repository. It was probably moved or deleted. Upstream Manager won't fetch, compare or merge it until this is fixed."),
+        el("div", { class: "row" }, pathIn, move),
+        el("div", { class: "row" }, el("span", { class: "muted" }, "Or, if it's gone for good:"),
+          el("button", { class: "btn ghost", onclick: (e) => busy(e.currentTarget, "Removing…", removeRepo) }, "Remove from Upstream Manager"))))
+    return
+  }
 
   const focusSel = el("select", { id: `focus-${repoId}`, "aria-label": "Focus branch" })
   for (const b of branches.filter(b => !b.startsWith("upkeep/"))) focusSel.append(el("option", { value: b }, b))
@@ -310,7 +338,11 @@ async function renderRepoPage(repoId) {
   content.append(el("div", { class: "repo-head" },
     el("a", { href: `${BASE}/repos`, class: "muted", style: "text-decoration:none" }, "Repos"), el("span", { class: "muted" }, "/"),
     el("h1", { class: "page" }, repo.name || repoId),
-    el("label", { class: "row muted", style: "gap:6px" }, "Focus", focusSel), tree, el("div", { class: "spacer" }), pathEl))
+    el("label", { class: "row muted", style: "gap:6px" }, "Focus", focusSel), tree, el("div", { class: "spacer" }), pathEl,
+    menu(`More actions for ${repo.name || repoId}`, [
+      { label: "Copy folder path", run: () => { navigator.clipboard?.writeText(repo.path); toast("Path copied", "ok") } },
+      { label: "Remove from Upstream Manager", danger: true, run: removeRepo },
+    ])))
 
   const upWrap = el("div", { class: "panel ups" }, loading("Comparing upstreams…"))
   const compWrap = el("div")
@@ -2151,7 +2183,8 @@ function currentView() {
   const parts = path.split('/').filter(Boolean)
   if (parts[0] === 'repo' && parts[1]) return ['repo', decodeURIComponent(parts[1])]
   if (['requests', 'settings', 'chats', 'workflows'].includes(parts[0])) return [parts[0]]
-  return ['repos']
+  if (!parts.length || parts[0] === 'repos') return ['repos']
+  return ['notfound']
 }
 
 async function router() {
@@ -2163,7 +2196,7 @@ async function router() {
     a.classList.toggle("on", on)
     if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current")
   }
-  document.title = { repos: "Repositories", repo: id, chats: "Chats", workflows: "Workflows", requests: "Requests", settings: "Settings" }[view] + " · Upstream Manager"
+  document.title = ({ repos: "Repositories", repo: id, chats: "Chats", workflows: "Workflows", requests: "Requests", settings: "Settings" }[view] || "Not found") + " · Upstream Manager"
   try {
     if (view === "repos") await renderRepos()
     else if (view === "repo") await renderRepoPage(id)
@@ -2171,6 +2204,9 @@ async function router() {
     else if (view === "workflows") await renderWorkflows()
     else if (view === "requests") await renderRequests()
     else if (view === "settings") await renderSettings()
+    else $("#content").replaceChildren(el("div", { class: "card", style: "max-width:520px;margin:40px auto;text-align:center" },
+      el("h1", { class: "page" }, "Page not found"), el("p", { class: "muted" }, `There is no page at ${location.pathname}.`),
+      el("a", { href: `${BASE}/repos`, class: "btn" }, "Go to your repos")))
   } catch (e) { $("#content").replaceChildren(el("p", { class: "muted" }, `Could not load this page: ${e.message}`)) }
   refreshPendingCount()
 }
