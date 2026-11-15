@@ -38,6 +38,33 @@ WATCH_FOLDERS = [
 ]
 
 
+def _free_id(base: str, path: str) -> str:
+    """The repo id for `path`: its own id if it is already tracked, else `base`, or base-2, -3... when another
+    repo (a different folder with the same name) has it."""
+    for r in store.all_repos():
+        if Path(r.get("path", "")).resolve() == Path(path).resolve():
+            return r["id"]
+    taken = {r["id"] for r in store.all_repos()} | {store.GENERAL}
+    rid, n = base, 2
+    while rid in taken:
+        rid, n = f"{base}-{n}", n + 1
+    return rid
+
+
+def _focus(path: str, wanted: str | None) -> str:
+    """The branch checked out, or with a detached HEAD the remote's default (else main/master)."""
+    if wanted:
+        return wanted
+    cur = gitops.current_branch(path)
+    if cur and cur != "HEAD":
+        return cur
+    head = gitops._run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=path).stdout.strip()
+    for b in ([head.split("/", 1)[1]] if "/" in head else []) + ["main", "master"]:
+        if gitops.ref_exists(path, f"refs/heads/{b}"):
+            return b
+    raise ValueError("the repo has a detached HEAD and no main or master branch: pick its focus branch")
+
+
 def slugify(text: str) -> str:
     text = (text or "").strip().lower()
     text = re.sub(r"[^a-z0-9._-]+", "-", text)
@@ -117,8 +144,8 @@ def add_repo(path: str | None, url: str | None, name: str | None,
         remotes = gitops.remotes(str(p))
         if focus_branch and not gitops.ref_exists(str(p), f"refs/heads/{focus_branch}"):
             raise ValueError(f"{focus_branch!r} is not a branch in this repo")
-        fb = focus_branch or gitops.current_branch(str(p))
-        rid = slugify(name or p.name)
+        fb = _focus(str(p), focus_branch)
+        rid = _free_id(slugify(name or p.name), str(p))
         repo = {
             "id": rid,
             "name": name or p.name,
@@ -143,8 +170,8 @@ def add_repo(path: str | None, url: str | None, name: str | None,
         if not (os.path.exists(dest) and gitops.is_git_repo(dest)):
             gitops.clone_into(dest, norm)
         remotes = gitops.remotes(dest)
-        fb = focus_branch or gitops.current_branch(dest)
-        rid = slugify(name or Path(dest).name)
+        fb = _focus(dest, focus_branch)
+        rid = _free_id(slugify(name or Path(dest).name), dest)
         repo = {
             "id": rid,
             "name": name or Path(dest).name,
@@ -279,7 +306,11 @@ def repo_summary() -> list[dict]:
 
 def _summary(repo: dict) -> dict:
     ups, conflicts, error = [], [], None
+    if not gitops.is_git_repo(repo["path"]):
+        error = f"{repo['path']} is missing or no longer a git repository (moved or deleted?)"
     try:
+        if error:
+            raise RuntimeError(error)
         plan = upstream_check.build_merge_plan(
             repo["path"], repo["id"], repo["name"], repo.get("upstreams", []),
             focus_branch=repo.get("focus_branch"),

@@ -137,6 +137,9 @@ def fetch(repo_path: str, comp: dict) -> tuple[bool, str]:
         if res.returncode != 0:
             return False, (res.stderr or res.stdout).strip()
     sub = _sub(repo_path, comp)
+    # .gitmodules says where the upstream is; the submodule's own origin only follows after a sync.
+    if (_out(sub, "remote", "get-url", "origin") or "") != comp["url"]:
+        _git(repo_path, "submodule", "sync", "--", comp["path"])
     res = _git(sub, "fetch", "--prune", "--tags", "origin")
     if res.returncode != 0:
         return False, (res.stderr or res.stdout).strip()

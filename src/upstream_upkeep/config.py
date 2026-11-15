@@ -30,16 +30,27 @@ def load() -> dict[str, Any]:
         if not CONFIG_PATH.exists():
             return {"repos": [], "settings": {}}
         try:
-            return json.loads(CONFIG_PATH.read_text())
-        except json.JSONDecodeError:
-            return {"repos": [], "settings": {}}
+            data = json.loads(CONFIG_PATH.read_text())
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+            return data
+        except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+            # Never start empty over a damaged file: the next save would wipe every repo and
+            # setting. Keep it aside and stop, so the person can restore it.
+            kept = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.corrupt-{datetime.now():%Y%m%d-%H%M%S}")
+            os.replace(CONFIG_PATH, kept)
+            raise RuntimeError(f"{CONFIG_PATH} could not be read ({e}); it was kept as {kept}. "
+                               "Restore it (or remove it to start empty) and start again.")
 
 
 def save(state: dict[str, Any]) -> None:
     with _lock:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = CONFIG_PATH.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state, indent=2, sort_keys=False))
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(state, indent=2, sort_keys=False))
+            f.flush()
+            os.fsync(f.fileno())  # a crash mid-save leaves the old file, never a half-written one
         os.replace(tmp, CONFIG_PATH)
 
 

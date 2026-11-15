@@ -60,6 +60,21 @@ def _user_only(what: str):
     return None
 
 
+@flask_app.errorhandler(TypeError)
+@flask_app.errorhandler(ValueError)
+@flask_app.errorhandler(AttributeError)
+def _bad_input(e):
+    """A body of the wrong shape (an array, a number for a path, ...) is the caller's mistake: 400, not 500.
+    The traceback still goes to the log, in case it is ours."""
+    flask_app.logger.warning("bad request %s %s: %r", request.method, request.path, e, exc_info=True)
+    return jsonify({"ok": False, "error": f"bad request: {e}"}), 400
+
+
+@flask_app.errorhandler(store.SessionNotFound)
+def _no_such_chat(e):
+    return jsonify({"ok": False, "error": f"no chat {e.args[0]} (it may have been deleted)"}), 404
+
+
 @flask_app.before_request
 def _refuse_cross_site_writes():
     """Refuse state-changing requests that another web page could forge.
@@ -952,19 +967,32 @@ def api_file(repo_id):
                     "mtime": str(f.stat().st_mtime_ns)})  # a string: nanoseconds lose precision as a JS number
 
 
-def _writable(repo: dict, rel: str) -> Path | None:
-    """A path inside the repo that the editor may change: not the root, nothing in .git."""
+def _writable(repo: dict, rel) -> Path | None:
+    """A path inside the repo that the editor may change: not the root, nothing in .git.
+
+    The last part is not resolved, so a symlink is renamed or deleted as the link itself,
+    never as the file it points to; a link whose target is outside the repo is refused."""
+    if not isinstance(rel, str) or not rel.strip() or "\0" in rel or os.path.isabs(rel):
+        return None
     root = Path(repo["path"]).resolve()
-    p = _repo_file(repo, rel or "")
-    if p is None or p == root:
+    parts = [x for x in Path(rel).parts if x not in ("", ".")]
+    if not parts or ".." in parts or ".git" in {x.casefold() for x in parts}:
         return None
-    if ".git" in {x.casefold() for x in p.relative_to(root).parts}:
+    parent = (root.joinpath(*parts[:-1])).resolve()
+    if parent != root and root not in parent.parents:
         return None
+    p = parent / parts[-1]
+    if p.is_symlink():
+        target = p.resolve()
+        if target != root and root not in target.parents:
+            return None
     return p
 
 
 def _rel(repo: dict, p: Path) -> str:
-    return p.relative_to(Path(repo["path"]).resolve()).as_posix()
+    root = Path(repo["path"]).resolve()
+    p = p.parent.resolve() / p.name if p.is_symlink() or not p.exists() else p.resolve()
+    return p.relative_to(root).as_posix()
 
 
 @flask_app.route("/api/repo/<repo_id>/file", methods=["POST"])
@@ -979,11 +1007,22 @@ def api_file_save(repo_id):
     p = _writable(repo, data.get("path"))
     if p is None or p.is_dir() or not isinstance(data.get("content"), str):
         return jsonify({"ok": False, "error": "can't write that path"}), 400
+    try:
+        raw = data["content"].encode("utf-8")  # before touching the file: a failed encode must not empty it
+    except UnicodeEncodeError:
+        return jsonify({"ok": False, "error": "the text has characters that can't be saved as UTF-8"}), 400
+    if p.parent.exists() and not p.parent.is_dir():
+        return jsonify({"ok": False, "error": f"{_rel(repo, p.parent)} is a file, not a folder"}), 400
     if p.exists() and data.get("mtime") and not data.get("force") and str(p.stat().st_mtime_ns) != str(data["mtime"]):
         return jsonify({"ok": False, "error": "the file changed on disk since you opened it", "changed": True}), 409
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(data["content"], encoding="utf-8")
-    return jsonify({"ok": True, "path": _rel(repo, p), "mtime": str(p.stat().st_mtime_ns)})
+    real = p.resolve() if p.is_symlink() else p  # save through a link to its target (inside the repo)
+    tmp = real.with_name(f".{real.name}.upkeep-tmp")
+    tmp.write_bytes(raw)
+    if real.exists():
+        os.chmod(tmp, real.stat().st_mode & 0o7777)
+    os.replace(tmp, real)  # all or nothing
+    return jsonify({"ok": True, "path": _rel(repo, p), "mtime": str(real.stat().st_mtime_ns)})
 
 
 @flask_app.route("/api/repo/<repo_id>/changes")
@@ -1021,8 +1060,10 @@ def api_file_new(repo_id):
     p = _writable(repo, data.get("path"))
     if p is None:
         return jsonify({"ok": False, "error": "can't create that path"}), 400
-    if p.exists():
+    if p.exists() or p.is_symlink():
         return jsonify({"ok": False, "error": f"{_rel(repo, p)} already exists"}), 409
+    if p.parent.exists() and not p.parent.is_dir():
+        return jsonify({"ok": False, "error": f"{_rel(repo, p.parent)} is a file, not a folder"}), 400
     if data.get("dir"):
         p.mkdir(parents=True)
     else:
@@ -1040,11 +1081,11 @@ def api_file_rename(repo_id):
     repo = _in_workspace(repo, (request.get_json(silent=True) or {}).get("ws"))
     data = request.get_json(force=True) or {}
     src, dst = _writable(repo, data.get("path")), _writable(repo, data.get("to"))
-    if src is None or dst is None or not src.exists():
+    if src is None or dst is None or not (src.exists() or src.is_symlink()):
         return jsonify({"ok": False, "error": "can't rename that path"}), 400
-    if dst.exists():
+    if dst.exists() or dst.is_symlink():
         return jsonify({"ok": False, "error": f"{_rel(repo, dst)} already exists"}), 409
-    if src in dst.parents:
+    if src in dst.parents or src == dst:
         return jsonify({"ok": False, "error": "can't move a folder into itself"}), 400
     dst.parent.mkdir(parents=True, exist_ok=True)
     src.rename(dst)
@@ -1103,6 +1144,10 @@ def api_run_daily():
     results = []
     with _run_lock:
         for repo in registry.get_watching_repos():
+            if not gitops.is_git_repo(repo["path"]):  # moved, deleted, or its .git removed: never act on a parent repo
+                results.append({"repo_id": repo["id"], "repo_name": repo["name"], "status": "error",
+                                "error": f"{repo['path']} is missing or no longer a git repository"})
+                continue
             focus = repo.get("focus_branch") or gitops.current_branch(repo["path"]) or "main"
             try:
                 plan = upstream_check.build_merge_plan(repo["path"], repo["id"], repo["name"], repo["upstreams"],
@@ -1285,8 +1330,8 @@ def api_chat(repo_id):
         abort(404)
     data = request.get_json(force=True) or {}
     message = data.get("message")
-    if not message:
-        abort(400)
+    if not isinstance(message, str) or not message.strip():
+        return jsonify({"ok": False, "error": "write a message first"}), 400
     from . import llm
     reply = llm.chat(repo_id, message, data.get("session"), data.get("attachments") or [])
     return jsonify(reply)
