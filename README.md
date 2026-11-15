@@ -130,6 +130,29 @@ embedding model or vector database is needed.
   (or set `UPSTREAM_MEMORY`, `UPSTREAM_DAILY_LOG`, `UPSTREAM_MEMORY_AUTOCLEAN`
   to `off`).
 
+### Sending your days to an LLMWIKI vault
+
+If you keep an LLMWIKI vault (an Obsidian vault behind the Local REST API
+plugin and its LLMWIKI MCP Bridge), Upstream Manager feeds its short-term
+memory through the vault's MCP endpoint. It never writes the vault's long-term
+wiki; the vault's own Ingest and Rollover workflows file what it sends.
+
+```bash
+export LLMWIKI_MCP_URL=http://192.168.20.5:27123/mcp
+export LLMWIKI_API_KEY=...   # the Local REST API key; read from the environment, never stored
+```
+
+- After each daily check, one line in today's daily note (`memory_log`), for
+  example `Upkeep: omi-local fast-forwarded 12; argos request raised (2 conflicts) (upstream-manager)`.
+  Nothing is written on a day when nothing moved.
+- When a finished day's repo logs are all written, they go to the vault once
+  as `raw/sources/YYYY-MM-DD - Upstream Manager.md` (`memory_add_source`),
+  one section per repo. A source is never rewritten; a day whose logs failed
+  (the model was down) waits for the next pass.
+
+Both run in the background; if the vault is down the app carries on and logs
+a warning. Leave `LLMWIKI_MCP_URL` unset to turn this off.
+
 ## Components: one repo that pins other repos
 
 A hub repo that includes other projects as git submodules (for example
