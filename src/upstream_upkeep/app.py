@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import threading
 from datetime import date
 from pathlib import Path
@@ -35,7 +36,7 @@ from urllib.parse import urlparse
 from flask import Flask, jsonify, request, render_template_string, abort
 
 from . import (actions, agent_context, components, config, credentials, daily_check, edits, github, gitops, memory,
-               pull_report, registry, stacks, store, upstream_check, wiki, workflows, workspaces)
+               pull_report, registry, stacks, storage, store, upstream_check, wiki, workflows, workspaces)
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -931,7 +932,9 @@ def api_commits(repo_id):
         return jsonify({"ok": True, "items": items, "more": len(items) == limit})
     focus = repo.get("focus_branch") or "HEAD"
     ups = {u["name"]: u for u in repo.get("upstreams", [])}
-    up = ups.get(request.args.get("upstream", "")) or next(iter(ups.values()), None)
+    # Default: the first enabled upstream that is not your own origin (a fork's origin is rarely what you watch).
+    ranked = sorted(ups.values(), key=lambda u: (u.get("enabled") is False, u["name"] == "origin"))
+    up = ups.get(request.args.get("upstream", "")) or next(iter(ranked), None)
     upref = f"refs/remotes/{up['name']}/{up.get('branch') or focus}" if up else None
     if view in ("behind", "ahead") and not (upref and gitops.ref_exists(repo["path"], upref)):
         return jsonify({"ok": False, "error": "upstream not fetched yet - press Fetch", "items": []})
@@ -986,14 +989,34 @@ def api_tree(repo_id):
     if d is None or not d.is_dir():
         abort(400)
     root = Path(repo["path"]).resolve()
+    subs = _submodule_paths(root)
     entries = []
     for c in d.iterdir():
         if c.name == ".git":
             continue
-        entries.append({"name": c.name, "type": "dir" if c.is_dir() else "file",
-                        "path": c.relative_to(root).as_posix(), "size": c.stat().st_size if c.is_file() else None})
+        rel = c.relative_to(root).as_posix()
+        e = {"name": c.name, "type": "dir" if c.is_dir() else "file",
+             "path": rel, "size": c.stat().st_size if c.is_file() else None}
+        if rel in subs:
+            e["submodule"] = True
+            e["checked_out"] = c.is_dir() and any(c.iterdir())
+        entries.append(e)
     entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
-    return jsonify({"ok": True, "path": d.relative_to(root).as_posix() if d != root else "", "entries": entries})
+    here = d.relative_to(root).as_posix() if d != root else ""
+    out = {"ok": True, "path": here, "entries": entries}
+    if here in subs and not entries:
+        out["note"] = ("this is a component (git submodule) that is not checked out here; "
+                       "see the Components tab for how it compares with its upstream")
+    return jsonify(out)
+
+
+def _submodule_paths(root: Path) -> set:
+    """Paths of the submodules listed in .gitmodules (empty if there is none)."""
+    if not (root / ".gitmodules").is_file():
+        return set()
+    r = subprocess.run(["git", "config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"],
+                       cwd=root, capture_output=True, text=True)
+    return {line.split(None, 1)[1].strip() for line in r.stdout.splitlines() if " " in line}
 
 
 @flask_app.route("/api/repo/<repo_id>/file")
@@ -1556,6 +1579,23 @@ def api_memory_daylog(repo_id):
     return jsonify(memory.write_day_log(repo_id, day))
 
 
+@flask_app.route("/api/storage")
+def api_storage():
+    """Disk use: Upstream Manager's data, each repo's git folder and component copies, and what cleanup would free."""
+    return jsonify({"ok": True, **storage.usage()})
+
+
+@flask_app.route("/api/storage/cleanup", methods=["POST"])
+def api_storage_cleanup():
+    """Remove Upstream Manager's own leftovers. {"dry_run": true} previews; "what" picks parts."""
+    data = request.get_json(silent=True) or {}
+    dry = bool(data.get("dry_run"))
+    if not dry and (denied := _user_only("Cleaning up data")):
+        return denied
+    what = data.get("what")
+    return jsonify({"ok": True, **storage.cleanup(dry_run=dry, what=what if isinstance(what, list) else None)})
+
+
 @flask_app.route("/api/repo/<repo_id>/memory/cleanup", methods=["POST"])
 def api_memory_cleanup(repo_id):
     """Clean up: {"dry_run": true} previews (thorough), {"ids": [...]} deletes exactly those."""
@@ -1913,6 +1953,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     .btn { height: 40px; } .btn.small { height: 34px; } .tab { height: 38px; }
     .path { max-width: 100%; }
   }
+.tbl{border-collapse:collapse}.tbl th,.tbl td{padding:4px 8px;border-bottom:1px solid var(--line, rgba(127,127,127,.2))}.tbl th{position:sticky;top:0;background:var(--panel, var(--bg));font-weight:600}
 </style>
 <link rel="stylesheet" href="{{ base_url }}/static/vendor/codemirror/codemirror.css">
 </head>

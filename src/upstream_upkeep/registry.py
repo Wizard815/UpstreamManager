@@ -75,32 +75,31 @@ def slugify(text: str) -> str:
 
 
 def parse_git_url(url: str) -> str:
-    """Validate / normalise a git URL. Returns the URL or raises ValueError."""
+    """Validate a git URL from any host and return it as given (trimmed). Raises ValueError.
+
+    Accepted: http(s)://, ssh://, git://, file:// URLs; scp-like user@host:path (git@gitlab.com:g/p.git);
+    and an absolute path to a repo or bare mirror on this machine. Nothing is appended, since some
+    hosts (Azure DevOps, some Gitea setups) do not accept a ".git" that was not in the URL."""
     url = (url or "").strip()
     if not url:
         raise ValueError("git URL is required")
-    if url.endswith(".git"):
-        url = url[:-4]
-    # allow https://host/org/repo, git@host:org/repo, ssh://...
-    patterns = [
-        r"^git@[^\s:/][^\s]*:[^\s]+\.git?$",  # scp-like: git@github.com:org/repo
-        r"^https?://[^\s]+$",                 # http(s)://...
-        r"^ssh://[^\s]+",                      # ssh://...
-    ]
-    if not any(re.match(p, url) for p in patterns):
+    if re.search(r"\s", url):
         raise ValueError(f"looks like not a git URL: {url!r}")
-    if "://" not in url and not url.startswith("git@"):
-        url = url.lstrip("/\\")
-        if "/" in url and not url.startswith("git@"):
-            url = "https://" + url
-    if not url.endswith(".git"):
-        url = url.rstrip("/") + ".git"
-    return url
+    if re.match(r"^(https?|ssh|git|file)://[^/]", url) or re.match(r"^file:///", url):
+        return url
+    if re.match(r"^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^/\\].*", url):  # scp-like
+        return url
+    if os.path.isabs(url) and os.path.isdir(url):  # a repo or mirror on this machine
+        return url
+    if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[^/]+/.+", url):  # github.com/org/repo without a scheme
+        return "https://" + url
+    raise ValueError(f"looks like not a git URL: {url!r}")
 
 
 def repo_dir_for_url(watch: Path, url: str) -> str:
     parsed = urlparse(url)
-    name = parsed.path.rstrip("/").split("/")[-1] or "clone"
+    path = parsed.path if parsed.scheme else url.split(":", 1)[-1] if "@" in url.split("/", 1)[0] else url
+    name = re.sub(r"\.git$", "", path.rstrip("/").split("/")[-1]) or "clone"
     return os.path.join(str(watch), name)
 
 
