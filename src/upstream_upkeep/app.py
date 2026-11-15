@@ -35,7 +35,7 @@ from urllib.parse import urlparse
 from flask import Flask, jsonify, request, render_template_string, abort
 
 from . import (actions, agent_context, components, config, credentials, daily_check, edits, github, gitops, memory,
-               pull_report, registry, stacks, store, upstream_check, workflows, workspaces)
+               pull_report, registry, stacks, store, upstream_check, wiki, workflows, workspaces)
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -1099,6 +1099,7 @@ def api_run_daily():
                 results.append({"repo_id": repo["id"], "status": "error", "error": str(e)})
     for r in results:
         _remember_daily(r)
+    wiki.log_daily(results)  # one line in the LLMWIKI daily note, when it is set up
     memory.write_due_logs_soon()  # log any finished day that has no log yet
     return jsonify({"ok": True, "results": results})
 
