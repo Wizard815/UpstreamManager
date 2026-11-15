@@ -225,3 +225,46 @@ def test_releases_are_version_tags_only(hub):
     assert st["release"] == "v1.0.0" and st["status"] == "up_to_date" and st["unreleased"] == 1
     components.update_settings(comp, {"tag_pattern": "v*-rc*"})  # a pattern of your own is taken as given
     assert components.compare(str(h), comp)["release"] == "v2.0.0-rc.1"
+
+
+def test_components_that_are_not_checked_out_are_compared_from_history_only(client, tmp_path):
+    """A hub like TheRock pins huge projects: comparing and bumping must never check them out."""
+    lib = _app(tmp_path, "biglib")
+    git(lib, "config", "uploadpack.allowFilter", "true")
+    git(lib, "tag", "v1.0.0")
+    origin = tmp_path / "hub-origin"
+    origin.mkdir()
+    git(origin, "init", "-q", "-b", "main")
+    git(origin, "config", "user.email", "t@t.t"); git(origin, "config", "user.name", "T")
+    commit_file(origin, "README.md", "hub\n", "hub")
+    git(origin, "-c", "protocol.file.allow=always", "submodule", "add", "-q", f"file://{lib}", "deps/biglib")
+    git(origin, "commit", "-qm", "pin biglib")
+    hub = tmp_path / "hub"
+    git(tmp_path, "clone", "-q", str(origin), str(hub))  # submodules not initialised
+    git(hub, "config", "user.email", "t@t.t"); git(hub, "config", "user.name", "T")
+    commit_file(lib, "src/model.js", "export const v = 2\n", "v2 work")
+    git(lib, "tag", "v1.1.0")
+    commit_file(lib, "README.md", "unreleased\n", "unreleased")
+    registry.add_repo(str(hub), None, "hub")
+    comp = store.get_repo("hub")["components"][0]
+    assert components.compare(str(hub), comp)["status"] == "not_checked_out"
+    st = client.post("/api/repo/hub/components/fetch", json={}).get_json()["items"][0]
+    assert (st["mode"], st["behind"], st["status"]) == ("history", 2, "ok")
+    assert not any((hub / "deps" / "biglib").iterdir())  # still not checked out
+    client.post("/api/repo/hub/components/deps/biglib", json={"follow": "releases"})
+    st = client.get("/api/repo/hub/components").get_json()["items"][0]
+    assert (st["release"], st["behind"], st["unreleased"]) == ("v1.1.0", 1, 1)
+    req = client.post("/api/repo/hub/components/request", json={}).get_json()["request"]
+    out = client.post(f"/api/request/{req['id']}/decide", json={"decision": "approve"}).get_json()
+    assert out["ok"], out
+    assert git(hub, "ls-tree", "HEAD", "deps/biglib").split()[2] == git(lib, "rev-parse", "v1.1.0^{commit}")
+    assert git(hub, "status", "--porcelain") == "" and not any((hub / "deps" / "biglib").iterdir())
+    assert client.get("/api/repo/hub/commits?component=deps/biglib&view=behind").get_json()["ok"]
+
+
+def test_a_branch_missing_upstream_names_the_default(hub):
+    h, a, _ = hub
+    comp = store.get_repo("hub")["components"][0]
+    components.update_settings(comp, {"branch": "mainline"})
+    st = components.compare(str(h), comp, do_fetch=True)
+    assert st["status"] == "error" and "no branch mainline" in st["detail"] and "default branch is main" in st["detail"]

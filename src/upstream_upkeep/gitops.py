@@ -21,15 +21,17 @@ _ENV_KEYS = {
 
 
 def _run(args: list[str], cwd: str | None = None, check: bool = False,
-         extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+         extra_env: dict[str, str] | None = None, timeout: float | None = None) -> subprocess.CompletedProcess:
     env = {k: v for k, v in __import__("os").environ.items() if k.upper() in _ENV_KEYS}
     env["GIT_TERMINAL_PROMPT"] = "0"  # never hang waiting for a password
     env.update(extra_env or {})  # e.g. a one-off auth header for a push (see github.py)
     try:
         return subprocess.run(
             args, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            env=env, check=check,
+            env=env, check=check, timeout=timeout,
         )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"timed out after {timeout:.0f}s")
     except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
         # A repo folder that was moved or deleted: a failed git call, not a crash of every page.
         if check:
@@ -140,9 +142,34 @@ def short_sha(path: str, rev: str | None = None) -> str | None:
 
 
 # ------------------------------------------------------------ compare / browse
-def fetch(path: str, remote: str) -> tuple[bool, str]:
-    """Update refs/remotes/<remote>/* from the network. Returns (ok, message)."""
-    res = _run(["git", "fetch", "--prune", remote], cwd=path)
+FETCH_TIMEOUT = 900
+
+
+def is_partial(path: str) -> bool:
+    """A blob-less (partial) clone: file contents arrive on demand."""
+    # git used to set extensions.partialclone; newer versions mark the remote a promisor instead
+    out = _run(["git", "config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$"], cwd=path).stdout
+    return any(l.split(None, 1)[-1].strip().lower() not in ("", "false") for l in out.splitlines())
+
+
+def fetch(path: str, remote: str, branch: str | None = None) -> tuple[bool, str]:
+    """Update refs/remotes/<remote>/... from the network. Returns (ok, message).
+
+    With `branch` (an upstream compared on one branch) only that branch is fetched, without tags:
+    big upstreams carry hundreds of branches and tags nobody compares. A partial clone stays
+    partial (history only; contents come on demand when a merge needs them). A stalled
+    connection is dropped instead of holding up the daily check.
+    """
+    args = ["git", "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=120", "fetch", "--prune"]
+    if is_partial(path):
+        args.append("--filter=blob:none")
+    if branch:
+        if not valid_branch_name(path, branch):
+            return False, f"bad branch name {branch!r}"
+        args += ["--no-tags", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"]
+    else:
+        args.append(remote)
+    res = _run(args, cwd=path, timeout=FETCH_TIMEOUT)
     return res.returncode == 0, (res.stderr or res.stdout).strip()
 
 
