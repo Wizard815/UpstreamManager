@@ -569,7 +569,7 @@ def api_pull_report(repo_id):
         st = components.compare(repo["path"], comp)
         if st["status"] in ("not_checked_out", "not_fetched", "error"):
             return jsonify({"ok": False, "error": st["detail"]})
-        sub = str(Path(repo["path"]) / comp["path"])
+        sub = str(components.store_dir(repo["path"], comp))  # its checkout, or its history copy
         report = pull_report.analyze(sub, st["pin"], f"refs/remotes/origin/{st['branch']}", comp.get("watch_paths"))
         return jsonify({**report, "source": f"component {comp_name}", "into": f"pin {st['pin'][:10]}"})
     up = next((u for u in repo.get("upstreams", []) if u["name"] == request.args.get("upstream")), None)
@@ -924,7 +924,7 @@ def api_commits(repo_id):
         st = components.compare(repo["path"], comp)
         if st["status"] in ("not_checked_out", "not_fetched", "error"):
             return jsonify({"ok": False, "error": st["detail"], "items": []})
-        sub = str(Path(repo["path"]) / comp["path"])
+        sub = str(components.store_dir(repo["path"], comp))  # its checkout, or its history copy
         ref = f"refs/remotes/origin/{st['branch']}"
         rev = {"behind": f"{st['pin']}..{ref}", "ahead": f"{ref}..{st['pin']}"}.get(view, st["pin"])
         items = gitops.list_commits(sub, rev, skip, limit, q)
@@ -951,7 +951,7 @@ def api_commit(repo_id, sha):
         comp = next((c for c in repo.get("components") or [] if c["name"] == comp_name), None)
         if not comp:
             abort(404)
-        path = str(Path(repo["path"]) / comp["path"])
+        path = str(components.store_dir(repo["path"], comp) or Path(repo["path"]) / comp["path"])
     try:
         return jsonify({"ok": True, **gitops.commit_detail(path, sha)})
     except gitops.GitError as e:
@@ -1192,7 +1192,24 @@ def api_run_daily():
     """
     results = []
     with _run_lock:
-        for repo in registry.get_watching_repos():
+        watching = registry.get_watching_repos()
+        # The network part first, several repos at a time; then each repo's decisions, one by one.
+        from concurrent.futures import ThreadPoolExecutor
+
+        def prefetch(repo):
+            if not gitops.is_git_repo(repo["path"]):
+                return repo["id"], {}
+            focus = repo.get("focus_branch") or gitops.current_branch(repo["path"]) or "main"
+            errs = {}
+            for up in repo.get("upstreams") or []:
+                if up.get("enabled", True):
+                    c = upstream_check.compare_upstream(repo["path"], up, focus, fetch=True)
+                    if c.conflict_detail and c.missing_ref:
+                        errs[up["name"]] = c.conflict_detail
+            return repo["id"], errs
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            fetch_errors = dict(pool.map(prefetch, watching))
+        for repo in watching:
             if not gitops.is_git_repo(repo["path"]):  # moved, deleted, or its .git removed: never act on a parent repo
                 results.append({"repo_id": repo["id"], "repo_name": repo["name"], "status": "error",
                                 "error": f"{repo['path']} is missing or no longer a git repository"})
@@ -1200,7 +1217,10 @@ def api_run_daily():
             focus = repo.get("focus_branch") or gitops.current_branch(repo["path"]) or "main"
             try:
                 plan = upstream_check.build_merge_plan(repo["path"], repo["id"], repo["name"], repo["upstreams"],
-                                                       focus_branch=focus, fetch=True)
+                                                       focus_branch=focus, fetch=False)
+                for up in plan.upstreams:  # keep the fetch's own error (offline, no such branch) in the result
+                    if up.missing_ref and fetch_errors.get(repo["id"], {}).get(up.name):
+                        up.conflict_detail = fetch_errors[repo["id"]][up.name]
                 pending = []
                 for up in plan.upstreams:
                     if up.missing_ref:  # say so: a silent skip reads as "up to date"

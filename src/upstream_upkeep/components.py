@@ -20,6 +20,7 @@ watch_paths, after_update. Everything else is re-read from git every time.
 from __future__ import annotations
 
 import re
+import subprocess
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -100,7 +101,23 @@ def _sub(repo_path: str, comp: dict) -> Path:
 
 
 def initialized(repo_path: str, comp: dict) -> bool:
+    """Checked out as a submodule (its files are on disk)."""
     return (_sub(repo_path, comp) / ".git").exists()
+
+
+def _mirror(repo_path: str, comp: dict) -> Path:
+    """Where a component that is not checked out keeps its upstream's history, for comparing only:
+    a bare, tree-less copy (commits and tags, no folders or files) inside the hub's git dir."""
+    common = (_out(repo_path, "rev-parse", "--path-format=absolute", "--git-common-dir") or str(Path(repo_path) / ".git"))
+    return Path(common) / "upkeep-components" / (re.sub(r"[^A-Za-z0-9._-]+", "_", comp["name"]) + ".git")
+
+
+def store_dir(repo_path: str, comp: dict) -> Path | None:
+    """The git dir to read a component's history from: its checkout, else its history copy, else None."""
+    if initialized(repo_path, comp):
+        return _sub(repo_path, comp)
+    m = _mirror(repo_path, comp)
+    return m if m.is_dir() else None
 
 
 def pin(repo_path: str, comp: dict) -> str | None:
@@ -116,7 +133,7 @@ def branch(repo_path: str, comp: dict) -> str:
     """Configured branch, else the upstream's default (origin/HEAD), else main/master."""
     if comp.get("branch"):
         return comp["branch"]
-    sub = _sub(repo_path, comp)
+    sub = store_dir(repo_path, comp) or _sub(repo_path, comp)
     head = _out(sub, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
     if head and "/" in head:
         return head.split("/", 1)[1]
@@ -127,20 +144,40 @@ def branch(repo_path: str, comp: dict) -> str:
 
 
 def fetch(repo_path: str, comp: dict) -> tuple[bool, str]:
-    """Network step: check the submodule out if needed, then fetch its upstream.
+    """Network step: bring the component's upstream history up to date.
 
-    A first checkout uses a blob-less partial clone, so large projects (vikunja)
-    download file contents only when they are actually needed.
+    A checked-out submodule fetches into its own git dir. One that is not checked out is
+    never checked out for this (a hub like TheRock pins llvm-project: tens of GB): its
+    upstream's commits and tags go into a tree-less history copy, enough to count commits,
+    find releases and bump the pin.
     """
     if not initialized(repo_path, comp):
-        res = _git(repo_path, "submodule", "update", "--init", "--filter=blob:none", "--", comp["path"])
+        m = _mirror(repo_path, comp)
+        if not m.is_dir():
+            m.parent.mkdir(parents=True, exist_ok=True)
+            res = gitops._run(["git", "init", "-q", "--bare", str(m)])
+            if res.returncode != 0:
+                return False, (res.stderr or res.stdout).strip()
+            _git(m, "remote", "add", "origin", comp["url"])
+            _git(m, "config", "remote.origin.promisor", "true")
+            _git(m, "config", "remote.origin.partialclonefilter", "tree:0")
+        elif (_out(m, "remote", "get-url", "origin") or "") != comp["url"]:
+            _git(m, "remote", "set-url", "origin", comp["url"])
+        res = gitops._run(["git", "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=120", "fetch", "--prune",
+                           "--tags", "--filter=tree:0", "origin", "+refs/heads/*:refs/remotes/origin/*"],
+                          cwd=str(m), timeout=gitops.FETCH_TIMEOUT)
         if res.returncode != 0:
             return False, (res.stderr or res.stdout).strip()
+        if not comp.get("branch"):
+            _git(m, "remote", "set-head", "origin", "--auto")
+        return True, ""
     sub = _sub(repo_path, comp)
     # .gitmodules says where the upstream is; the submodule's own origin only follows after a sync.
     if (_out(sub, "remote", "get-url", "origin") or "") != comp["url"]:
         _git(repo_path, "submodule", "sync", "--", comp["path"])
-    res = _git(sub, "fetch", "--prune", "--tags", "origin")
+    res = gitops._run(["git", "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=120", "fetch", "--prune", "--tags",
+                       *(["--filter=blob:none"] if gitops.is_partial(str(sub)) else []), "origin"],
+                      cwd=str(sub), timeout=gitops.FETCH_TIMEOUT)
     if res.returncode != 0:
         return False, (res.stderr or res.stdout).strip()
     if not comp.get("branch"):
@@ -163,21 +200,36 @@ def compare(repo_path: str, comp: dict, do_fetch: bool = False, light: bool = Fa
         if not ok:
             out.update(status="error", detail=f"fetch failed: {msg}")
             return out
-    if not initialized(repo_path, comp):
-        out.update(status="not_checked_out", detail="not checked out yet - press Fetch")
+    store = store_dir(repo_path, comp)
+    if store is None:
+        out.update(status="not_checked_out", detail="not compared yet - press Fetch (it downloads only the upstream's history)")
         return out
-    sub = str(_sub(repo_path, comp))
+    sub = str(store)
+    out["mode"] = "checkout" if initialized(repo_path, comp) else "history"
     out["branch"] = br = branch(repo_path, comp)
     ref = f"refs/remotes/origin/{br}"
-    checked_out = _out(sub, "rev-parse", "HEAD")
+    checked_out = _out(sub, "rev-parse", "HEAD") if out["mode"] == "checkout" else None
     out["checked_out"] = checked_out
     out["moved"] = bool(checked_out and out["pin"] and checked_out != out["pin"])
-    out["dirty"] = 0 if light else len([l for l in (_out(sub, "status", "--porcelain") or "").splitlines() if l.strip()])
+    out["dirty"] = 0 if light or out["mode"] != "checkout" else \
+        len([l for l in (_out(sub, "status", "--porcelain") or "").splitlines() if l.strip()])
     if not out["pin"]:
         out.update(status="error", detail="the hub's HEAD has no pin for this path")
         return out
-    if not gitops.ref_exists(sub, ref) or not gitops.ref_exists(sub, out["pin"]):
-        out.update(status="not_fetched", detail=f"origin/{br} not fetched yet - press Fetch")
+    if not gitops.ref_exists(sub, ref):
+        fetched = _out(sub, "for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes/origin/")
+        if fetched:  # the upstream was fetched: the branch itself is missing (renamed upstream?)
+            head = _out(sub, "symbolic-ref", "--short", "refs/remotes/origin/HEAD") or ""
+            default = head.split("/", 1)[1] if "/" in head else None
+            out.update(status="error", detail=f"the upstream has no branch {br} (from .gitmodules or this component's settings)"
+                       + (f"; its default branch is {default}: set the component's branch to {default}" if default else ""))
+        else:
+            out.update(status="not_fetched", detail=f"origin/{br} not fetched yet - press Fetch")
+        return out
+    if not gitops.ref_exists(sub, out["pin"]):
+        out.update(status="not_fetched", detail=("the pinned commit isn't in the upstream's history (your own commits?): "
+                                                 "check the submodule out to compare it" if out["mode"] == "history"
+                                                 else f"origin/{br} not fetched yet - press Fetch"))
         return out
     out["follow"] = comp.get("follow") or "branch"
     out["pin_tag"] = _out(sub, "describe", "--tags", "--exact-match", out["pin"])
@@ -217,11 +269,7 @@ def compare(repo_path: str, comp: dict, do_fetch: bool = False, light: bool = Fa
 def compare_all(repo: dict, do_fetch: bool = False, light: bool = False) -> list[dict]:
     """Every component, compared in parallel (each one is its own git repo, all read-only)."""
     comps = repo.get("components") or []
-    if do_fetch:
-        # First-time checkouts write the hub's .git/config and index: one at a time.
-        for c in comps:
-            if c.get("enabled", True) and not initialized(repo["path"], c):
-                _git(repo["path"], "submodule", "update", "--init", "--filter=blob:none", "--", c["path"])
+    # Nothing is checked out here: components that aren't get a history copy (see fetch).
     with ThreadPoolExecutor(max_workers=max(1, min(6, len(comps)))) as pool:
         return list(pool.map(lambda c: _compare_one(repo, c, do_fetch, light), comps))
 
@@ -264,7 +312,7 @@ def bump(repo: dict, names: list[str], focus: str) -> dict:
             results.append({"name": name, "ok": False, "detail": "no such component"})
             continue
         st = compare(path, comp)
-        sub = str(_sub(path, comp))
+        sub = str(store_dir(path, comp) or _sub(path, comp))
         if st["status"] in ("not_checked_out", "not_fetched", "error"):
             results.append({"name": name, "ok": False, "detail": st["detail"]})
         elif st["behind"] == 0:
@@ -278,7 +326,10 @@ def bump(repo: dict, names: list[str], focus: str) -> dict:
             results.append({"name": name, "ok": False, "detail": "the submodule is checked out at a different commit than the pin"})
         else:
             target = st["upstream"]  # the branch head, or the newest release when following releases
-            res = _git(sub, "checkout", "-q", "--detach", target)
+            if st.get("mode") == "history":  # not checked out: just record the new pin
+                res = _git(path, "update-index", "--cacheinfo", f"160000,{target},{comp['path']}")
+            else:
+                res = _git(sub, "checkout", "-q", "--detach", target)
             if res.returncode != 0:
                 results.append({"name": name, "ok": False, "detail": (res.stderr or res.stdout).strip()})
                 continue
@@ -294,12 +345,16 @@ def bump(repo: dict, names: list[str], focus: str) -> dict:
     paths = [c["path"] for c, *_ in moved]
     subject = "Bump " + ", ".join(f"{c['name']} to {t[:8]}" for c, _, t, _ in moved)
     body = "\n".join(f"- {c['name']} ({c['path']}): {p[:10]} -> {t[:10]}, {n} upstream commit(s)" for c, p, t, n in moved)
-    res = _git(path, "add", "--", *paths)
-    if res.returncode == 0:
-        res = _git(path, "commit", "-q", "-m", subject, "-m", body, "--", *paths)
+    checked = [c["path"] for c, *_ in moved if initialized(path, c)]
+    res = _git(path, "add", "--", *checked) if checked else subprocess.CompletedProcess([], 0, "", "")
+    if res.returncode == 0:  # blocker() made sure nothing else is staged
+        res = _git(path, "commit", "-q", "-m", subject, "-m", body)
     if res.returncode != 0:
         for comp, old_pin, *_ in moved:  # leave everything as it was
-            _git(_sub(path, comp), "checkout", "-q", "--detach", old_pin)
+            if initialized(path, comp):
+                _git(_sub(path, comp), "checkout", "-q", "--detach", old_pin)
+            else:
+                _git(path, "update-index", "--cacheinfo", f"160000,{old_pin},{comp['path']}")
         _git(path, "reset", "-q", "--", *paths)
         detail = (res.stderr or res.stdout).strip()
         if "Please tell me who you are" in detail or "user.email" in detail:

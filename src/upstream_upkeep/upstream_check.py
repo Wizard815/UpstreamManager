@@ -91,9 +91,15 @@ def compare_upstream(path: str, upstream: dict, focus_branch: str | None = None,
 
     fetch_error = None
     if fetch:
-        ok, msg = gitops.fetch(path, remote)
+        # origin is fetched whole (its branches feed branch sets); other upstreams just the compared branch
+        ok, msg = gitops.fetch(path, remote, None if remote == "origin" else branch)
         if not ok:
             fetch_error = msg
+            if "couldn't find remote ref" in msg:
+                head = gitops._run(["git", "ls-remote", "--symref", remote, "HEAD"], cwd=path, timeout=60).stdout
+                default = next((l.split()[1].removeprefix("refs/heads/") for l in head.splitlines() if l.startswith("ref:")), None)
+                fetch_error = (f"{remote} has no branch {branch}" + (f"; its default branch is {default}: set this upstream's "
+                               f"branch to {default}" if default else ""))
 
     ref = f"refs/remotes/{remote}/{branch}"
     if not gitops.ref_exists(path, focus):
