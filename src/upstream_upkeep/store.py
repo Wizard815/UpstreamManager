@@ -257,7 +257,7 @@ def new_session(repo_id: str) -> dict:
     repo = chat_owner(repo_id)
     sessions = _sessions(repo)
     # abandoned empty chats are clutter: drop them when starting another
-    sessions[:] = [s for s in sessions if s.get("messages")]
+    sessions[:] = [s for s in sessions if s.get("messages") or s.get("tags")]
     sid = f"s-{uuid.uuid4().hex[:8]}"
     session = {"id": sid, "title": None, "created_at": config.now_iso(), "messages": []}
     sessions.append(session)
@@ -287,14 +287,23 @@ def get_message(repo_id: str, session_id: str, index: int) -> dict | None:
     return msgs[index] if 0 <= index < len(msgs) else None
 
 
+class SessionNotFound(KeyError):
+    """A chat asked for by id that does not exist (deleted, perhaps in another tab)."""
+
+
 @_locked
 def get_session(repo_id: str, session_id: str | None = None) -> dict:
-    """The requested session, else the active one, else a fresh one."""
+    """The requested session, else the active one, else a fresh one.
+
+    A chat asked for by id that doesn't exist is an error, never quietly replaced by a new one:
+    that would post into a chat nobody sees and steal the user's active chat."""
     repo = chat_owner(repo_id)
     want = session_id or repo.get("active_session")
     for s in _sessions(repo):
         if s["id"] == want:
             return s
+    if session_id:
+        raise SessionNotFound(session_id)
     return new_session(repo_id)
 
 

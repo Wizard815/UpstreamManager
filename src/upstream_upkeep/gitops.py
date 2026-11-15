@@ -25,10 +25,16 @@ def _run(args: list[str], cwd: str | None = None, check: bool = False,
     env = {k: v for k, v in __import__("os").environ.items() if k.upper() in _ENV_KEYS}
     env["GIT_TERMINAL_PROMPT"] = "0"  # never hang waiting for a password
     env.update(extra_env or {})  # e.g. a one-off auth header for a push (see github.py)
-    return subprocess.run(
-        args, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        env=env, check=check,
-    )
+    try:
+        return subprocess.run(
+            args, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=env, check=check,
+        )
+    except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
+        # A repo folder that was moved or deleted: a failed git call, not a crash of every page.
+        if check:
+            raise
+        return subprocess.CompletedProcess(args, 128, "", f"{type(e).__name__}: {e.filename or cwd}")
 
 
 class GitError(Exception):
@@ -61,7 +67,13 @@ def _remotes(path: str) -> dict[str, str]:
 
 
 def is_git_repo(path: str) -> bool:
-    return _git(["rev-parse", "--is-inside-work-tree"], path) == "true"
+    """`path` is the top of a git checkout: not a folder inside one (whose git commands would
+    act on the enclosing repo), not a folder whose .git was deleted inside another repo."""
+    try:
+        top = _git(["rev-parse", "--show-toplevel"], path)
+    except GitError:
+        return False
+    return bool(top) and Path(top).resolve() == Path(path).resolve()
 
 
 def repo_name(path: str) -> str | None:

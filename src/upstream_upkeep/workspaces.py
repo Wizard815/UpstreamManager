@@ -171,6 +171,8 @@ def open_workspace(repo: dict, upstream: str | None = None, branches: list[str] 
     sources = [_resolve(repo, s) for s in wanted]
     if change and not sources:
         slug = re.sub(r"[^a-z0-9]+", "-", change.lower()).strip("-")[:40] or "change"
+        if not change.isascii():  # titles in other scripts slug to little or nothing: keep them apart
+            slug += "-" + hashlib.sha1(change.encode()).hexdigest()[:6]
         name = f"merge-change-{slug}"
     elif len(sources) == 1 and upstream:
         name = f"merge-{re.sub(r'[^A-Za-z0-9._-]', '-', upstream)}-{sources[0]['sha'][:10]}"
