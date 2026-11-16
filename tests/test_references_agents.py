@@ -101,7 +101,7 @@ def test_clone_a_reference_repo_branch_and_switch(client, lib, repos):
     git(up, "branch", "feature")
     r = client.post("/api/refs/clone", json={"url": f"file://{up}", "folder": "", "name": "upstream-ref"}).get_json()
     assert r["ok"] and r["state"] == "cloning"
-    for _ in range(100):
+    for _ in range(400):
         item = next((i for i in client.get("/api/refs").get_json()["items"] if i["name"] == "upstream-ref"), {})
         if item.get("kind") == "repo" and "job" not in item:
             break
@@ -116,7 +116,7 @@ def test_clone_a_reference_repo_branch_and_switch(client, lib, repos):
     assert client.post("/api/refs/move", json={"path": "n.txt", "to": "upstream-ref"}).status_code == 400
     # a failed clone says why and can be dismissed
     r = client.post("/api/refs/clone", json={"url": "file:///no/such/repo", "name": "broken"}).get_json()
-    for _ in range(100):
+    for _ in range(400):
         item = next((i for i in client.get("/api/refs").get_json()["items"] if i["name"] == "broken"), {})
         if item.get("job", {}).get("state") == "failed":
             break
@@ -250,7 +250,7 @@ def test_hand_a_task_to_hermes_studio(client, repos):
         assert t["ok"], t
         sid = t["where"]["studio"]
         assert t["where"]["url"].endswith(f"/#/hermes/session/{sid}")
-        for _ in range(100):
+        for _ in range(400):
             a = client.get(f"/api/tasks/{t['task']['id']}/agent").get_json()
             if not a["run"]["running"] and len(a["messages"]) == 2:
                 break

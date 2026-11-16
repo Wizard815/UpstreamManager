@@ -162,7 +162,9 @@ def _workspace(task: dict, repo: dict) -> dict | None:
         except Exception:
             pass
     if task.get("upstream"):
-        return workspaces.open_workspace(repo, upstream=task["upstream"], onto=task.get("onto"))
+        ws = workspaces.open_workspace(repo, upstream=task["upstream"], onto=task.get("onto"))
+        _exclude_commit_file(ws["path"])
+        return ws
     ws = workspaces.open_workspace(repo, change=f"{task['title']} {task['id'][:4]}", onto=task.get("onto"))
     _exclude_commit_file(ws["path"])
     return ws
@@ -234,6 +236,8 @@ def send_to(task_id: str, to: str, message: str | None = None) -> dict:
     if to not in WHERE:
         raise TaskError("to must be one of " + ", ".join(WHERE))
     repo = store.get_repo(task["repo_id"])
+    if repo is None and task["repo_id"] != store.GENERAL and to not in ("wiki", "orb"):
+        raise TaskError("this task's repo was removed from Upstream Manager: add it again, or park the task")
     if to == "here":
         ws = _workspace(task, repo)
         session = store.new_session(task["repo_id"])
@@ -281,10 +285,14 @@ def send_to(task_id: str, to: str, message: str | None = None) -> dict:
             except KeyError:
                 pass
         if to == "herdr":
+            alive = False
             if prev.get("type") == "herdr" and prev.get("agent"):
-                herdr.prompt(prev["agent"], message or brief(task, repo))
-                where = prev
-            else:
+                try:
+                    herdr.prompt(prev["agent"], message or brief(task, repo))
+                    alive, where = True, prev
+                except herdr.HerdrError:  # the agent's pane was closed: start a fresh one below
+                    alive = False
+            if not alive:
                 info = herdr.start(task_id, task["title"], workdir, agent_instructions(task, repo, workdir) + "\n\n" + (message or brief(task, repo)))
                 where = {"type": "herdr", **info, "workspace": ws and ws["name"], "workdir": workdir}
         else:
