@@ -108,8 +108,8 @@ def _save(ws: Path, meta: dict) -> None:
 
 
 def _unresolved(ws: Path) -> list[str]:
-    out = _git(ws, "diff", "--name-only", "--diff-filter=U").stdout
-    return [l for l in out.splitlines() if l.strip()]
+    out = _git(ws, "diff", "--name-only", "-z", "--diff-filter=U").stdout
+    return [l for l in out.split("\0") if l.strip()]
 
 
 def _markers(ws: Path, base: str, also: list[str] = ()) -> list[str]:

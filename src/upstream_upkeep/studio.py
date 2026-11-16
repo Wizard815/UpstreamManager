@@ -62,7 +62,10 @@ def _req(method: str, path: str, timeout: float = TIMEOUT, **kw) -> dict:
         except ValueError:
             msg = r.text[:300]
         raise StudioError(f"Studio said {r.status_code}: {msg}")
-    return r.json() if r.content else {}
+    try:
+        return r.json() if r.content else {}
+    except ValueError:
+        raise StudioError(f"Studio sent something that isn't JSON (is {s['url']} really Hermes Studio?)")
 
 
 def login(username: str, password: str) -> None:
@@ -71,9 +74,13 @@ def login(username: str, password: str) -> None:
         r = requests.post(s["url"].rstrip("/") + "/api/auth/login", json={"username": username, "password": password}, timeout=TIMEOUT)
     except requests.RequestException as e:
         raise StudioError(f"can't reach Hermes Studio at {s['url']}: {e}") from e
-    if r.status_code >= 400 or not (r.json() or {}).get("token"):
+    try:
+        token = (r.json() or {}).get("token") if r.status_code < 400 else None
+    except ValueError:
+        token = None
+    if not token:
         raise StudioError("Studio didn't accept that sign-in")
-    credentials.set("studio_token", r.json()["token"])
+    credentials.set("studio_token", token)
 
 
 def status() -> dict:

@@ -40,6 +40,7 @@ from . import (actions, agent_context, components, config, credentials, daily_ch
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
+flask_app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024  # one upload request; each file is capped lower (references.py)
 flask_app.config["JSON_SORT_KEYS"] = False
 
 # background lock so concurrent daily-checks don't race
@@ -47,6 +48,25 @@ _run_lock = threading.Lock()
 
 # Extra hosts (host:port) allowed to send changes, e.g. a proxy in front of the app.
 _ALLOWED_HOSTS = {h.strip() for h in os.environ.get("UPSTREAM_ALLOWED_HOSTS", "").split(",") if h.strip()}
+
+
+def _host_ok(host: str) -> bool:
+    """Who may call: localhost, an IP address (a DNS-rebinding page always uses a name), this machine's
+    own name, or a name listed in UPSTREAM_ALLOWED_HOSTS. Stops another site from posing as this one."""
+    if not host:
+        return False
+    name = host.rsplit(":", 1)[0].strip("[]").lower() if not host.endswith("]") else host.strip("[]").lower()
+    if name in ("localhost", "") or name.endswith(".localhost") or host in _ALLOWED_HOSTS or name in _ALLOWED_HOSTS:
+        return True
+    import ipaddress
+    import socket as _socket
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    me = _socket.gethostname().lower()
+    return name in (me, me.split(".")[0], me.split(".")[0] + ".local")
 
 
 def _from_agent() -> bool:
@@ -85,6 +105,8 @@ def _refuse_cross_site_writes():
     CORS preflight, which this app never approves, and a foreign Origin header
     is rejected outright. Reads are unaffected.
     """
+    if not _host_ok(request.host) and not _host_ok(request.headers.get("X-Forwarded-Host", "")):
+        return jsonify({"ok": False, "error": f"unknown host {request.host}: add it to UPSTREAM_ALLOWED_HOSTS"}), 403
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
     # File uploads are multipart; a custom header forces the same preflight a JSON body does.
@@ -884,14 +906,20 @@ def _task_root(repo: dict, session_id) -> dict:
         task_id = store.get_session(repo["id"], session_id).get("task") if session_id else None
     except store.SessionNotFound:
         return repo
-    t = tasks.get(task_id) if task_id else None
-    ws = t and (t.get("where") or {}).get("workspace") or (t or {}).get("workspace")
-    if ws:
-        try:
+    if not task_id:
+        return repo
+    t = tasks.get(task_id)
+    ws = t and ((t.get("where") or {}).get("workspace") or t.get("workspace"))
+    if t and not ws and t["kind"] not in tasks.CODE_KINDS:
+        return repo  # an idea's chat has no branch and edits nothing
+    try:
+        if ws:
             return {**repo, "path": str(workspaces.path_of(repo, ws))}
-        except workspaces.WorkspaceError:
-            pass
-    return repo
+    except workspaces.WorkspaceError:
+        pass
+    # a task chat edits its branch or nothing: never your own checkout
+    abort(flask_app.make_response((jsonify({"ok": False, "error": "this chat's task branch is gone (removed, or the task was deleted): "
+                                                                 "send the task to \"Work on it here\" again to get a new branch"}), 409)))
 
 
 @flask_app.route("/api/repo/<repo_id>/edits/apply", methods=["POST"])
@@ -1463,7 +1491,10 @@ def api_chat_history(repo_id):
     session = store.snapshot(store.get_session(repo_id, request.args.get("session")))
     repo = store.chat_owner(repo_id)
     if repo.get("path"):
-        repo = _task_root(repo, session["id"])
+        try:
+            repo = _task_root(repo, session["id"])
+        except Exception:  # its branch is gone: show the messages without checking edits
+            repo = {**repo, "path": None}
     for m in session["messages"] if repo.get("path") else []:
         # Edits not applied yet are checked against the files as they are now.
         if m.get("edits") and not m.get("applied"):
@@ -1734,15 +1765,26 @@ def api_task_changes(task_id):
     path, base = ws["path"], ws["focus_branch"]
     commits = gitops.list_commits(path, f"{base}..HEAD", 0, 100)
     files = []
-    for line in gitops._run(["git", "diff", "--numstat", f"{base}...HEAD"], cwd=path).stdout.splitlines():
-        add, dele, f = (line.split("\t", 2) + ["", ""])[:3]
-        files.append({"path": f, "added": add, "removed": dele, "committed": True})
-    for line in gitops._run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=path).stdout.splitlines():
-        if line[3:] == tasks.COMMIT_FILE:
+    num = gitops._run(["git", "diff", "--numstat", "-z", f"{base}...HEAD"], cwd=path).stdout.split("\0")
+    i = 0
+    while i < len(num):
+        rec = num[i].split("\t")
+        if len(rec) == 3:
+            add, dele, f = rec
+            if f == "":  # a rename: old and new names follow
+                f, i = num[i + 2] if i + 2 < len(num) else "", i + 2
+            files.append({"path": f, "added": add, "removed": dele, "committed": True})
+        i += 1
+    for st, f in _porcelain(path):
+        if f == tasks.COMMIT_FILE:
             continue
-        files.append({"path": line[3:], "status": line[:2].strip() or "?", "committed": False})
+        files.append({"path": f, "status": st.strip() or "?", "committed": False})
     proposed = Path(path, tasks.COMMIT_FILE)
-    return jsonify({"ok": True, "branch": ws["branch"], "onto": base, "path": path, "commits": commits, "files": files,
+    if proposed.is_symlink():  # only a plain file the agent wrote, never a link to somewhere else
+        proposed = Path(path, ".no-such-file")
+    expected = f"upkeep/{ws['name']}"
+    return jsonify({"ok": True, "branch": ws["branch"], "expected_branch": expected,
+                    "warning": None if ws["branch"] == expected else f"the folder is on {ws['branch']}, not the task's branch {expected}: something switched it", "onto": base, "path": path, "commits": commits, "files": files,
                     "ready": ws["ready"], "next_step": ws["next_step"], "workspace": ws["name"],
                     "proposed_message": proposed.read_text(errors="replace")[:5000] if proposed.is_file() else ""})
 
@@ -1753,14 +1795,29 @@ def api_task_diff(task_id):
     t = tasks.get(task_id) or abort(404)
     repo, ws = _task_ws(t)
     f = request.args.get("path") or ""
-    if not f or f.startswith("-") or ".." in Path(f).parts:
+    if not f or f.startswith("-") or os.path.isabs(f) or ".." in Path(f).parts or "\0" in f:
         abort(400)
     out = gitops._run(["git", "diff", ws["focus_branch"], "--", f], cwd=ws["path"]).stdout
     if not out and not gitops._run(["git", "ls-files", "--error-unmatch", "--", f], cwd=ws["path"]).returncode == 0:
         p = Path(ws["path"], f)
-        if p.is_file() and p.stat().st_size < 400_000:
+        inside = Path(ws["path"]).resolve() in p.resolve().parents
+        if inside and not p.is_symlink() and p.is_file() and p.stat().st_size < 400_000:
             out = "new file (not added yet)\n" + "".join("+" + l for l in p.read_text(errors="replace").splitlines(True))
     return jsonify({"ok": True, "path": f, "diff": out[:200_000]})
+
+
+def _porcelain(path: str) -> list[tuple[str, str]]:
+    """(status, path) for each changed file, read with -z so odd names (spaces, accents, renames) are exact."""
+    out = gitops._run(["git", "status", "--porcelain", "-z", "--untracked-files=all"], cwd=path).stdout
+    items, parts, i = [], out.split("\0"), 0
+    while i < len(parts):
+        e = parts[i]
+        if len(e) > 3:
+            items.append((e[:2], e[3:]))
+            if e[0] in "RC":  # a rename's old name follows; skip it
+                i += 1
+        i += 1
+    return items
 
 
 def _has_markers(p: Path) -> bool:
@@ -1788,8 +1845,11 @@ def api_task_commit(task_id):
     if paths is not None and (not isinstance(paths, list) or not all(isinstance(x, str) and x and not x.startswith("-") for x in paths)):
         return jsonify({"ok": False, "error": "paths must be a list of files"}), 400
     path = ws["path"]
+    if ws["branch"] != f"upkeep/{ws['name']}":
+        return jsonify({"ok": False, "error": f"the task's folder is on {ws['branch']}, not its branch upkeep/{ws['name']}: "
+                        "something (an agent?) switched it. Switch it back before committing."}), 409
     # Never commit a half-resolved merge: every conflicted or changed file must be free of markers.
-    changed = [l[3:] for l in gitops._run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=path).stdout.splitlines() if l[3:]]
+    changed = [f for _st, f in _porcelain(path)]
     marked = [f for f in dict.fromkeys(ws["unresolved"] + changed) if _has_markers(Path(path, f))]
     if marked:
         return jsonify({"ok": False, "error": f"{len(marked)} file(s) still have conflict markers: {', '.join(marked[:8])}"
@@ -1880,6 +1940,17 @@ def api_refs():
     return _ref_call(references.tree, request.args.get("path", ""))
 
 
+@flask_app.route("/api/refs/settings", methods=["POST"])
+def api_refs_settings():
+    """Where the library lives: {root: "/absolute/folder"}. Existing items are not moved."""
+    if (denied := _user_only("Moving the reference library")):
+        return denied
+    try:
+        return jsonify({"ok": True, "root": references.set_root((request.get_json(silent=True) or {}).get("root"))})
+    except references.RefError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
 @flask_app.route("/api/refs/read")
 def api_refs_read():
     return _ref_call(references.read, request.args.get("path", ""))
@@ -1915,6 +1986,9 @@ def api_refs_folder():
 def api_refs_clone():
     """Clone a repo as a reference: {url, folder?, name?, branch?} (in the background)."""
     d = request.get_json(silent=True) or {}
+    url = str(d.get("url") or "").strip()
+    if (url.startswith(("/", "file:", "~")) or re.match(r"^[A-Za-z]:[\\/]", url)) and (denied := _user_only("Copying a repo from this machine")):
+        return denied
     return _ref_call(references.clone, d.get("url") or "", d.get("folder") or "", d.get("name") or None, d.get("branch") or None)
 
 
@@ -1938,6 +2012,8 @@ def api_refs_upload():
 
 @flask_app.route("/api/refs/move", methods=["POST"])
 def api_refs_move():
+    if (denied := _user_only("Moving or renaming references")):
+        return denied
     d = request.get_json(silent=True) or {}
     return _ref_call(references.move, d.get("path") or "", d.get("to") or "", d.get("name") or None)
 

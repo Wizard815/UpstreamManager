@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import uuid
 import mimetypes
 import re
 import shutil
@@ -28,6 +30,7 @@ META = ".refs.json"
 MAX_UPLOAD = 512 * 1024 * 1024
 TEXT_LIMIT = 60_000
 TREE_LIMIT = 400
+LIST_LIMIT = 2000
 IMAGE_LIMIT = 8 * 1024 * 1024
 _JOBS: dict[str, dict] = {}       # path -> {"state": cloning|failed, "error", "url", "since"}
 _LOCK = threading.Lock()
@@ -43,6 +46,26 @@ class RefError(ValueError):
     pass
 
 
+def set_root(path: str) -> str:
+    """Move the library to another folder (an absolute path; created if missing; not inside a tracked repo)."""
+    p = Path(str(path or "").strip()).expanduser()
+    if not p.is_absolute():
+        raise RefError("give the library an absolute folder, like /data/references")
+    for r in store.all_repos():
+        rp = Path(r["path"]).resolve()
+        if p.resolve() == rp or rp in p.resolve().parents:
+            raise RefError(f"that folder is inside the repo {r.get('name') or r['id']}: pick one outside your repos")
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        probe = p / ".write-test.tmp"
+        probe.write_text("x")
+        probe.unlink()
+    except OSError as e:
+        raise RefError(f"can't use {p}: {e}")
+    store.save_settings({"references": {**(store.settings().get("references") or {}), "root": str(p)}})
+    return str(p)
+
+
 def root() -> Path:
     r = (store.settings().get("references") or {}).get("root") or str(config.CONFIG_PATH.parent / "references")
     p = Path(r).expanduser()
@@ -50,13 +73,19 @@ def root() -> Path:
     return p
 
 
-def _p(rel: str | None, must_exist: bool = True) -> Path:
-    """A path inside the library; never outside it, never inside a clone's .git."""
+def norm(rel: str | None) -> str:
+    """The one spelling of a library path ("./a//b/" is "a/b"; "." and "" are the library itself)."""
     if rel is None:
-        rel = ""
+        return ""
     if not isinstance(rel, str) or "\0" in rel or rel.startswith(("/", "\\")):
         raise RefError("bad path")
-    parts = [x for x in Path(rel).parts if x not in ("", ".")]
+    return "/".join(x for x in Path(rel).parts if x not in ("", "."))
+
+
+def _p(rel: str | None, must_exist: bool = True) -> Path:
+    """A path inside the library; never outside it, never inside a clone's .git."""
+    rel = norm(rel)
+    parts = [x for x in Path(rel).parts if x]
     if ".." in parts or ".git" in {x.casefold() for x in parts} or (parts and parts[0] == META):
         raise RefError("bad path")
     base = root().resolve()
@@ -127,6 +156,9 @@ def kind_of(p: Path) -> str:
 
 
 def _repo_info(p: Path) -> dict:
+    if gitops._run(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=str(p)).returncode != 0:
+        return {"incomplete": True, "branch": None, "branches": [], "url": gitops._run(["git", "remote", "get-url", "origin"], cwd=str(p)).stdout.strip(),
+                "error": "this clone has no commits checked out (it may have been cut off): delete it and clone again"}
     out = {"branch": gitops._run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(p)).stdout.strip(),
            "url": gitops._run(["git", "remote", "get-url", "origin"], cwd=str(p)).stdout.strip()}
     out["branches"] = [b for b in gitops._run(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd=str(p)).stdout.split() if b][:50]
@@ -134,15 +166,17 @@ def _repo_info(p: Path) -> dict:
 
 
 def tree(rel: str = "") -> dict:
+    rel = norm(rel)
     d = _p(rel)
     if not d.is_dir() or kind_of(d) == "repo" and rel and False:
         raise RefError("not a folder")
     meta, items = _meta(), []
     with _LOCK:
         jobs = dict(_JOBS)
-    for c in sorted(d.iterdir(), key=lambda x: x.name.lower()):
-        if c.name in (META, ".git") or c.name.endswith(".tmp") and c.parent == root():
-            continue
+    children = sorted((c for c in d.iterdir() if c.name not in (META, ".git") and not c.name.endswith((".part", ".tmp"))),
+                      key=lambda x: (not x.is_dir(), x.name.lower()))
+    more = max(0, len(children) - LIST_LIMIT)
+    for c in children[:LIST_LIMIT]:
         r = (Path(rel) / c.name).as_posix() if rel else c.name
         st = c.lstat()
         e = {"name": c.name, "path": r, "kind": kind_of(c), "size": st.st_size if c.is_file() else None,
@@ -155,7 +189,7 @@ def tree(rel: str = "") -> dict:
     for r, j in jobs.items():  # clones that haven't made their folder yet
         if Path(r).parent.as_posix() in (rel or ".",) and not any(i["path"] == r for i in items):
             items.append({"name": Path(r).name, "path": r, "kind": "repo", "job": j})
-    return {"path": rel, "root": str(root()), "items": items, "in_repo": _inside_repo(d)}
+    return {"path": rel, "root": str(root()), "items": items, "in_repo": _inside_repo(d), "more": more}
 
 
 def _inside_repo(p: Path) -> str | None:
@@ -173,12 +207,28 @@ _NAME = re.compile(r"^[^/\\\0]{1,120}$")
 
 def _clean_name(name: str) -> str:
     name = (name or "").strip()
-    if not _NAME.fullmatch(name) or name in (".", "..") or name.startswith(".git") or name == META:
-        raise RefError("names can't be empty, contain / or \\, or start with .git")
+    if not _NAME.fullmatch(name) or name in (".", "..") or name.casefold() == ".git" or name == META \
+            or name.endswith((".part", ".tmp")):
+        raise RefError("names can't be empty, longer than 120 characters, contain / or \\, or be .git")
     return name
 
 
+def _upload_name(filename: str) -> str:
+    """A browser's file name made safe to keep: no folders, no control characters, at most 120 characters."""
+    name = re.sub(r"[\\/\x00-\x1f:]+", "_", (filename or "").strip()).strip(" .") or "upload"
+    if name.casefold() == ".git" or name == META:
+        name = "_" + name
+    if len(name) > 120:
+        stem, dot, ext = name.rpartition(".")
+        ext = ext if dot and len(ext) <= 10 else ""
+        name = (stem if dot else name)[: 119 - len(ext)] + ("." + ext if ext else "")
+    return name.removesuffix(".part").removesuffix(".tmp") or "upload"
+
+
 def mkdir(parent: str, name: str) -> dict:
+    parent = norm(parent)
+    if _inside_repo(_p(parent)):
+        raise RefError("keep your own folders out of cloned repos")
     d = _p(parent) / _clean_name(name)
     if d.exists():
         raise RefError(f"{name} already exists")
@@ -190,6 +240,7 @@ def mkdir(parent: str, name: str) -> dict:
 def clone(url: str, folder: str = "", name: str | None = None, branch: str | None = None) -> dict:
     """Clone a repo into a folder of the library, in the background (history only; files on demand)."""
     url = registry.parse_git_url(url)
+    folder = norm(folder)
     parent = _p(folder)
     name = _clean_name(name or re.sub(r"\.git$", "", url.rstrip("/").split("/")[-1].split(":")[-1]) or "repo")
     dest = parent / name
@@ -208,7 +259,7 @@ def clone(url: str, folder: str = "", name: str | None = None, branch: str | Non
             if r.returncode == 0:
                 _JOBS.pop(rel, None)
             else:
-                _JOBS[rel] = {**_JOBS[rel], "state": "failed", "error": (r.stderr or r.stdout).strip()[-500:]}
+                _JOBS[rel] = {**_JOBS[rel], "state": "failed", "error": _explain((r.stderr or r.stdout).strip(), branch)}
         if r.returncode == 0:
             _note(rel, source=url, added=config.now_iso())
         else:
@@ -218,13 +269,26 @@ def clone(url: str, folder: str = "", name: str | None = None, branch: str | Non
     return {"path": rel, "state": "cloning"}
 
 
+def _explain(err: str, branch: str | None = None) -> str:
+    """git's clone/fetch errors in plain words."""
+    if "could not read Username" in err or "Authentication failed" in err or "Repository not found" in err:
+        return "the repo wasn't found, or it's private (the host asked for a sign-in): check the address"
+    if "Remote branch" in err and "not found" in err or "couldn't find remote ref" in err:
+        return f"the repo has no branch {branch}" if branch else "that branch doesn't exist on the repo"
+    if "Could not resolve host" in err or "unable to access" in err:
+        return "can't reach the host: check the address and your network"
+    if "timed out" in err:
+        return "the clone took too long and was stopped"
+    return err[-500:] or "the clone failed"
+
+
 def dismiss_job(rel: str) -> None:
     with _LOCK:
         _JOBS.pop(rel, None)
 
 
 def _repo(rel: str) -> Path:
-    p = _p(rel)
+    p = _p(norm(rel))
     if kind_of(p) != "repo":
         raise RefError(f"{rel} is not a cloned repo")
     return p
@@ -235,7 +299,9 @@ def branch(rel: str, name: str, start: str | None = None) -> dict:
     p = _repo(rel)
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", name or "") or name.startswith(("-", "/")) or ".." in name:
         raise RefError("branch names may use letters, digits and . _ / -")
-    r = gitops._run(["git", "switch", "-c", name] + ([start] if start else []), cwd=str(p))
+    if start and (start.startswith("-") or not re.fullmatch(r"[A-Za-z0-9._/@{}^~-]{1,200}", start)):
+        raise RefError("start the branch from a branch name or commit")
+    r = gitops._run(["git", "switch", "-c", name] + (["--end-of-options", start] if start else []), cwd=str(p))
     if r.returncode:
         raise RefError((r.stderr or r.stdout).strip())
     return _repo_info(p)
@@ -253,7 +319,8 @@ def switch(rel: str, name: str) -> dict:
         f = gitops._run(["git", "fetch", "origin", f"+refs/heads/{name}:refs/remotes/origin/{name}"], cwd=str(p), timeout=900)
         r = gitops._run(["git", "switch", "--track", f"origin/{name}"], cwd=str(p), timeout=900) if f.returncode == 0 else f
     if r.returncode:
-        raise RefError((r.stderr or r.stdout).strip() or f"no branch {name}")
+        raise RefError(_explain((r.stderr or r.stdout).strip(), name) if "remote ref" in (r.stderr or "") else
+                       (r.stderr or r.stdout).strip() or f"no branch {name}")
     return _repo_info(p)
 
 
@@ -273,16 +340,19 @@ def update(rel: str) -> dict:
 
 
 def save_upload(folder: str, filename: str, stream, size: int | None = None) -> dict:
-    d = _p(folder)
+    d = _p(norm(folder))
     if not d.is_dir():
         raise RefError("upload into a folder")
-    name = _clean_name(Path(filename or "upload").name)
-    dest = d / name
-    stem, suf, n = dest.stem, dest.suffix, 2
-    while dest.exists():
-        dest = d / f"{stem} ({n}){suf}"
-        n += 1
-    tmp = dest.with_name(dest.name + ".part")
+    if _inside_repo(d):
+        raise RefError("keep your own files out of cloned repos: upload into a folder")
+    name = _upload_name(filename)
+    for old in d.glob("*.part"):  # uploads cut off long ago (a closed tab, a crash)
+        try:
+            if time.time() - old.stat().st_mtime > 3600:
+                old.unlink()
+        except OSError:
+            pass
+    tmp = d / f".{uuid.uuid4().hex}.part"
     written = 0
     with open(tmp, "wb") as out:
         while chunk := stream.read(1024 * 1024):
@@ -292,16 +362,29 @@ def save_upload(folder: str, filename: str, stream, size: int | None = None) -> 
                 tmp.unlink(missing_ok=True)
                 raise RefError(f"{name} is larger than {MAX_UPLOAD // 2**20} MB")
             out.write(chunk)
-    tmp.replace(dest)
+    dest = d / name
+    stem, suf, n = dest.stem, dest.suffix, 2
+    while True:  # claim the name atomically: two uploads of the same name keep both
+        try:
+            os.link(tmp, dest)
+            break
+        except FileExistsError:
+            dest = d / f"{stem} ({n}){suf}"
+            n += 1
+    tmp.unlink()
     rel = _rel(dest)
     _note(rel, added=config.now_iso(), uploaded=True)
     return {"path": rel, "size": written, "kind": kind_of(dest)}
 
 
 def move(rel: str, to_folder: str, new_name: str | None = None) -> dict:
-    src = _p(rel)
+    rel, to_folder = norm(rel), norm(to_folder)
     if not rel:
         raise RefError("can't move the library itself")
+    src = _p(rel)
+    with _LOCK:
+        if any(j == rel or j.startswith(rel + "/") for j, v in _JOBS.items() if v["state"] == "cloning"):
+            raise RefError("a clone is still running in there: wait for it to finish")
     dst_dir = _p(to_folder)
     if not dst_dir.is_dir():
         raise RefError("move into a folder")
@@ -318,9 +401,13 @@ def move(rel: str, to_folder: str, new_name: str | None = None) -> dict:
 
 
 def delete(rel: str) -> None:
-    p = _p(rel)
+    rel = norm(rel)
     if not rel:
         raise RefError("can't delete the library itself")
+    p = _p(rel)
+    with _LOCK:
+        if any(j == rel or j.startswith(rel + "/") for j, v in _JOBS.items() if v["state"] == "cloning"):
+            raise RefError("a clone is still running in there: wait for it to finish")
     if p.is_dir() and not p.is_symlink():
         shutil.rmtree(p)
     else:
@@ -329,6 +416,9 @@ def delete(rel: str) -> None:
 
 
 def set_note(rel: str, note: str) -> None:
+    rel = norm(rel)
+    if not rel:
+        raise RefError("pick an item")
     _p(rel)
     _note(rel, note=(note or "").strip()[:2000])
 
@@ -371,20 +461,31 @@ def read(rel: str, limit: int = TEXT_LIMIT) -> dict:
     inner = None
     if "!" in rel and rel.split("!", 1)[0].lower().endswith(".zip"):
         rel, inner = rel.split("!", 1)
+    rel = norm(rel)
     p = _p(rel)
     k = kind_of(p)
     out = {"path": rel, "kind": k, "size": p.stat().st_size if p.is_file() else None, **_meta().get(rel, {})}
-    if inner is not None:
-        return {**out, "path": f"{rel}!{inner}", "kind": "text", "text": _zip_member(p, inner, limit)}
-    if k in ("folder", "repo"):
-        return {**out, "text": folder_overview(rel, limit)}
-    if k == "pdf":
-        return {**out, "text": _pdf_text(p, limit)}
-    if k == "zip":
-        return {**out, "text": _zip_listing(p)}
+    try:
+        if inner is not None:
+            return {**out, "path": f"{rel}!{inner}", "kind": "text", "text": _zip_member(p, inner, limit)}
+        if k in ("folder", "repo"):
+            return {**out, "text": folder_overview(rel, limit)}
+        if k == "pdf":
+            return {**out, "text": _pdf_text(p, limit)}
+        if k == "zip":
+            return {**out, "text": _zip_listing(p)}
+    except KeyError:
+        raise RefError(f"there is no {inner} in {rel}")
+    except (zipfile.BadZipFile, zipfile.LargeZipFile) as e:
+        raise RefError(f"{rel} isn't a readable zip: {e}")
+    except RefError:
+        raise
+    except Exception as e:  # pypdf and friends raise their own kinds for damaged files
+        raise RefError(f"{rel} can't be read: {type(e).__name__}: {str(e)[:200]}")
     if k in ("image", "video"):
         return {**out, "text": None, "mime": mimetypes.guess_type(p.name)[0]}
-    data = p.read_bytes()[: limit * 4]
+    with open(p, "rb") as fh:
+        data = fh.read(limit * 4)
     if b"\0" in data[:4096]:
         return {**out, "text": None, "binary": True}
     text = data.decode("utf-8", errors="replace")
@@ -406,7 +507,7 @@ def folder_overview(rel: str, limit: int = TEXT_LIMIT) -> str:
             if count < TREE_LIMIT:
                 lines.append(rp)
             count += 1
-            if f.lower().startswith("readme") and len(depth) <= 1 and len(readmes) < 6:
+            if f.lower().startswith("readme") and len(depth) <= 1 and len(readmes) < 6 and not (Path(dirpath) / f).is_symlink():
                 readmes.append(Path(dirpath) / f)
     head = f"[Reference folder {rel or '(library root)'}: {count} files]\n" + "\n".join(lines)
     if count > TREE_LIMIT:
@@ -421,7 +522,9 @@ def folder_overview(rel: str, limit: int = TEXT_LIMIT) -> str:
 
 def for_model(rel: str, limit: int = 20_000) -> tuple[str, list[dict]]:
     """An item as (text for the prompt, images for a model that can see). Images are data URLs."""
-    p = _p(rel.split("!", 1)[0])
+    base = rel.split("!", 1)[0] if "!" in rel and rel.split("!", 1)[0].lower().endswith(".zip") else rel
+    rel = norm(base) + rel[len(base):]
+    p = _p(norm(base))
     k = kind_of(p)
     if k == "image":
         if p.stat().st_size > IMAGE_LIMIT:
@@ -441,23 +544,29 @@ def for_model(rel: str, limit: int = 20_000) -> tuple[str, list[dict]]:
 
 
 def search(query: str, limit: int = 50) -> list[dict]:
-    """Find files by name, and text files/repos by content (git grep in repos, a plain scan elsewhere)."""
+    """Find files by name, and text in cloned repos (git grep). Skips .git and dependency folders."""
     q = (query or "").strip()
     if len(q) < 2:
         raise RefError("search for at least 2 characters")
-    base, out = root(), []
-    for p in base.rglob("*"):
-        if ".git" in p.parts or p.name == META:
-            continue
-        if q.lower() in p.name.lower():
-            out.append({"path": _rel(p), "kind": kind_of(p), "match": "name"})
-            if len(out) >= limit:
-                return out
-    for repo in [d for d in base.rglob(".git")][:50]:
-        r = gitops._run(["git", "grep", "-n", "-I", "--max-count=3", "-F", "-e", q], cwd=str(repo.parent), timeout=60)
+    base, out, repos, seen = root(), [], [], 0
+    for dirpath, dirnames, filenames in os.walk(base):
+        if ".git" in dirnames:
+            repos.append(Path(dirpath))
+        dirnames[:] = [x for x in dirnames if x not in (".git", "node_modules", ".venv", "__pycache__")]
+        for name in dirnames + filenames:
+            seen += 1
+            if q.lower() in name.lower() and name != META and not name.endswith(".part"):
+                p = Path(dirpath) / name
+                out.append({"path": _rel(p), "kind": kind_of(p), "match": "name"})
+                if len(out) >= limit:
+                    return out
+        if seen > 200_000:
+            break
+    for repo in repos[:50]:
+        r = gitops._run(["git", "grep", "-z", "-n", "-I", "--max-count=3", "-F", "-e", q], cwd=str(repo), timeout=60)
         for line in r.stdout.splitlines()[: limit - len(out)]:
-            f, n, text = (line.split(":", 2) + ["", ""])[:3]
-            out.append({"path": _rel(repo.parent / f), "kind": "text", "match": f"line {n}: {text.strip()[:160]}"})
+            f, n, text = (line.split("\0", 2) + ["", ""])[:3]
+            out.append({"path": _rel(repo / f), "kind": "text", "match": f"line {n}: {text.strip()[:160]}"})
         if len(out) >= limit:
             break
     return out

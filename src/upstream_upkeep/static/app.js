@@ -2372,6 +2372,7 @@ function branchPanel(t, redraw) {
       el("div", { class: "row", style: "gap:8px;align-items:center;flex-wrap:wrap" }, el("h4", { style: "margin:0" }, "Branch"),
         el("code", { class: "small" }, c.branch), el("span", { class: "muted small" }, `→ ${c.onto}`), el("div", { class: "spacer" }),
         el("button", { class: "btn ghost small", onclick: () => draw() }, "Refresh")),
+      c.warning ? el("div", { class: "small", style: "color:var(--bad)" }, `⚠ ${c.warning}`) : null,
       el("div", { class: "muted small" }, c.next_step),
       el("h5", {}, `Commits (${c.commits.length})`),
       c.commits.length ? el("div", { class: "col", style: "gap:2px" }, ...c.commits.map(x => el("div", { class: "commit-line" },
@@ -2407,7 +2408,12 @@ async function renderReferences() {
   // left: folders and repos, expandable
   const branch = async (path, box, depth) => {
     const r = await api(apiUrl(`/api/refs?path=${encodeURIComponent(path)}`)).catch(e => ({ items: [], error: e.message }))
-    if (!path) rootInfo.textContent = r.root ? `on disk: ${r.root}` : ""
+    if (!path && r.root) rootInfo.replaceChildren(el("span", {}, `on disk: ${r.root} `), el("button", { class: "linkish small", onclick: async () => {
+      const to = prompt("Keep the library in this folder (absolute path; what's already there stays where it is):", r.root)
+      if (!to || to === r.root) return
+      const res = await api(apiUrl("/api/refs/settings"), { method: "POST", body: JSON.stringify({ root: to }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!res.ok) return toast(res.error, "error")
+      toast(`The library is now ${res.root}`, "ok"); renderReferences() } }, "change"))
     box.replaceChildren(...(r.items || []).filter(i => i.kind === "folder" || i.kind === "repo").map(i => {
       const kids = el("div", { role: "group", hidden: "" })
       const row = el("div", { class: "trow", role: "treeitem", tabindex: "0", "data-path": i.path, "aria-expanded": "false", style: `padding-left:${8 + depth * 14}px` },
@@ -2513,7 +2519,8 @@ async function renderReferences() {
       const row = el("div", { class: "ref-row", draggable: "true", tabindex: "0", ...(i.job?.state === "cloning" ? { "data-cloning": "1" } : {}) },
         el("span", { "aria-hidden": "true" }, REF_ICON[i.kind] || "📎"),
         el("span", { class: "nm" }, i.name),
-        el("span", { class: "muted small" }, i.job ? (i.job.state === "failed" ? `clone failed: ${i.job.error}` : "cloning…") : i.kind === "repo" ? `${i.branch} · ${i.url || i.source || ""}` : i.kind === "folder" ? "" : i.kind),
+        el("span", { class: "muted small", style: i.incomplete ? "color:var(--bad)" : null }, i.job ? (i.job.state === "failed" ? `clone failed: ${i.job.error}` : "cloning…")
+          : i.incomplete ? "incomplete clone: delete it and clone again" : i.kind === "repo" ? `${i.branch} · ${i.url || i.source || ""}` : i.kind === "folder" ? "" : i.kind),
         el("span", { class: "muted small", style: "text-align:right" }, fmtSize(i.size)),
         el("span", { class: "muted small" }, (i.added || i.modified || "").slice(0, 10)))
       row.ondragstart = (e) => e.dataTransfer.setData("text/x-ref-path", i.path)
@@ -2532,6 +2539,7 @@ async function renderReferences() {
         current ? el("button", { class: "btn ghost small", onclick: () => useInChat(current, current.split("/").pop()) }, "Use this folder in a chat") : null,
         current ? itemMenu({ path: current, name: current.split("/").pop(), kind: "folder" }) : null),
       el("div", { class: "ref-head muted small" }, el("span", {}), el("span", {}, "Name"), el("span", {}, ""), el("span", { style: "text-align:right" }, "Size"), el("span", {}, "Added")),
+      r.more ? el("div", { class: "muted small" }, `…and ${r.more} more items not listed here (use Search to find them).`) : null,
       drop, el("div", { class: "muted small" }, "Drag files from your computer onto this list to upload them here; drag an item onto a folder on the left to move it.")))
     if (rows.some(r => r.dataset.cloning)) pollClones()
   }
@@ -2754,7 +2762,7 @@ async function wikiSetup() {
   const sync = () => { pathRow.hidden = mode.value !== "folder"; restRows.hidden = mode.value !== "rest" }
   mode.onchange = sync; sync()
   const state = el("div", { class: "small", style: `color:${st.ok ? "var(--good)" : st.enabled ? "var(--bad)" : "var(--muted)"}` },
-    !st.enabled ? "Off." : st.ok ? `Connected: ${st.notes} long-term notes; today's note is ${st.today}.` : `Not connected: ${st.error}`)
+    !st.enabled ? "Off." : st.ok ? `Connected: ${st.notes} long-term notes in wiki/.` : `Not connected: ${st.error}`)
   const save = el("button", { class: "btn" }, "Save")
   save.onclick = () => busy(save, "Saving…", async () => {
     if (key.value.trim()) await api(apiUrl("/api/credentials"), { method: "POST", body: JSON.stringify({ wiki_api_key: key.value.trim() }) })

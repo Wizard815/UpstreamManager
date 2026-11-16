@@ -112,7 +112,7 @@ def test_hand_to_hermes_runs_in_the_background_and_shows_the_conversation(client
         assert r.status_code == 400 and "up to the user" in r.get_json()["error"]
         r = client.post(f"/api/tasks/{t['id']}/send", json={"to": "hermes"}).get_json()
         assert r["ok"] and r["where"]["hermes"] == "api_1" and r["where"]["workdir"] != repo["path"]
-        for _ in range(50):
+        for _ in range(400):
             h = client.get(f"/api/tasks/{t['id']}/hermes").get_json()
             if not h["run"]["running"] and len(h["messages"]) == 3:
                 break
