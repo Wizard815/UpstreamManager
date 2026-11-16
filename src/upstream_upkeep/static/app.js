@@ -340,6 +340,7 @@ async function renderRepoPage(repoId) {
     el("h1", { class: "page" }, repo.name || repoId),
     el("label", { class: "row muted", style: "gap:6px" }, "Focus", focusSel), tree, el("div", { class: "spacer" }), pathEl,
     menu(`More actions for ${repo.name || repoId}`, [
+      { label: "New task…", run: () => taskDialog({ repo: repoId }) },
       { label: "Copy folder path", run: () => { navigator.clipboard?.writeText(repo.path); toast("Path copied", "ok") } },
       { label: "Remove from Upstream Manager", danger: true, run: removeRepo },
     ])))
@@ -384,7 +385,8 @@ async function renderRepoPage(repoId) {
   }
   const chatToggle = el("button", { class: "btn ghost small chat-ctl", onclick: () => setMode(bench.classList.contains("chat-hidden") ? "normal" : "hidden") }, "Hide chat")
 
-  const chat = chatPanel(repoId, { focus: repo.focus_branch, onWide: () => setMode(bench.classList.contains("chat-wide") ? "normal" : "wide"), isWide: () => bench.classList.contains("chat-wide") })
+  const wantSession = new URLSearchParams(location.search).get("session")
+  const chat = chatPanel(repoId, { sessionId: wantSession, focus: repo.focus_branch, onWide: () => setMode(bench.classList.contains("chat-wide") ? "normal" : "wide"), isWide: () => bench.classList.contains("chat-wide") })
   tools = renderTools(toolsPane, repoId, { extra: chatToggle })
   // Chat sits beside the tools on a wide screen and is a tab on a narrow one.
   const narrow = matchMedia("(max-width: 900px)")
@@ -694,7 +696,11 @@ function chatPanel(repoId, opts = {}) {
       wide.onclick = () => { opts.onWide(); wide.textContent = opts.isWide?.() ? "⤡" : "⤢" }
       head.append(wide)
     }
+    if (hist.task) head.append(el("button", { class: "btn ghost small", title: "This chat works on a task", onclick: () => route(`/work?task=${hist.task}`) }, "Task ↗"))
     head.append(menu("Chat actions", [
+      { label: "Make a task of this chat…", run: () => taskDialog({ repo: repoId === GENERAL ? undefined : repoId, title: hist.title || "", kind: "fix", dialogTitle: "Make a task of this chat",
+        body: (hist.messages || []).filter(m => m.role !== "agent").slice(-4).map(m => `${m.role === "user" ? "You" : "Assistant"}: ${m.content.slice(0, 600)}`).join("\n\n"),
+        about: (hist.tags || []).filter(t => ["commit", "request", "pr", "push"].includes(t.type)).map(t => ({ type: t.type, id: t.id, label: t.label, url: t.url })) }) },
       { label: "Open on the Chats page", run: () => route(`/chats?repo=${repoId}&session=${sessionId}`) },
       { label: "Delete this chat", danger: true, run: async () => {
         if (!confirm("Delete this chat? What the assistant remembers is kept.")) return
@@ -768,6 +774,10 @@ function chatPanel(repoId, opts = {}) {
       opts.onChange?.()
     }
     msgIn.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendBtn.click() } })
+    try {  // a task sent here leaves its brief as the first message, for you to read and send
+      const draft = sessionStorage.getItem(`draft:${sessionId}`)
+      if (draft) { msgIn.value = draft; sessionStorage.removeItem(`draft:${sessionId}`); msgIn.rows = 8; setTimeout(() => msgIn.focus(), 0) }
+    } catch {}
     root.replaceChildren(head, about, box, el("div", { class: "composer" }, tray, msgIn, el("div", { class: "row" }, el("div", { class: "spacer" }), sendBtn)))
     box.scrollTop = box.scrollHeight
   }
@@ -1036,12 +1046,12 @@ async function renderActions(wrap, repoId, refresh = false) {
 
 // Right-hand tools: commits, files, memory, publish, actions.
 function renderTools(wrap, repoId, { extra } = {}) {
-  const names = ["Chat", "Commits", "Files", "Merges", "Stack", "Memory", "Publish", "Actions"]
+  const names = ["Chat", "Work", "Commits", "Files", "Merges", "Stack", "Memory", "Publish", "Actions"]
   const bar = el("div", { class: "tabs", role: "tablist", "aria-label": "Repo tools" })
   const panes = {}, tabs = {}, built = {}
   let filesScope = null  // a merge workspace name, or null for the repo itself
   const builders = {
-    Chat: async () => {}, Commits: renderCommits, Merges: renderMerges, Stack: (pane, id) => renderStack(pane, id), Memory: renderMemory, Publish: renderPublish, Actions: renderActions,
+    Chat: async () => {}, Work: renderRepoWork, Commits: renderCommits, Merges: renderMerges, Stack: (pane, id) => renderStack(pane, id), Memory: renderMemory, Publish: renderPublish, Actions: renderActions,
     Files: (pane, id) => renderFiles(pane, id, { ws: filesScope, onScope: (ws) => { filesScope = ws } }),
   }
   const flush = new Set(["Files", "Chat"])
@@ -1134,10 +1144,13 @@ async function renderCommits(wrap, repoId) {
         : addTag(repoId, { type: "commit", id: c.full, label: `${c.sha} ${c.subject.slice(0, 40)}` })
       const view = el("button", { class: "btn ghost", "aria-label": `View commit ${c.sha}` }, "View")
       view.onclick = () => busy(view, null, () => showCommit(repoId, c.full, comp))
+      const work = el("button", { class: "btn ghost", title: "Make a task of it: fix it here, hand it to Hermes, or park it", "aria-label": `Work on commit ${c.sha}` }, "Work on")
+      work.onclick = () => taskDialog({ repo: repoId, kind: "fix", title: `Fix: ${c.subject}`.slice(0, 200), dialogTitle: `Work on ${c.sha}`,
+        about: [comp ? { type: "component", id: comp, label: `${comp} ${c.sha}` } : { type: "commit", id: c.full, label: `${c.sha} ${c.subject.slice(0, 40)}` }] })
       list.append(el("div", { class: "mem" },
         el("code", { style: "color:#9fb4ff" }, c.sha),
         el("div", { style: "flex:1;min-width:0" }, el("div", {}, c.subject), el("div", { class: "muted", style: "font-size:12px" }, `${c.author} · ${c.date.slice(0, 10)}`)),
-        view, tag))
+        view, work, tag))
     }
     skip += res.items.length
     if (!list.children.length) info.textContent = viewSel.value === "behind" ? "Nothing missing: you have every upstream commit." : "No commits."
@@ -1176,12 +1189,16 @@ async function showCommit(repoId, sha, component = null) {
   const tag = el("button", { class: "btn" }, "Tag for chat")
   tag.onclick = () => { addTag(repoId, { type: "commit", id: d.sha, label: `${d.sha.slice(0, 8)} ${(d.message || "").split("\n")[0].slice(0, 40)}` }) }
   if (component) tag.hidden = true
+  const workBtn = el("button", { class: "btn ghost" }, "Work on it")
+  workBtn.onclick = () => { close(); taskDialog({ repo: repoId, kind: "fix", title: `Fix: ${(d.message || "").split("\n")[0]}`.slice(0, 200), dialogTitle: `Work on ${d.sha.slice(0, 10)}`,
+    about: [{ type: "commit", id: d.sha, label: `${d.sha.slice(0, 8)} ${(d.message || "").split("\n")[0].slice(0, 40)}` }] }) }
+  if (component) workBtn.hidden = true
   const closeBtn = el("button", { class: "btn ghost", onclick: close }, "Close")
   const titleId = `commit-title-${sha.slice(0, 10)}`
   const ov = el("div", { class: "overlay", onclick: (e) => { if (e.target === ov) close() } },
     el("div", { class: "overlay-panel", role: "dialog", "aria-modal": "true", "aria-labelledby": titleId },
       el("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap" },
-        el("h3", { style: "margin:0", id: titleId }, d.ok ? `Commit ${d.sha.slice(0, 10)}` : "Commit"), el("div", { style: "display:flex;gap:6px" }, d.ok ? tag : null, closeBtn)),
+        el("h3", { style: "margin:0", id: titleId }, d.ok ? `Commit ${d.sha.slice(0, 10)}` : "Commit"), el("div", { style: "display:flex;gap:6px" }, d.ok ? workBtn : null, d.ok ? tag : null, closeBtn)),
       d.ok ? el("div", {},
         el("div", { class: "muted" }, `${d.author} · ${(d.date || "").slice(0, 10)}`),
         el("pre", { style: "white-space:pre-wrap;margin:8px 0" }, d.message),
@@ -1823,6 +1840,13 @@ async function renderRequests() {
       })
       const denyBtn = el("button", { class: "btn danger" }, "Deny")
       denyBtn.onclick = () => decide("deny", denyBtn)
+      const workBtn = el("button", { class: "btn ghost", title: "Make a task of it: resolve it here, hand it to Hermes, or park it" }, "Work on this")
+      workBtn.onclick = () => taskDialog({ repo: r.repo_id, kind: r.safe === false ? "merge" : "fix", dialogTitle: "Work on this request",
+        title: (r.safe === false ? "Resolve: " : "") + requestLine(r).slice(0, 180),
+        upstream: (r.upstreams || []).find(u => u.conflict)?.name,
+        body: (r.upstreams || []).filter(u => (u.conflict_files || []).length).map(u => `Conflicts merging ${u.name}/${u.branch} (${u.conflict_files.length} files):\n`
+          + u.conflict_files.slice(0, 30).map(f => `- ${f}`).join("\n") + (u.conflict_files.length > 30 ? "\n- …" : "")).join("\n\n"),
+        about: [{ type: "request", id: r.id, label: requestLine(r).slice(0, 60) }] })
       wrap.append(el("div", { class: "repo-card", id: `req-${r.id}` },
         el("h3", {}, r.repo_name || r.repo_id, " ",
           isActions ? badge("", `GitHub Actions: ${(r.disable || []).length} off, ${(r.enable || []).length} on`)
@@ -1862,7 +1886,7 @@ async function renderRequests() {
         r.summary ? el("div", { style: "margin:6px 0;font-size:13px" }, el("strong", {}, "Agent's summary: "), r.summary) : null,
         r.workspace ? el("div", { class: "muted", style: "font-size:12px" }, `Resolved in merge workspace ${r.workspace}; approving fast-forwards ${r.focus_branch} to it and removes the workspace.`) : null,
         r.comment ? el("div", { class: "muted" }, `Note: ${r.comment}`) : null,
-        pending ? el("div", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px" }, ...(reportBtns.length ? reportBtns : [approveBtn]), denyBtn, commentIn,
+        pending ? el("div", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px" }, ...(reportBtns.length ? reportBtns : [approveBtn]), denyBtn, workBtn, commentIn,
           el("span", { class: "muted", style: "font-size:12px" }, isActions
             ? "Approve changes these workflows on GitHub (needs a token with Actions: read/write). Files are not touched."
             : isPush
@@ -2001,8 +2025,268 @@ async function renderSettings() {
         memStatus, memSave))
     card.append(await agentSetup())
     card.append(await wikiSetup())
+    card.append(await integrationsSetup())
     card.append(await storageSetup())
   } catch (e) { card.replaceChildren(el("p", { class: "muted" }, `Could not load settings: ${e.message}`)) }
+}
+
+// ------------------------------------------------------------------ Work: tasks for the agent
+// A task is a piece of work about a repo (fix a commit, a bug, a change, an idea). It is worked on
+// here (a chat plus its own branch), handed to Hermes for bigger jobs, or parked for later in the
+// LLM wiki or Pondering Orb. See tasks.py.
+const KIND_LABEL = { fix: "Fix", bug: "Bug", feature: "Change", chore: "Chore", merge: "Merge", idea: "Idea" }
+const WHERE_LABEL = { here: "Worked on here", hermes: "With Hermes", wiki: "Parked in the wiki", orb: "Parked in Pondering Orb" }
+const STATUS_CLS = { open: "warn", working: "info", parked: "", done: "ok", dropped: "" }
+let integrations = null
+async function loadIntegrations(force = false) {
+  if (!integrations || force) integrations = await api(apiUrl("/api/integrations")).catch(() => ({ hermes: {}, orb: {}, wiki: {} }))
+  return integrations
+}
+const aboutIcon = { commit: "◆", request: "✓", file: "▤", component: "📦", pr: "⇄", push: "↑", conflict: "⚠" }
+
+// Open the task dialog, prefilled from where you started ("Work on" a commit, a request, a chat...).
+async function taskDialog(pre = {}) {
+  const ints = await loadIntegrations(true)
+  const repos = await api(apiUrl("/api/repos")).catch(() => [])
+  const list = Array.isArray(repos) ? repos : repos.repos || []
+  const repoSel = el("select", { "aria-label": "Repository" }, el("option", { value: GENERAL }, "No particular repo"), ...list.map(r => el("option", { value: r.id }, r.name || r.id)))
+  repoSel.value = pre.repo || GENERAL
+  const title = el("input", { value: pre.title || "", placeholder: "What needs doing, in a line", "aria-label": "Title", style: "width:100%" })
+  const kind = el("select", { "aria-label": "Kind" }, ...Object.entries(KIND_LABEL).map(([k, v]) => el("option", { value: k }, v)))
+  kind.value = pre.kind || "fix"
+  const body = el("textarea", { rows: "6", placeholder: "Details: what's wrong, how to reproduce, what you want instead…", "aria-label": "Details", style: "width:100%" })
+  body.value = pre.body || ""
+  const about = [...(pre.about || [])]
+  const chips = el("div", { class: "row", style: "flex-wrap:wrap;gap:6px" })
+  const drawChips = () => chips.replaceChildren(...about.map((a, i) => el("span", { class: "chip" }, `${aboutIcon[a.type] || ""} ${a.label}`,
+    el("button", { class: "chip-x", "aria-label": `Remove ${a.label}`, onclick: () => { about.splice(i, 1); drawChips() } }, "×"))),
+    ...(about.length ? [] : [el("span", { class: "muted small" }, "Not linked to a commit or request.")]))
+  drawChips()
+  let close
+  const send = async (btn, to) => busy(btn, { here: "Making its branch…", hermes: "Starting Hermes…", wiki: "Parking…", orb: "Parking…" }[to] || "Saving…", async () => {
+    if (!title.value.trim()) { title.focus(); return toast("Give the task a title", "error") }
+    const res = await api(apiUrl("/api/tasks"), { method: "POST", body: JSON.stringify({ repo: repoSel.value, title: title.value, body: body.value, kind: kind.value, about, upstream: pre.upstream, to: to || undefined }) })
+    if (!res.ok) { toast(`Saved the task, but: ${res.error}`, "error"); close(); return route(`/work?task=${res.task.id}`) }
+    close(); refreshWorkCount()
+    afterSend(res, to)
+  })
+  const btn = (label, to, cls, why) => {
+    const b = el("button", { class: `btn ${cls || "ghost"}`, title: why || null }, label)
+    b.onclick = () => send(b, to)
+    return b
+  }
+  const h = ints.hermes || {}, o = ints.orb || {}, w = ints.wiki || {}
+  const hermesBtn = btn("Hand to Hermes", "hermes", "ghost", h.ok ? "Start a Hermes session for a longer, bigger job" : `Hermes: ${h.error || "not set up"} (Settings → Hermes)`)
+  const wikiBtn = btn("Park in LLM wiki", "wiki", "ghost", w.ok ? "Save it to the wiki's inbox for later" : "The LLM wiki isn't set up (Settings → LLM wiki)")
+  const orbBtn = btn("Park in Pondering Orb", "orb", "ghost", o.ok ? `A task in Orb's ${o.list} list` : `Pondering Orb: ${o.error || "not set up"} (Settings → Pondering Orb)`)
+  if (!h.ok) hermesBtn.classList.add("dim"); if (!w.ok) wikiBtn.classList.add("dim"); if (!o.ok) orbBtn.classList.add("dim")
+  close = openDialog(pre.dialogTitle || "New task",
+    el("div", { class: "col", style: "gap:10px;min-width:min(560px,80vw)" },
+      el("div", { class: "row", style: "gap:8px;flex-wrap:wrap" }, el("label", { class: "col", style: "gap:4px;flex:1;min-width:160px" }, "Repo", repoSel), el("label", { class: "col", style: "gap:4px" }, "Kind", kind)),
+      el("label", { class: "col", style: "gap:4px" }, "Title", title),
+      el("label", { class: "col", style: "gap:4px" }, "Details", body),
+      el("div", { class: "col", style: "gap:4px" }, el("span", {}, "About"), chips),
+      el("div", { class: "row", style: "gap:8px;flex-wrap:wrap;margin-top:6px" },
+        btn("Work on it now", "here", "", "Open a chat about it, with its own branch to change code in"), hermesBtn,
+        el("div", { class: "spacer" }), btn("Save for later", null), wikiBtn, orbBtn),
+      el("p", { class: "muted small", style: "margin:0" }, "Code work happens on the task's own branch; nothing reaches your focus branch until you approve it.")))
+  setTimeout(() => title.focus(), 0)
+}
+
+function afterSend(res, to) {
+  const t = res.task
+  if (to === "here") {
+    try { sessionStorage.setItem(`draft:${res.where.session}`, res.draft || "") } catch {}
+    toast(res.where.workspace ? `Branch upkeep/${res.where.workspace} is ready for this task` : "Chat opened for this task", "ok")
+    return route(`/repo/${t.repo_id}?session=${res.where.session}`)
+  }
+  if (to === "hermes") { toast("Hermes is on it", "ok"); return route(`/work?task=${t.id}`) }
+  if (to === "wiki") return toast(`Parked in the LLM wiki: ${res.where.note}`, "ok")
+  if (to === "orb") return toast(`Parked in Pondering Orb (${res.where.list})`, "ok")
+  toast("Task saved", "ok")
+}
+
+async function refreshWorkCount() {
+  const c = document.getElementById("work-count")
+  if (!c) return
+  const r = await api(apiUrl("/api/tasks")).catch(() => ({ items: [] }))
+  const n = (r.items || []).filter(t => t.status === "open" || t.status === "working").length
+  c.textContent = n ? String(n) : ""
+}
+
+function taskRow(t, onPick, selected) {
+  const where = t.where?.type
+  const running = t.hermes_run?.running
+  return el("button", { class: `task-row${selected ? " sel" : ""}`, onclick: () => onPick(t), "aria-current": selected ? "true" : null },
+    el("div", { class: "row", style: "gap:6px;align-items:center;min-width:0" },
+      badge(STATUS_CLS[t.status] || "", t.status), el("span", { class: "muted small" }, KIND_LABEL[t.kind] || t.kind),
+      el("strong", { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0" }, t.title)),
+    el("div", { class: "muted small", style: "text-align:left" }, `${t.repo_name} · ${where ? WHERE_LABEL[where] : "not started"}${running ? " · Hermes is working…" : ""} · ${t.updated_at.slice(0, 16).replace("T", " ")}`))
+}
+
+async function renderWork() {
+  const params = new URLSearchParams(location.search)
+  const main = $("#main")
+  let filter = store_.get("workFilter", "active"), repoF = params.get("repo") || "", picked = params.get("task")
+  const listBox = el("div", { class: "task-list", role: "list" }), detail = el("div", { class: "task-detail panel" })
+  const repoSel = el("select", { "aria-label": "Repo" }, el("option", { value: "" }, "All repos"))
+  const repos = await api(apiUrl("/api/repos")).catch(() => [])
+  for (const r of (Array.isArray(repos) ? repos : repos.repos || [])) repoSel.append(el("option", { value: r.id }, r.name || r.id))
+  repoSel.value = repoF
+  const filters = { active: "Active", parked: "Parked", done: "Done", all: "All" }
+  const fbar = el("div", { class: "tabs", role: "tablist", "aria-label": "Which tasks" })
+  const draw = async () => {
+    const r = await api(apiUrl(`/api/tasks${repoF ? `?repo=${encodeURIComponent(repoF)}` : ""}`))
+    const items = (r.items || []).filter(t => filter === "all" || (filter === "active" ? ["open", "working"].includes(t.status) : filter === "done" ? ["done", "dropped"].includes(t.status) : t.status === filter))
+    fbar.replaceChildren(...Object.entries(filters).map(([k, v]) => el("button", { class: `tab${k === filter ? " active" : ""}`, role: "tab", "aria-selected": String(k === filter),
+      onclick: () => { filter = k; store_.set("workFilter", k); draw() } }, v)))
+    listBox.replaceChildren(...items.map(t => taskRow(t, pick, t.id === picked)))
+    if (!items.length) listBox.append(el("p", { class: "muted", style: "padding:12px" }, filter === "active"
+      ? "Nothing on the go. Start a task from a commit (“Work on”), a request, a chat, or with New task." : "No tasks here."))
+    const cur = (r.items || []).find(t => t.id === picked)
+    if (cur) await taskDetail(detail, cur, draw); else detail.replaceChildren(el("p", { class: "muted", style: "padding:16px" }, "Pick a task to see it, work on it, or hand it on."))
+  }
+  const pick = (t) => { picked = t.id; history.replaceState({}, "", `${BASE}/work?task=${t.id}${repoF ? `&repo=${repoF}` : ""}`); draw() }
+  repoSel.onchange = () => { repoF = repoSel.value; draw() }
+  const newBtn = el("button", { class: "btn", onclick: () => taskDialog({ repo: repoF || undefined }) }, "+ New task")
+  main.replaceChildren(
+    el("div", { class: "row", style: "margin-bottom:12px;gap:10px;flex-wrap:wrap;align-items:center" }, el("h1", { class: "page", style: "margin:0" }, "Work"),
+      el("span", { class: "muted" }, "Fixes, bugs and changes for the agent: work on them here, hand them to Hermes, or park them."), el("div", { class: "spacer" }), repoSel, newBtn),
+    el("div", { class: "work-grid" }, el("div", { class: "panel", style: "min-width:0" }, fbar, listBox), detail))
+  await draw()
+}
+
+async function taskDetail(box, t, redraw) {
+  stopHermesPoll()
+  const ints = await loadIntegrations()
+  const act = (label, fn, cls = "ghost") => { const b = el("button", { class: `btn ${cls} small` }, label); b.onclick = () => busy(b, null, fn); return b }
+  const send = (to, message) => async () => {
+    const res = await api(apiUrl(`/api/tasks/${t.id}/send`), { method: "POST", body: JSON.stringify({ to, message }) }).catch(e => ({ ok: false, error: e.message }))
+    if (!res.ok) return toast(res.error, "error")
+    refreshWorkCount()
+    if (to === "hermes") { await redraw(); return }
+    afterSend(res, to); if (to !== "here") await redraw()
+  }
+  const setStatus = (status) => async () => { await api(apiUrl(`/api/tasks/${t.id}`), { method: "POST", body: JSON.stringify({ status }) }); refreshWorkCount(); await redraw() }
+  const where = t.where || {}
+  const aboutChips = el("div", { class: "row", style: "flex-wrap:wrap;gap:6px" }, ...(t.about || []).map(a => {
+    const chip = el("button", { class: "chip", title: `${a.type}: ${a.id}` }, `${aboutIcon[a.type] || ""} ${a.label}`)
+    chip.onclick = () => a.type === "commit" ? showCommit(t.repo_id, a.id) : a.type === "request" ? route("/requests") : a.url ? open(a.url, "_blank", "noopener") : null
+    return chip
+  }))
+  const h = ints.hermes || {}
+  const actions = el("div", { class: "row", style: "gap:6px;flex-wrap:wrap" },
+    where.type === "here" ? act("Open its chat", async () => route(`/repo/${t.repo_id}?session=${where.session}`), "") : act("Work on it now", send("here"), ""),
+    where.type === "hermes" ? null : act("Hand to Hermes", async () => h.ok ? send("hermes")() : toast(`Hermes: ${h.error || "not set up"}. Set it up in Settings → Hermes.`, "error")),
+    act("Park in LLM wiki", send("wiki")), act("Park in Pondering Orb", send("orb")),
+    el("div", { class: "spacer" }),
+    t.status === "done" ? act("Reopen", setStatus("open")) : act("Mark done", setStatus("done")),
+    t.status !== "dropped" && t.status !== "done" ? act("Drop", setStatus("dropped")) : null,
+    menu("More", [{ label: "Delete task", danger: true, run: async () => { if (!confirm("Delete this task? Anything it started (a branch, a Hermes session, a parked note) stays.")) return
+      await api(apiUrl(`/api/tasks/${t.id}`), { method: "DELETE", body: "{}" }); refreshWorkCount(); history.replaceState({}, "", `${BASE}/work`); renderWork() } }]))
+  const whereLine = where.type ? el("div", { class: "small", style: "color:var(--info)" }, WHERE_LABEL[where.type],
+    where.workspace ? ` · branch upkeep/${where.workspace}` : "", where.type === "wiki" ? ` · ${where.note}` : "",
+    where.type === "orb" && where.url ? el("a", { href: where.url, target: "_blank", rel: "noopener", style: "margin-left:6px" }, "open in Orb") : null) : null
+  const bodyBox = el("div", { class: "md", style: "margin-top:4px" }); bodyBox.innerHTML = renderMarkdown(t.body || "_No details._")
+  const log = el("details", {}, el("summary", { class: "muted small" }, `History (${t.log.length})`),
+    el("ul", { class: "small muted", style: "margin:4px 0 0 18px;padding:0" }, ...t.log.slice().reverse().map(l => el("li", {}, `${l.at.slice(0, 16).replace("T", " ")} · ${l.text}`))))
+  const parts = [el("div", { class: "row", style: "gap:8px;align-items:center;flex-wrap:wrap" }, badge(STATUS_CLS[t.status] || "", t.status), el("span", { class: "muted" }, `${KIND_LABEL[t.kind]} · ${t.repo_name}${t.by === "agent" ? " · written down by an agent" : ""}`)),
+    el("h2", { style: "margin:6px 0" }, t.title), whereLine, aboutChips, bodyBox, actions, log]
+  if (where.type === "hermes") parts.push(hermesPanel(t))
+  box.replaceChildren(el("div", { class: "col", style: "gap:10px;padding:14px" }, ...parts))
+}
+
+let hermesTimer = null
+const stopHermesPoll = () => { if (hermesTimer) clearTimeout(hermesTimer); hermesTimer = null }
+function hermesPanel(t) {
+  const wrap = el("div", { class: "hermes" })
+  const log = el("div", { class: "chat-box", role: "log", "aria-live": "polite", "aria-label": "Hermes conversation", style: "max-height:52vh" })
+  const state = el("div", { class: "small muted" })
+  const msgIn = el("textarea", { rows: "2", placeholder: "Tell Hermes more… (Enter to send)", "aria-label": "Message to Hermes" })
+  const sendBtn = el("button", { class: "btn" }, "Send")
+  let shown = -1
+  const poll = async () => {
+    if (!wrap.isConnected) return stopHermesPoll()
+    const r = await api(apiUrl(`/api/tasks/${t.id}/hermes`)).catch(e => ({ ok: false, error: e.message, messages: [] }))
+    const running = r.run?.running
+    state.textContent = !r.ok ? `Can't read the Hermes session: ${r.error}` : running ? "Hermes is working on it… (big jobs can take a while; you can leave this page)" : r.run?.error ? `Last message failed: ${r.run.error}` : `Hermes session ${r.session}`
+    state.style.color = !r.ok || r.run?.error ? "var(--bad)" : running ? "var(--info)" : ""
+    sendBtn.disabled = !!running
+    if ((r.messages || []).length !== shown) {
+      shown = r.messages.length
+      log.replaceChildren(...r.messages.map(m => {
+        const d = el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.role === "tool" ? " tool" : ""}` })
+        if (m.role === "assistant") d.innerHTML = renderMarkdown(m.content); else d.textContent = m.role === "tool" ? `⚙ ${m.content}` : m.content
+        return d
+      }))
+      if (!shown) log.append(el("p", { class: "muted" }, running ? "Waiting for Hermes' first reply…" : "No messages yet."))
+      log.scrollTop = log.scrollHeight
+    }
+    hermesTimer = setTimeout(poll, running ? 3000 : 15000)
+  }
+  sendBtn.onclick = () => {
+    const text = msgIn.value.trim(); if (!text) return
+    busy(sendBtn, "Sending…", async () => {
+      const res = await api(apiUrl(`/api/tasks/${t.id}/send`), { method: "POST", body: JSON.stringify({ to: "hermes", message: text }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!res.ok) return toast(res.error, "error")
+      msgIn.value = ""; stopHermesPoll(); poll()
+    })
+  }
+  msgIn.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendBtn.click() } })
+  wrap.append(el("h4", { style: "margin:8px 0 4px" }, "Hermes"), state, log, el("div", { class: "composer" }, msgIn, el("div", { class: "row" }, el("div", { class: "spacer" }), sendBtn)))
+  setTimeout(poll, 0)
+  return wrap
+}
+
+// The Work tab on a repo page: that repo's tasks.
+async function renderRepoWork(pane, repoId) {
+  const r = await api(apiUrl(`/api/tasks?repo=${encodeURIComponent(repoId)}`))
+  const items = (r.items || []).filter(t => !["done", "dropped"].includes(t.status))
+  pane.replaceChildren(el("div", { class: "row", style: "margin-bottom:8px;gap:8px" }, el("strong", {}, `Tasks (${items.length} active)`), el("div", { class: "spacer" }),
+      el("button", { class: "btn ghost small", onclick: () => route(`/work?repo=${encodeURIComponent(repoId)}`) }, "All on the Work page"),
+      el("button", { class: "btn small", onclick: () => taskDialog({ repo: repoId }) }, "+ New task")),
+    ...items.map(t => taskRow(t, (x) => route(`/work?task=${x.id}`), false)),
+    items.length ? null : el("p", { class: "muted" }, "No active tasks. Use “Work on” next to a commit, or + New task."))
+}
+
+// Settings: where tasks can go.
+async function integrationsSetup() {
+  const box = el("div")
+  const ints = await loadIntegrations(true)
+  const h = ints.hermes || {}, o = ints.orb || {}
+  const hOn = el("input", { type: "checkbox", style: "height:auto" }); hOn.checked = !!h.enabled
+  const hUrl = el("input", { value: h.url || "", placeholder: "http://127.0.0.1:8642", style: "width:100%" })
+  const hProfile = el("input", { value: h.profile || "", placeholder: "(default profile)", style: "width:100%" })
+  const hModel = el("input", { value: h.model || "", placeholder: "(Hermes' own default)", style: "width:100%" })
+  const hKey = el("input", { type: "password", autocomplete: "off", placeholder: h.key_set ? "•••• set (type to replace)" : "API_SERVER_KEY from Hermes", style: "width:100%" })
+  const oUrl = el("input", { value: o.url || "", placeholder: "http://192.168.20.5:8095", style: "width:100%" })
+  const oList = el("input", { value: o.list || "Inbox", style: "width:100%" })
+  const oKey = el("input", { type: "password", autocomplete: "off", placeholder: o.token_set ? "•••• set (type to replace)" : "an ORB_API_TOKENS token (if Orb uses them)", style: "width:100%" })
+  const line = (st, okText) => el("div", { class: "small", style: `color:${st.ok ? "var(--good)" : "var(--muted)"}` }, st.ok ? okText : `Not connected: ${st.error || "not set up"}`)
+  const save = el("button", { class: "btn" }, "Save")
+  save.onclick = () => busy(save, "Saving…", async () => {
+    const keys = {}
+    if (hKey.value.trim()) keys.hermes_api_key = hKey.value.trim()
+    if (oKey.value.trim()) keys.orb_token = oKey.value.trim()
+    if (Object.keys(keys).length) await api(apiUrl("/api/credentials"), { method: "POST", body: JSON.stringify(keys) })
+    await api(apiUrl("/api/integrations/settings"), { method: "POST", body: JSON.stringify({ hermes: { enabled: hOn.checked, url: hUrl.value, profile: hProfile.value, model: hModel.value }, orb: { url: oUrl.value, list: oList.value } }) })
+    toast("Saved", "ok"); box.replaceWith(await integrationsSetup())
+  })
+  const mcpCmd = `hermes mcp add upstream --command upstream-mcp --env UPSTREAM_APP_URL=${location.origin}${BASE}`
+  box.append(el("h4", { style: "margin-top:20px" }, "Hermes"),
+    el("div", { class: "muted" }, "Hand bigger or longer tasks to a Hermes agent. Turn on Hermes' API server (API_SERVER_ENABLED=true and an API_SERVER_KEY), then point this at it. Each task gets its own branch; Hermes works there and you approve the result here."),
+    el("div", { class: "col", style: "margin-top:8px" }, el("label", { class: "row" }, hOn, "Use Hermes"),
+      el("label", { class: "col", style: "gap:4px" }, "API server address", hUrl),
+      el("div", { class: "row", style: "gap:8px" }, el("label", { class: "col", style: "gap:4px;flex:1" }, "Profile", hProfile), el("label", { class: "col", style: "gap:4px;flex:1" }, "Model", hModel)),
+      el("label", { class: "col", style: "gap:4px" }, "API key (kept with your accounts)", hKey), line(h, `Connected to ${h.url}${h.profile ? ` (profile ${h.profile})` : ""}.`),
+      el("div", { class: "small muted" }, "So Hermes can see repos and hand changes back for approval, give it Upstream Manager's tools (run on the Hermes machine):"),
+      el("pre", { class: "code-pre", style: "white-space:pre-wrap" }, mcpCmd)),
+    el("h4", { style: "margin-top:20px" }, "Pondering Orb"),
+    el("div", { class: "muted" }, "Park a task as a to-do in Orb (it syncs to your CalDAV lists)."),
+    el("div", { class: "col", style: "margin-top:8px" }, el("label", { class: "col", style: "gap:4px" }, "Orb address", oUrl),
+      el("label", { class: "col", style: "gap:4px" }, "List for parked tasks", oList), el("label", { class: "col", style: "gap:4px" }, "API token", oKey),
+      line(o, `Connected; parked tasks go to the ${o.list} list.`), el("div", {}, save)))
+  return box
 }
 
 // Disk use and cleanup of Upstream Manager's own data. See storage.py.
@@ -2212,11 +2496,12 @@ function currentView() {
   if (BASE && path.startsWith(BASE)) path = path.slice(BASE.length)
   const parts = path.split('/').filter(Boolean)
   if (parts[0] === 'repo' && parts[1]) return ['repo', decodeURIComponent(parts[1])]
-  if (['requests', 'settings', 'chats', 'workflows'].includes(parts[0])) return [parts[0]]
+  if (['requests', 'settings', 'chats', 'workflows', 'work'].includes(parts[0])) return [parts[0]]
   if (!parts.length || parts[0] === 'repos') return ['repos']
   return ['notfound']
 }
 
+setTimeout(() => refreshWorkCount(), 500)
 async function router() {
   const [view, id] = currentView()
   tools = null
@@ -2233,6 +2518,7 @@ async function router() {
     else if (view === "chats") await renderChats()
     else if (view === "workflows") await renderWorkflows()
     else if (view === "requests") await renderRequests()
+    else if (view === "work") await renderWork()
     else if (view === "settings") await renderSettings()
     else $("#content").replaceChildren(el("div", { class: "card", style: "max-width:520px;margin:40px auto;text-align:center" },
       el("h1", { class: "page" }, "Page not found"), el("p", { class: "muted" }, `There is no page at ${location.pathname}.`),
