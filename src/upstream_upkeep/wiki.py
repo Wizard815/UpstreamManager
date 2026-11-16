@@ -9,8 +9,10 @@ this one feed. Through the vault's MCP endpoint and its memory tools:
 - once a finished day's repo logs are written, one new source for Ingest
   (memory_add_source), "raw/sources/<day> - Upstream Manager.md"
 
-Off unless LLMWIKI_MCP_URL is set (e.g. http://192.168.20.5:27123/mcp). The key
-comes from LLMWIKI_API_KEY and is never stored. Everything runs in the
+Off unless LLMWIKI_MCP_URL is set: on a family vault the bridge's
+http://192.168.20.5:27123/family-mcp with a service token (writes go to the
+shared household/ memory), on a single-user vault /mcp with the Local REST API
+key. The key comes from LLMWIKI_API_KEY and is never stored. Everything runs in the
 background and only logs a failure: the wiki being down never breaks the app.
 """
 from __future__ import annotations
