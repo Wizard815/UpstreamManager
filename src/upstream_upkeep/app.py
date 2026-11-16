@@ -33,10 +33,10 @@ from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request, render_template_string, abort
+from flask import Flask, jsonify, request, render_template_string, abort, send_file
 
 from . import (actions, agent_context, components, config, credentials, daily_check, edits, github, gitops, hermes,
-               memory, orb, pull_report, registry, stacks, storage, store, tasks, upstream_check, wiki, workflows, workspaces)
+               herdr, memory, orb, pull_report, references, registry, stacks, storage, store, studio, tasks, upstream_check, wiki, workflows, workspaces)
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -87,7 +87,10 @@ def _refuse_cross_site_writes():
     """
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
-    if request.mimetype != "application/json":
+    # File uploads are multipart; a custom header forces the same preflight a JSON body does.
+    upload = request.path.endswith("/api/refs/upload") and request.mimetype == "multipart/form-data" \
+        and request.headers.get("X-Upstream-Upload") == "1"
+    if request.mimetype != "application/json" and not upload:
         return jsonify({"ok": False, "error": "send requests as application/json"}), 415
     origin = request.headers.get("Origin")
     if origin and origin != "null":
@@ -872,7 +875,23 @@ def _edit_message(repo_id: str):
     msg = store.get_message(repo_id, data.get("session"), int(data.get("index", -1)))
     if not msg or not msg.get("edits"):
         abort(404)
-    return repo, msg, data
+    return _task_root(repo, data.get("session")), msg, data
+
+
+def _task_root(repo: dict, session_id) -> dict:
+    """A chat that works on a task edits the task's branch folder, never your own checkout."""
+    try:
+        task_id = store.get_session(repo["id"], session_id).get("task") if session_id else None
+    except store.SessionNotFound:
+        return repo
+    t = tasks.get(task_id) if task_id else None
+    ws = t and (t.get("where") or {}).get("workspace") or (t or {}).get("workspace")
+    if ws:
+        try:
+            return {**repo, "path": str(workspaces.path_of(repo, ws))}
+        except workspaces.WorkspaceError:
+            pass
+    return repo
 
 
 @flask_app.route("/api/repo/<repo_id>/edits/apply", methods=["POST"])
@@ -929,6 +948,13 @@ def api_commits(repo_id):
         ref = f"refs/remotes/origin/{st['branch']}"
         rev = {"behind": f"{st['pin']}..{ref}", "ahead": f"{ref}..{st['pin']}"}.get(view, st["pin"])
         items = gitops.list_commits(sub, rev, skip, limit, q)
+        return jsonify({"ok": True, "items": items, "more": len(items) == limit})
+    if view == "branch":  # a quick look at any other branch, local or fetched
+        br = request.args.get("branch", "")
+        ref = next((r for r in (f"refs/heads/{br}", f"refs/remotes/{br}") if br and not br.startswith("-") and gitops.ref_exists(repo["path"], r)), None)
+        if not ref:
+            return jsonify({"ok": False, "error": f"no branch {br}", "items": []})
+        items = gitops.list_commits(repo["path"], ref, skip, limit, q)
         return jsonify({"ok": True, "items": items, "more": len(items) == limit})
     focus = repo.get("focus_branch") or "HEAD"
     ups = {u["name"]: u for u in repo.get("upstreams", [])}
@@ -1436,6 +1462,8 @@ def api_chat_history(repo_id):
         abort(404)
     session = store.snapshot(store.get_session(repo_id, request.args.get("session")))
     repo = store.chat_owner(repo_id)
+    if repo.get("path"):
+        repo = _task_root(repo, session["id"])
     for m in session["messages"] if repo.get("path") else []:
         # Edits not applied yet are checked against the files as they are now.
         if m.get("edits") and not m.get("applied"):
@@ -1605,7 +1633,7 @@ def api_task_create():
     try:
         t = tasks.create(data.get("repo") or store.GENERAL, data.get("title"), data.get("body"),
                          data.get("kind") or "fix", data.get("about"), by="agent" if _from_agent() else "user",
-                         upstream=data.get("upstream"))
+                         upstream=data.get("upstream"), onto=data.get("onto"))
     except tasks.TaskError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     out = {"ok": True, "task": t}
@@ -1622,13 +1650,13 @@ def _task_json(out: dict) -> dict:
 
 
 def _send_task(task_id: str, to: str, message=None) -> dict:
-    if to == "hermes" and (denied := _user_only("Handing work to Hermes")):
+    if to in ("hermes", "herdr", "studio") and (denied := _user_only("Handing work to a coding agent")):
         return {"ok": False, "error": denied[0].get_json()["error"]}
     try:
         return {"ok": True, **tasks.send_to(task_id, to, message if isinstance(message, str) else None)}
     except (tasks.TaskError, workspaces.WorkspaceError) as e:
         return {"ok": False, "error": str(e)}
-    except (hermes.HermesError, orb.OrbError, wiki.WikiError) as e:
+    except (hermes.HermesError, herdr.HerdrError, studio.StudioError, orb.OrbError, wiki.WikiError) as e:
         tasks.update(task_id, note=f"couldn't send to {to}: {e}")
         return {"ok": False, "error": str(e)}
 
@@ -1686,11 +1714,291 @@ def api_task_hermes(task_id):
     return jsonify({"ok": True, "session": sid, "messages": msgs, "run": hermes.run_state(sid)})
 
 
+def _task_ws(t: dict) -> tuple[dict, dict]:
+    repo = store.get_repo(t["repo_id"]) or abort(404)
+    name = (t.get("where") or {}).get("workspace") or t.get("workspace")
+    if not name:
+        abort(flask_app.make_response((jsonify({"ok": False, "error": "this task has no branch yet: work on it here or hand it to an agent first"}), 400)))
+    try:
+        return repo, workspaces.status(repo, name)
+    except workspaces.WorkspaceError as e:
+        abort(flask_app.make_response((jsonify({"ok": False, "error": str(e)}), 400)))
+
+
+@flask_app.route("/api/tasks/<task_id>/changes")
+def api_task_changes(task_id):
+    """The task's branch: its commits, the files it changed (vs the branch it goes into), what's uncommitted,
+    and the commit message an agent proposed."""
+    t = tasks.get(task_id) or abort(404)
+    repo, ws = _task_ws(t)
+    path, base = ws["path"], ws["focus_branch"]
+    commits = gitops.list_commits(path, f"{base}..HEAD", 0, 100)
+    files = []
+    for line in gitops._run(["git", "diff", "--numstat", f"{base}...HEAD"], cwd=path).stdout.splitlines():
+        add, dele, f = (line.split("\t", 2) + ["", ""])[:3]
+        files.append({"path": f, "added": add, "removed": dele, "committed": True})
+    for line in gitops._run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=path).stdout.splitlines():
+        if line[3:] == tasks.COMMIT_FILE:
+            continue
+        files.append({"path": line[3:], "status": line[:2].strip() or "?", "committed": False})
+    proposed = Path(path, tasks.COMMIT_FILE)
+    return jsonify({"ok": True, "branch": ws["branch"], "onto": base, "path": path, "commits": commits, "files": files,
+                    "ready": ws["ready"], "next_step": ws["next_step"], "workspace": ws["name"],
+                    "proposed_message": proposed.read_text(errors="replace")[:5000] if proposed.is_file() else ""})
+
+
+@flask_app.route("/api/tasks/<task_id>/diff")
+def api_task_diff(task_id):
+    """One file's diff on the task's branch (committed vs the target branch, plus uncommitted)."""
+    t = tasks.get(task_id) or abort(404)
+    repo, ws = _task_ws(t)
+    f = request.args.get("path") or ""
+    if not f or f.startswith("-") or ".." in Path(f).parts:
+        abort(400)
+    out = gitops._run(["git", "diff", ws["focus_branch"], "--", f], cwd=ws["path"]).stdout
+    if not out and not gitops._run(["git", "ls-files", "--error-unmatch", "--", f], cwd=ws["path"]).returncode == 0:
+        p = Path(ws["path"], f)
+        if p.is_file() and p.stat().st_size < 400_000:
+            out = "new file (not added yet)\n" + "".join("+" + l for l in p.read_text(errors="replace").splitlines(True))
+    return jsonify({"ok": True, "path": f, "diff": out[:200_000]})
+
+
+def _has_markers(p: Path) -> bool:
+    try:
+        if not p.is_file() or p.stat().st_size > 5_000_000:
+            return False
+        text = p.read_text(errors="replace")
+    except OSError:
+        return False
+    return bool(re.search(r"^<{7}( |$)", text, re.M) and re.search(r"^>{7}( |$)", text, re.M))
+
+
+@flask_app.route("/api/tasks/<task_id>/commit", methods=["POST"])
+def api_task_commit(task_id):
+    """Commit what's changed on the task's branch with the message you reviewed: {message, paths?}."""
+    if (denied := _user_only("Committing a task's changes")):
+        return denied
+    t = tasks.get(task_id) or abort(404)
+    repo, ws = _task_ws(t)
+    data = request.get_json(silent=True) or {}
+    msg = (data.get("message") or "").strip() if isinstance(data.get("message"), str) else ""
+    if not msg:
+        return jsonify({"ok": False, "error": "write a commit message"}), 400
+    paths = data.get("paths")
+    if paths is not None and (not isinstance(paths, list) or not all(isinstance(x, str) and x and not x.startswith("-") for x in paths)):
+        return jsonify({"ok": False, "error": "paths must be a list of files"}), 400
+    path = ws["path"]
+    # Never commit a half-resolved merge: every conflicted or changed file must be free of markers.
+    changed = [l[3:] for l in gitops._run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=path).stdout.splitlines() if l[3:]]
+    marked = [f for f in dict.fromkeys(ws["unresolved"] + changed) if _has_markers(Path(path, f))]
+    if marked:
+        return jsonify({"ok": False, "error": f"{len(marked)} file(s) still have conflict markers: {', '.join(marked[:8])}"
+                        + (" …" if len(marked) > 8 else "") + ". Resolve them first (or ask the agent to)."}), 409
+    add = gitops._run(["git", "add", "-A", "--", *(paths or ["."])], cwd=path)
+    if add.returncode:
+        return jsonify({"ok": False, "error": (add.stderr or add.stdout).strip()}), 400
+    gitops._run(["git", "reset", "-q", "--", tasks.COMMIT_FILE], cwd=path)
+    ident = ["-c", f"user.name={gitops._run(['git', 'config', 'user.name'], cwd=repo['path']).stdout.strip() or 'Upstream Manager'}",
+             "-c", f"user.email={gitops._run(['git', 'config', 'user.email'], cwd=repo['path']).stdout.strip() or 'upstream-manager@localhost'}"]
+    res = gitops._run(["git", *ident, "commit", "-q", "-F", "-"], cwd=path, input=msg + "\n")
+    if res.returncode:
+        return jsonify({"ok": False, "error": (res.stderr or res.stdout).strip() or "nothing to commit"}), 400
+    Path(path, tasks.COMMIT_FILE).unlink(missing_ok=True)
+    sha = (gitops.short_sha(path, "HEAD") or "")[:10]
+    tasks.update(task_id, note=f"committed {sha}: {msg.splitlines()[0][:100]}")
+    return jsonify({"ok": True, "sha": sha})
+
+
+@flask_app.route("/api/tasks/<task_id>/submit", methods=["POST"])
+def api_task_submit(task_id):
+    """Raise the approval request for the task's branch (same as submitting its workspace)."""
+    t = tasks.get(task_id) or abort(404)
+    repo, ws = _task_ws(t)
+    return api_submit_workspace(repo["id"], ws["name"])
+
+
+@flask_app.route("/api/tasks/<task_id>/agent")
+def api_task_agent(task_id):
+    """What the agent a task went to is doing: Hermes/Studio conversation, or a herdr agent's screen."""
+    t = tasks.get(task_id) or abort(404)
+    w = t.get("where") or {}
+    try:
+        if w.get("type") == "hermes":
+            return jsonify({"ok": True, "type": "hermes", "messages": hermes.messages(w["hermes"]), "run": hermes.run_state(w["hermes"])})
+        if w.get("type") == "studio":
+            return jsonify({"ok": True, "type": "studio", "url": w.get("url"), "messages": studio.messages(w["studio"]), "run": studio.run_state(w["studio"])})
+        if w.get("type") == "herdr":
+            a = herdr.agent(w["agent"])
+            return jsonify({"ok": True, "type": "herdr", "agent": w["agent"], "kind": w.get("kind"), **a,
+                            "run": {"running": a["status"] == "working", "error": None}})
+    except (hermes.HermesError, studio.StudioError, herdr.HerdrError) as e:
+        return jsonify({"ok": False, "type": w.get("type"), "error": str(e), "messages": [], "run": {"running": False}})
+    return jsonify({"ok": False, "error": "not with an agent", "messages": []})
+
+
+@flask_app.route("/api/tasks/<task_id>/suggest")
+def api_task_suggest(task_id):
+    t = tasks.get(task_id) or abort(404)
+    return jsonify({"ok": True, **tasks.suggest(t, _available())})
+
+
+@flask_app.route("/api/tasks/suggest", methods=["POST"])
+def api_suggest_draft():
+    """Where a task you're writing should go: {repo, title, body, kind, about}."""
+    d = request.get_json(silent=True) or {}
+    draft = {"repo_id": d.get("repo") or store.GENERAL, "title": str(d.get("title") or ""), "body": str(d.get("body") or ""),
+             "kind": d.get("kind") if d.get("kind") in tasks.KINDS else "fix", "about": d.get("about") if isinstance(d.get("about"), list) else []}
+    return jsonify({"ok": True, **tasks.suggest(draft, _available())})
+
+
+_AVAIL: dict = {"at": 0.0, "v": {}}
+
+
+def _available() -> dict:
+    """Which destinations answer (cached 30 s: the suggestion is asked for while typing)."""
+    import time as _t
+    if _t.time() - _AVAIL["at"] > 30:
+        w = wiki.status()
+        _AVAIL["v"] = {"hermes": hermes.status().get("ok"), "herdr": herdr.status().get("ok"), "studio": studio.status().get("ok"),
+                       "orb": orb.status().get("ok"), "wiki": bool(w.get("writer")) or bool(w.get("ok"))}
+        _AVAIL["at"] = _t.time()
+    return _AVAIL["v"]
+
+
+# ---------------------------------------------------------------- references
+def _ref_call(fn, *a, **kw):
+    try:
+        return jsonify({"ok": True, **(fn(*a, **kw) or {})})
+    except FileNotFoundError:
+        abort(404)
+    except (references.RefError, ValueError) as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@flask_app.route("/api/refs")
+def api_refs():
+    return _ref_call(references.tree, request.args.get("path", ""))
+
+
+@flask_app.route("/api/refs/read")
+def api_refs_read():
+    return _ref_call(references.read, request.args.get("path", ""))
+
+
+@flask_app.route("/api/refs/raw")
+def api_refs_raw():
+    """The file itself, for previews (images, PDFs, video) and downloads."""
+    try:
+        p = references._p(request.args.get("path", ""))
+    except (references.RefError, FileNotFoundError):
+        abort(404)
+    if not p.is_file():
+        abort(404)
+    return send_file(p, as_attachment=request.args.get("download") == "1", conditional=True)
+
+
+@flask_app.route("/api/refs/search")
+def api_refs_search():
+    try:
+        return jsonify({"ok": True, "items": references.search(request.args.get("q", ""))})
+    except references.RefError as e:
+        return jsonify({"ok": False, "error": str(e), "items": []}), 400
+
+
+@flask_app.route("/api/refs/folder", methods=["POST"])
+def api_refs_folder():
+    d = request.get_json(silent=True) or {}
+    return _ref_call(references.mkdir, d.get("parent") or "", d.get("name") or "")
+
+
+@flask_app.route("/api/refs/clone", methods=["POST"])
+def api_refs_clone():
+    """Clone a repo as a reference: {url, folder?, name?, branch?} (in the background)."""
+    d = request.get_json(silent=True) or {}
+    return _ref_call(references.clone, d.get("url") or "", d.get("folder") or "", d.get("name") or None, d.get("branch") or None)
+
+
+@flask_app.route("/api/refs/upload", methods=["POST"])
+def api_refs_upload():
+    """Upload files into a folder: multipart form with folder= and one or more file= parts."""
+    folder = request.form.get("folder", "")
+    files = request.files.getlist("file")
+    if not files:
+        return jsonify({"ok": False, "error": "no file"}), 400
+    out = []
+    try:
+        for f in files:
+            out.append(references.save_upload(folder, f.filename, f.stream))
+    except FileNotFoundError:
+        abort(404)
+    except references.RefError as e:
+        return jsonify({"ok": False, "error": str(e), "saved": out}), 400
+    return jsonify({"ok": True, "saved": out})
+
+
+@flask_app.route("/api/refs/move", methods=["POST"])
+def api_refs_move():
+    d = request.get_json(silent=True) or {}
+    return _ref_call(references.move, d.get("path") or "", d.get("to") or "", d.get("name") or None)
+
+
+@flask_app.route("/api/refs/note", methods=["POST"])
+def api_refs_note():
+    d = request.get_json(silent=True) or {}
+    return _ref_call(lambda: references.set_note(d.get("path") or "", d.get("note") or "") or {})
+
+
+@flask_app.route("/api/refs/delete", methods=["POST"])
+def api_refs_delete():
+    if (denied := _user_only("Deleting references")):
+        return denied
+    d = request.get_json(silent=True) or {}
+    return _ref_call(lambda: references.delete(d.get("path") or "") or {})
+
+
+@flask_app.route("/api/refs/dismiss", methods=["POST"])
+def api_refs_dismiss():
+    references.dismiss_job((request.get_json(silent=True) or {}).get("path") or "")
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/refs/branch", methods=["POST"])
+def api_refs_branch():
+    """Make your own branch of a reference repo: {path, name, start?}."""
+    d = request.get_json(silent=True) or {}
+    return _ref_call(references.branch, d.get("path") or "", d.get("name") or "", d.get("start") or None)
+
+
+@flask_app.route("/api/refs/switch", methods=["POST"])
+def api_refs_switch():
+    """Look at another branch of a reference repo: {path, branch}."""
+    d = request.get_json(silent=True) or {}
+    return _ref_call(references.switch, d.get("path") or "", d.get("branch") or "")
+
+
+@flask_app.route("/api/refs/branches")
+def api_refs_branches():
+    try:
+        return jsonify({"ok": True, "items": references.remote_branches(request.args.get("path", ""))})
+    except FileNotFoundError:
+        abort(404)
+    except references.RefError as e:
+        return jsonify({"ok": False, "error": str(e), "items": []}), 400
+
+
+@flask_app.route("/api/refs/update", methods=["POST"])
+def api_refs_update():
+    d = request.get_json(silent=True) or {}
+    return _ref_call(references.update, d.get("path") or "")
+
+
 @flask_app.route("/api/integrations")
 def api_integrations():
     """Where tasks can go: Hermes, Pondering Orb, the LLM wiki."""
     w = wiki.status()
-    return jsonify({"ok": True, "hermes": hermes.status(), "orb": orb.status(),
+    _AVAIL["at"] = 0.0
+    return jsonify({"ok": True, "hermes": hermes.status(), "herdr": herdr.status(), "studio": studio.status(), "orb": orb.status(),
+                    "suggest": (store.settings().get("work") or {}).get("suggest", "ask"),
                     "wiki": {"ok": bool(w.get("writer")) or bool(w.get("ok")), "writer": w.get("writer"), "reader": w.get("ok"),
                              "error": w.get("error")}})
 
@@ -1710,6 +2018,24 @@ def api_integrations_settings():
         patch["hermes"] = {"enabled": bool(h.get("enabled")), "url": url or "http://127.0.0.1:8642",
                            "profile": re.sub(r"[^A-Za-z0-9_.-]", "", str(h.get("profile") or "")),
                            "model": str(h.get("model") or "").strip()[:100]}
+    if isinstance(data.get("herdr"), dict):
+        h = data["herdr"]
+        kind = str(h.get("kind") or "claude").strip()
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", kind):
+            return jsonify({"ok": False, "error": "the agent kind is a name like claude, codex or hermes"}), 400
+        patch["herdr"] = {"enabled": bool(h.get("enabled")), "socket": str(h.get("socket") or "").strip()[:500],
+                          "session": re.sub(r"[^A-Za-z0-9_.-]", "", str(h.get("session") or "")), "kind": kind,
+                          "args": str(h.get("args") or "").strip()[:300]}
+    if isinstance(data.get("studio"), dict):
+        st = data["studio"]
+        url = str(st.get("url") or "").strip()
+        if url and not re.match(r"^https?://", url):
+            return jsonify({"ok": False, "error": "the Studio address must start with http:// or https://"}), 400
+        patch["studio"] = {"enabled": bool(st.get("enabled")), "url": url.rstrip("/") or "http://127.0.0.1:8648",
+                           "profile": re.sub(r"[^A-Za-z0-9_.-]", "", str(st.get("profile") or "")),
+                           "agent": re.sub(r"[^a-z0-9_-]", "", str(st.get("agent") or ""))}
+    if data.get("suggest") in ("ask", "auto"):
+        patch["work"] = {"suggest": data["suggest"]}
     if isinstance(data.get("orb"), dict):
         o = data["orb"]
         url = str(o.get("url") or "").strip()
@@ -1717,6 +2043,11 @@ def api_integrations_settings():
             return jsonify({"ok": False, "error": "the Orb address must start with http:// or https://"}), 400
         patch["orb"] = {"url": url.rstrip("/"), "list": str(o.get("list") or "Inbox").strip()[:80] or "Inbox"}
     save_settings(patch)
+    if isinstance(data.get("studio_login"), dict) and data["studio_login"].get("username"):
+        try:
+            studio.login(str(data["studio_login"]["username"]), str(data["studio_login"].get("password") or ""))
+        except studio.StudioError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
     return api_integrations()
 
 
@@ -1835,6 +2166,16 @@ def api_file_write():
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(data.get("content", ""), encoding="utf-8")
     return jsonify({"ok": True, "path": str(p)})
+
+
+@flask_app.route("/api/repo/<repo_id>/refs")
+def api_repo_refs(repo_id):
+    """Local branches, then fetched remote ones (origin/main...), for a quick look at any of them."""
+    repo = _tracked(repo_id)
+    out = gitops._run(["git", "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"], cwd=repo["path"]).stdout.split()
+    names = [r[len("refs/heads/"):] for r in out if r.startswith("refs/heads/") and not r.startswith("refs/heads/upkeep/")] + \
+            [r[len("refs/remotes/"):] for r in out if r.startswith("refs/remotes/") and not r.endswith("/HEAD")]
+    return jsonify({"ok": True, "items": names[:500]})
 
 
 @flask_app.route("/api/repo/<repo_id>/branches")
@@ -2094,6 +2435,21 @@ TEMPLATE = r"""<!DOCTYPE html>
     .btn { height: 40px; } .btn.small { height: 34px; } .tab { height: 38px; }
     .path { max-width: 100%; }
   }
+.task-body{max-height:180px;overflow:auto;border-left:2px solid var(--line);padding-left:10px}.dest-grid{display:flex;flex-wrap:wrap;gap:6px}.suggest{font-size:13px}.suggest strong{color:var(--info)}
+.agent-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:12px;align-items:start}
+.agent-box,.branch-box{padding:10px;min-width:0}.branch-box h5{margin:10px 0 4px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.file-row{display:flex;gap:8px;align-items:center;background:none;border:0;color:inherit;font:inherit;text-align:left;padding:3px 6px;border-radius:6px;cursor:pointer;width:100%}
+.file-row:hover{background:var(--raise)}.file-row .nm{font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fst{font-size:11px;min-width:64px;font-family:var(--mono)}.fst.c{color:var(--good)}.fst.u{color:#e0a060}
+.commit-line{display:flex;gap:6px;align-items:baseline;font-size:13px}.linkish{background:none;border:0;color:var(--accent2,#9fb4ff);cursor:pointer;font:inherit;padding:0}
+pre.term{margin:0;font:12px/1.35 var(--mono);white-space:pre-wrap;color:#cfd6e4}
+.ref-grid{display:grid;grid-template-columns:minmax(220px,300px) 1fr;gap:14px;align-items:start}@media (max-width:900px){.ref-grid{grid-template-columns:1fr}}
+.ref-tree .trow{display:flex;gap:6px;align-items:center;padding:4px 8px;cursor:pointer;border-radius:6px}.ref-tree .trow:hover{background:var(--raise)}
+.ref-tree .trow.sel{background:var(--raise);box-shadow:inset 3px 0 0 var(--accent,#4c7dff)}.ref-tree .tw{width:12px;color:var(--muted)}
+.trow.drop,.ref-drop.drop{outline:2px dashed var(--accent,#4c7dff);outline-offset:-2px}
+.ref-row,.ref-head{display:grid;grid-template-columns:22px minmax(140px,1.4fr) minmax(0,2fr) 70px 86px;gap:8px;align-items:center;padding:6px 8px;border-bottom:1px solid var(--line)}
+.ref-row{cursor:pointer}.ref-row:hover{background:var(--raise)}.ref-row .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ref-row>span:nth-child(3){overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ref-drop{min-height:120px;border-radius:8px}
 .work-grid{display:grid;grid-template-columns:minmax(280px,380px) 1fr;gap:14px;align-items:start}
 @media (max-width:900px){.work-grid{grid-template-columns:1fr}}
 .task-list{display:flex;flex-direction:column;max-height:calc(100vh - 220px);overflow:auto}
@@ -2114,6 +2470,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     <a href="{{ base_url }}/repos" data-view="repos">Repos</a>
     <a href="{{ base_url }}/work" data-view="work">Work <span class="count" id="work-count"></span></a>
     <a href="{{ base_url }}/chats" data-view="chats">Chats</a>
+    <a href="{{ base_url }}/references" data-view="references">References</a>
     <a href="{{ base_url }}/workflows" data-view="workflows">Workflows</a>
     <a href="{{ base_url }}/requests" data-view="requests">Requests <span class="count" id="pending-count"></span></a>
     <a href="{{ base_url }}/settings" data-view="settings">Settings</a>

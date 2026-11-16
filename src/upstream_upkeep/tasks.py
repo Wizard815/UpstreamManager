@@ -18,7 +18,7 @@ from . import config, store, workspaces
 
 KINDS = ("fix", "bug", "feature", "merge", "chore", "idea")
 STATUSES = ("open", "working", "parked", "done", "dropped")
-WHERE = ("here", "hermes", "wiki", "orb")
+WHERE = ("here", "hermes", "herdr", "studio", "wiki", "orb")
 ABOUT_TYPES = ("commit", "request", "file", "component", "pr", "push", "conflict")
 MAX_ABOUT = 12
 
@@ -69,7 +69,8 @@ def get(task_id: str) -> dict | None:
 
 
 @store._locked
-def create(repo_id: str, title, body=None, kind: str = "fix", about=None, by: str = "user", upstream: str | None = None) -> dict:
+def create(repo_id: str, title, body=None, kind: str = "fix", about=None, by: str = "user", upstream: str | None = None,
+           onto: str | None = None) -> dict:
     if repo_id != store.GENERAL and not store.get_repo(repo_id):
         raise TaskError(f"no repo {repo_id}")
     if kind not in KINDS:
@@ -79,6 +80,12 @@ def create(repo_id: str, title, body=None, kind: str = "fix", about=None, by: st
          "body": _text(body, "body", 20000), "kind": kind, "about": _clean_about(about),
          "status": "open", "where": None, "created_at": now, "updated_at": now, "by": by,
          "log": [{"at": now, "text": f"created by {'an agent' if by == 'agent' else 'you'}"}]}
+    if isinstance(onto, str) and onto.strip():
+        repo = store.get_repo(repo_id)
+        from . import gitops
+        if not repo or not gitops.ref_exists(repo["path"], f"refs/heads/{onto.strip()}"):
+            raise TaskError(f"no local branch {onto.strip()} to work on")
+        t["onto"] = onto.strip()
     if kind == "merge" and isinstance(upstream, str) and upstream.strip():
         t["upstream"] = upstream.strip()[:100]  # a merge task works in a merge workspace for this upstream
     _all().append(t)
@@ -155,8 +162,67 @@ def _workspace(task: dict, repo: dict) -> dict | None:
         except Exception:
             pass
     if task.get("upstream"):
-        return workspaces.open_workspace(repo, upstream=task["upstream"])
-    return workspaces.open_workspace(repo, change=f"{task['title']} {task['id'][:4]}")
+        return workspaces.open_workspace(repo, upstream=task["upstream"], onto=task.get("onto"))
+    ws = workspaces.open_workspace(repo, change=f"{task['title']} {task['id'][:4]}", onto=task.get("onto"))
+    _exclude_commit_file(ws["path"])
+    return ws
+
+
+COMMIT_FILE = ".upkeep-commit-msg"
+
+
+def _exclude_commit_file(path: str) -> None:
+    """Agents leave their proposed commit message in COMMIT_FILE; git never sees it."""
+    from . import gitops
+    common = gitops._run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=path).stdout.strip()
+    if not common:
+        return
+    ex = __import__("pathlib").Path(common) / "info" / "exclude"
+    ex.parent.mkdir(parents=True, exist_ok=True)
+    text = ex.read_text() if ex.exists() else ""
+    if COMMIT_FILE not in text.split():
+        ex.write_text(text + ("" if text.endswith("\n") or not text else "\n") + COMMIT_FILE + "\n")
+
+
+def agent_instructions(task: dict, repo: dict, workdir: str, review: bool = True) -> str:
+    """What every agent (Hermes, a herdr agent, a Studio run) is told about where and how to work."""
+    focus = task.get("onto") or repo.get("focus_branch") or "main"
+    lines = [
+        "You are working on a task handed over from Upstream Manager.",
+        f"Work only in this folder: {workdir}" + (" (the task's own branch)." if workdir != repo["path"] else "."),
+        f"The repo is {repo.get('name') or repo['id']}; the result goes into its branch {focus} once the user approves.",
+        "Never push, force-push or rewrite history, and never switch the folder to another branch.",
+    ]
+    if review:
+        lines.append(f"Do not commit. The user reviews every commit message first: when a change is ready, write the commit message"
+                     f" you propose (a subject line, a blank line, then the why) into the file {COMMIT_FILE} at the folder's root,"
+                     " and say so. Upstream Manager shows your changes and that message; the user edits it and commits.")
+    else:
+        lines.append("Commit your work with clear messages (a subject line, a blank line, then the why).")
+    lines.append(f"If you have Upstream Manager's MCP tools (server 'upstream'), use them: repo id {repo['id']}, task {task['id']}"
+                 " (update_task to report progress).")
+    return "\n".join(lines)
+
+
+def suggest(task: dict, available: dict | None = None) -> dict:
+    """Where this task should probably go, and why: the user agrees, or picks another."""
+    available = available or {}
+    body, kind = task.get("body") or "", task["kind"]
+    files = body.count("\n- ")
+    big = files >= 8 or len(body) > 2500 or kind == "merge" and files >= 3
+    agent = next((w for w in ("herdr", "studio", "hermes") if available.get(w)), None)
+    if task["repo_id"] == store.GENERAL and kind != "idea":
+        return {"to": "orb" if available.get("orb") else "wiki", "why": "it isn't about a repo yet: keep it as a to-do"}
+    if kind == "idea":
+        return {"to": "wiki" if available.get("wiki") else "orb", "why": "an idea to come back to: park it in your notes"}
+    if big and agent:
+        what = f"{files} files are involved" if files >= 3 else "it's a big job"
+        return {"to": agent, "why": f"{what}: a coding agent can take its time on the task's branch"}
+    if kind in ("fix", "bug", "chore") and len(task.get("about") or []) <= 2:
+        return {"to": "here", "why": "a focused fix: work on it here with the chat, on its own branch"}
+    if agent:
+        return {"to": agent, "why": "a change that needs several steps: hand it to a coding agent"}
+    return {"to": "here", "why": "work on it here, on its own branch"}
 
 
 def send_to(task_id: str, to: str, message: str | None = None) -> dict:
@@ -190,7 +256,7 @@ def send_to(task_id: str, to: str, message: str | None = None) -> dict:
         if sid and hermes.run_state(sid).get("running"):
             raise TaskError("Hermes is still working on this task")
         if not sid:
-            sid = hermes.start(task["title"], hermes.instructions(repo, workdir))
+            sid = hermes.start(task["title"], agent_instructions(task, repo, workdir))
         def done(err, tid=task_id):
             try:
                 update(tid, note=f"Hermes failed: {err}" if err else "Hermes replied")
@@ -200,6 +266,32 @@ def send_to(task_id: str, to: str, message: str | None = None) -> dict:
         where = {"type": "hermes", "hermes": sid, "workspace": ws and ws["name"], "workdir": workdir}
         task["workspace"] = ws and ws["name"]
         update(task_id, status="working", where=where, note="handed to Hermes")
+        return {"where": where}
+    if to in ("herdr", "studio"):
+        from . import herdr, studio
+        if repo is None:
+            raise TaskError("a coding agent works on a repo: this task is not about one")
+        ws = _workspace(task, repo)
+        workdir = ws["path"] if ws else repo["path"]
+        task["workspace"] = ws and ws["name"]
+        prev = task.get("where") or {}
+        def done(err, tid=task_id, who=to):
+            try:
+                update(tid, note=f"{who} failed: {err}" if err else f"{who} finished a run")
+            except KeyError:
+                pass
+        if to == "herdr":
+            if prev.get("type") == "herdr" and prev.get("agent"):
+                herdr.prompt(prev["agent"], message or brief(task, repo))
+                where = prev
+            else:
+                info = herdr.start(task_id, task["title"], workdir, agent_instructions(task, repo, workdir) + "\n\n" + (message or brief(task, repo)))
+                where = {"type": "herdr", **info, "workspace": ws and ws["name"], "workdir": workdir}
+        else:
+            sid = prev.get("studio") if prev.get("type") == "studio" else None
+            sid = studio.run(message or brief(task, repo), workdir, agent_instructions(task, repo, workdir), sid, on_done=done)
+            where = {"type": "studio", "studio": sid, "url": studio.link(sid), "workspace": ws and ws["name"], "workdir": workdir}
+        update(task_id, status="working", where=where, note=f"handed to {'herdr' if to == 'herdr' else 'Hermes Studio'}")
         return {"where": where}
     if to == "wiki":
         res = wiki.park(task["title"], brief(task, repo) + f"\n\n(Parked from Upstream Manager, task {task['id']}.)")

@@ -157,10 +157,11 @@ def _advance(ws: Path, meta: dict, focus: str) -> None:
 
 
 def open_workspace(repo: dict, upstream: str | None = None, branches: list[str] | None = None,
-                   change: str | None = None) -> dict:
+                   change: str | None = None, onto: str | None = None) -> dict:
     """Create (or return) a workspace merging `upstream`, or the set `branches`, into the focus branch;
-    or, with `change` (a short title), an empty one to make and test a change of your own in."""
-    focus = repo.get("focus_branch") or "main"
+    or, with `change` (a short title), an empty one to make and test a change of your own in.
+    `onto` works against another local branch instead of the focus branch (its result goes there)."""
+    focus = onto or repo.get("focus_branch") or "main"
     if not gitops.ref_exists(repo["path"], f"refs/heads/{focus}"):
         raise WorkspaceError(f"focus branch {focus} does not exist")
     wanted = [upstream] if upstream else list(dict.fromkeys(b for b in (branches or []) if b))

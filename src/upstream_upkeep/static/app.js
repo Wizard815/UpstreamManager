@@ -279,6 +279,18 @@ function addTag(repoId, tag) {
   toast(`Tagged ${tag.label} for the chat`, "ok")
 }
 
+// Ask the chat about something: attach it and start the question in the composer.
+function askAbout(repoId, tag, prompt) {
+  const t = loadTags(repoId)
+  if (!t.some(x => x.type === tag.type && x.id === tag.id)) {
+    if (t.length >= MAX_TAGS) return toast(`You can attach up to ${MAX_TAGS} items. Remove one from the chat tray first.`, "error")
+    t.push(tag); saveTags(repoId, t)
+  }
+  refreshTray()
+  if (tools && matchMedia("(max-width: 900px)").matches) tools.show("Chat")
+  document.dispatchEvent(new CustomEvent("chat-prefill", { detail: { repoId, text: prompt } }))
+}
+
 // ↓ behind = commits the upstream has that you lack; ↑ ahead = commits only you have.
 let tools = null  // the open repo page's tool tabs: {show(name), openFiles(ws)}
 
@@ -752,7 +764,7 @@ function chatPanel(repoId, opts = {}) {
       tray.append(el("span", { class: "muted small" }, `Attached (${items.length}/${MAX_TAGS}):`))
       for (const t of items) {
         const x = el("button", { class: "chip-x", "aria-label": `Remove ${t.label}`, onclick: () => { saveTags(trayKey, loadTags(trayKey).filter(y => !(y.type === t.type && y.id === t.id))); refreshTray() } }, "×")
-        tray.append(el("span", { class: "chip" }, `${t.type === "commit" ? "◆" : "▤"} ${t.label}`, x))
+        tray.append(el("span", { class: "chip" }, t.type === "ref" ? t.label : `${t.type === "commit" ? "◆" : "▤"} ${t.label}`, x))
       }
     }
     refreshTray()
@@ -774,6 +786,12 @@ function chatPanel(repoId, opts = {}) {
       opts.onChange?.()
     }
     msgIn.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendBtn.click() } })
+    const onPrefill = (e) => {
+      if (!msgIn.isConnected) return document.removeEventListener("chat-prefill", onPrefill)
+      if (e.detail.repoId !== repoId) return
+      msgIn.value = e.detail.text + msgIn.value; msgIn.focus(); msgIn.setSelectionRange(msgIn.value.length, msgIn.value.length)
+    }
+    document.addEventListener("chat-prefill", onPrefill)
     try {  // a task sent here leaves its brief as the first message, for you to read and send
       const draft = sessionStorage.getItem(`draft:${sessionId}`)
       if (draft) { msgIn.value = draft; sessionStorage.removeItem(`draft:${sessionId}`); msgIn.rows = 8; setTimeout(() => msgIn.focus(), 0) }
@@ -1110,7 +1128,11 @@ async function renderCommits(wrap, repoId) {
   const viewSel = el("select", { "aria-label": "Which commits" },
     el("option", { value: "behind" }, "Missing from upstream (behind)"),
     el("option", { value: "ahead" }, "Only on my branch (ahead)"),
-    el("option", { value: "all" }, "All commits"))
+    el("option", { value: "all" }, "All commits"),
+    el("option", { value: "branch" }, "Another branch…"))
+  // A quick look at any other branch (local or fetched), without checking it out.
+  const brSel = el("select", { "aria-label": "Branch to look at", hidden: "" })
+  api(apiUrl(`/api/repo/${repoId}/refs`)).then(r => brSel.replaceChildren(...(r.items || []).map(b => el("option", { value: b }, b)))).catch(() => {})
   // Source: one of the repo's upstreams, or a component (its submodule history).
   const upSel = el("select", { "aria-label": "Source" },
     ...(repo.upstreams || []).map(u => el("option", { value: `up:${u.name}` }, u.name)),
@@ -1130,7 +1152,8 @@ async function renderCommits(wrap, repoId) {
     if (reset) { skip = 0; list.replaceChildren(loading()) }
     const [kind, name] = upSel.value.split(/:(.*)/s)
     const src = kind === "comp" ? `component=${encodeURIComponent(name)}` : `upstream=${encodeURIComponent(name || "")}`
-    const q = `view=${viewSel.value}&${src}&skip=${skip}&limit=50&q=${encodeURIComponent(qIn.value.trim())}`
+    brSel.hidden = viewSel.value !== "branch"; upSel.hidden = viewSel.value === "branch"
+    const q = `view=${viewSel.value}&${viewSel.value === "branch" ? `branch=${encodeURIComponent(brSel.value)}` : src}&skip=${skip}&limit=50&q=${encodeURIComponent(qIn.value.trim())}`
     let res
     try { res = await api(apiUrl(`/api/repo/${repoId}/commits?${q}`)) }
     catch (e) { res = { ok: false, error: e.message } }
@@ -1144,13 +1167,16 @@ async function renderCommits(wrap, repoId) {
         : addTag(repoId, { type: "commit", id: c.full, label: `${c.sha} ${c.subject.slice(0, 40)}` })
       const view = el("button", { class: "btn ghost", "aria-label": `View commit ${c.sha}` }, "View")
       view.onclick = () => busy(view, null, () => showCommit(repoId, c.full, comp))
-      const work = el("button", { class: "btn ghost", title: "Make a task of it: fix it here, hand it to Hermes, or park it", "aria-label": `Work on commit ${c.sha}` }, "Work on")
+      const ask = el("button", { class: "btn ghost", title: "Ask the chat about this commit", "aria-label": `Ask about commit ${c.sha}` }, "Ask")
+      ask.onclick = () => comp ? toast("Ask about component commits from the component's own repo.", "info")
+        : askAbout(repoId, { type: "commit", id: c.full, label: `${c.sha} ${c.subject.slice(0, 40)}` }, `About commit ${c.sha} (“${c.subject.slice(0, 60)}”): `)
+      const work = el("button", { class: "btn ghost", title: "Make a task of it: fix it here, send it to an agent, or park it", "aria-label": `Work on commit ${c.sha}` }, "Work on")
       work.onclick = () => taskDialog({ repo: repoId, kind: "fix", title: `Fix: ${c.subject}`.slice(0, 200), dialogTitle: `Work on ${c.sha}`,
         about: [comp ? { type: "component", id: comp, label: `${comp} ${c.sha}` } : { type: "commit", id: c.full, label: `${c.sha} ${c.subject.slice(0, 40)}` }] })
       list.append(el("div", { class: "mem" },
         el("code", { style: "color:#9fb4ff" }, c.sha),
         el("div", { style: "flex:1;min-width:0" }, el("div", {}, c.subject), el("div", { class: "muted", style: "font-size:12px" }, `${c.author} · ${c.date.slice(0, 10)}`)),
-        view, work, tag))
+        view, ask, work, tag))
     }
     skip += res.items.length
     if (!list.children.length) info.textContent = viewSel.value === "behind" ? "Nothing missing: you have every upstream commit." : "No commits."
@@ -1160,8 +1186,9 @@ async function renderCommits(wrap, repoId) {
   more.onclick = () => busy(more, "Loading…", () => load(false))
   viewSel.onchange = () => load(true)
   upSel.onchange = () => load(true)
+  brSel.onchange = () => load(true)
   qIn.addEventListener("keydown", (e) => { if (e.key === "Enter") load(true) })
-  wrap.append(el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" }, viewSel, upSel.options.length > 1 ? upSel : "", qIn), info, list, more)
+  wrap.append(el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" }, viewSel, upSel.options.length > 1 ? upSel : "", brSel, qIn), info, list, more)
   if (!upSel.options.length) info.textContent = "No upstream or component to compare against."
   await load(true)
 }
@@ -1193,12 +1220,16 @@ async function showCommit(repoId, sha, component = null) {
   workBtn.onclick = () => { close(); taskDialog({ repo: repoId, kind: "fix", title: `Fix: ${(d.message || "").split("\n")[0]}`.slice(0, 200), dialogTitle: `Work on ${d.sha.slice(0, 10)}`,
     about: [{ type: "commit", id: d.sha, label: `${d.sha.slice(0, 8)} ${(d.message || "").split("\n")[0].slice(0, 40)}` }] }) }
   if (component) workBtn.hidden = true
+  const askBtn = el("button", { class: "btn ghost" }, "Ask about it")
+  askBtn.onclick = () => { close(); askAbout(repoId, { type: "commit", id: d.sha, label: `${d.sha.slice(0, 8)} ${(d.message || "").split("\n")[0].slice(0, 40)}` },
+    `About commit ${d.sha.slice(0, 8)} (“${(d.message || "").split("\n")[0].slice(0, 60)}”): `) }
+  if (component) askBtn.hidden = true
   const closeBtn = el("button", { class: "btn ghost", onclick: close }, "Close")
   const titleId = `commit-title-${sha.slice(0, 10)}`
   const ov = el("div", { class: "overlay", onclick: (e) => { if (e.target === ov) close() } },
     el("div", { class: "overlay-panel", role: "dialog", "aria-modal": "true", "aria-labelledby": titleId },
       el("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap" },
-        el("h3", { style: "margin:0", id: titleId }, d.ok ? `Commit ${d.sha.slice(0, 10)}` : "Commit"), el("div", { style: "display:flex;gap:6px" }, d.ok ? workBtn : null, d.ok ? tag : null, closeBtn)),
+        el("h3", { style: "margin:0", id: titleId }, d.ok ? `Commit ${d.sha.slice(0, 10)}` : "Commit"), el("div", { style: "display:flex;gap:6px" }, d.ok ? askBtn : null, d.ok ? workBtn : null, d.ok ? tag : null, closeBtn)),
       d.ok ? el("div", {},
         el("div", { class: "muted" }, `${d.author} · ${(d.date || "").slice(0, 10)}`),
         el("pre", { style: "white-space:pre-wrap;margin:8px 0" }, d.message),
@@ -1916,6 +1947,7 @@ async function renderSettings() {
     const keyIn = el("input", { value: llm.api_key || "", type: "password", autocomplete: "off", placeholder: "optional", style: "width:320px" })
     const fallIn = el("textarea", { rows: "3", style: "width:420px;max-width:100%;font:12px var(--mono)", placeholder: "http://host:8001/v1\nhttp://host:8002/v1",
       "aria-label": "Fallback server URLs" }, (llm.fallback_urls || []).join("\n"))
+    const visionIn = el("input", { type: "checkbox", style: "height:auto" }); visionIn.checked = !!llm.vision
     const liveEl = el("div", { class: "muted small" })
     const showLive = async (refresh) => {
       const s = await api(apiUrl(`/api/llm/status${refresh ? "?refresh=1" : ""}`)).catch(() => null)
@@ -1944,7 +1976,7 @@ async function renderSettings() {
     const saveBtn = el("button", { class: "btn" }, "Save")
     saveBtn.onclick = () => busy(saveBtn, "Saving…", async () => {
       const fallback_urls = fallIn.value.split("\n").map(u => u.trim()).filter(Boolean)
-      const res = await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ llm: { model: modelSel.value, base_url: urlIn.value.trim(), api_key: keyIn.value, fallback_urls } }) })
+      const res = await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ llm: { model: modelSel.value, base_url: urlIn.value.trim(), api_key: keyIn.value, fallback_urls, vision: visionIn.checked } }) })
       keyIn.value = res.settings?.llm?.api_key || ""
       toast("Model connection saved", "ok")
       await showLive(true); refreshModelStatus()
@@ -1958,6 +1990,7 @@ async function renderSettings() {
         liveEl,
         el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Model", modelSel),
         modelStatus,
+        el("label", { class: "row", style: "gap:6px" }, visionIn, "This model can see images (send attached pictures, e.g. from References, as images)"),
         el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, refreshBtn, saveBtn)
       )
     )
@@ -2035,7 +2068,7 @@ async function renderSettings() {
 // here (a chat plus its own branch), handed to Hermes for bigger jobs, or parked for later in the
 // LLM wiki or Pondering Orb. See tasks.py.
 const KIND_LABEL = { fix: "Fix", bug: "Bug", feature: "Change", chore: "Chore", merge: "Merge", idea: "Idea" }
-const WHERE_LABEL = { here: "Worked on here", hermes: "With Hermes", wiki: "Parked in the wiki", orb: "Parked in Pondering Orb" }
+const WHERE_LABEL = { here: "Worked on here", hermes: "With Hermes", herdr: "With a herdr agent", studio: "With Hermes Studio", wiki: "Parked in the wiki", orb: "Parked in Pondering Orb" }
 const STATUS_CLS = { open: "warn", working: "info", parked: "", done: "ok", dropped: "" }
 let integrations = null
 async function loadIntegrations(force = false) {
@@ -2045,12 +2078,34 @@ async function loadIntegrations(force = false) {
 const aboutIcon = { commit: "◆", request: "✓", file: "▤", component: "📦", pr: "⇄", push: "↑", conflict: "⚠" }
 
 // Open the task dialog, prefilled from where you started ("Work on" a commit, a request, a chat...).
+// Upstream Manager suggests where the task should go (and why); you take the suggestion or pick another.
+const DEST = {
+  here: { label: "Work on it here", busy: "Making its branch…", why: "A chat about it, on its own branch" },
+  herdr: { label: "Send to herdr", busy: "Starting the agent…", why: "Start a coding agent in herdr on the task's branch" },
+  studio: { label: "Send to Hermes Studio", busy: "Starting Studio…", why: "A Studio run on the task's branch; follow it in Studio" },
+  hermes: { label: "Hand to Hermes", busy: "Starting Hermes…", why: "A Hermes session on the task's branch" },
+  wiki: { label: "Park in LLM wiki", busy: "Parking…", why: "A note in the wiki's inbox for later" },
+  orb: { label: "Park in Pondering Orb", busy: "Parking…", why: "A to-do in Orb" },
+}
+let drawDests = null
 async function taskDialog(pre = {}) {
-  const ints = await loadIntegrations(true)
+  const ints = await loadIntegrations()
+  loadIntegrations(true).then(fresh => { Object.assign(ints, fresh); drawDests?.() }).catch(() => {})
   const repos = await api(apiUrl("/api/repos")).catch(() => [])
   const list = Array.isArray(repos) ? repos : repos.repos || []
   const repoSel = el("select", { "aria-label": "Repository" }, el("option", { value: GENERAL }, "No particular repo"), ...list.map(r => el("option", { value: r.id }, r.name || r.id)))
   repoSel.value = pre.repo || GENERAL
+  const ontoSel = el("select", { "aria-label": "Branch to work on" })
+  const loadBranches = async () => {
+    ontoSel.replaceChildren()
+    if (repoSel.value === GENERAL) { ontoSel.disabled = true; ontoSel.append(el("option", { value: "" }, "—")); return }
+    ontoSel.disabled = false
+    const repo = list.find(r => r.id === repoSel.value) || {}
+    const bs = await api(apiUrl(`/api/repo/${repoSel.value}/branches`)).catch(() => ({}))
+    const names = (bs.branches || bs.items || []).map(b => typeof b === "string" ? b : b.name).filter(b => b && !b.startsWith("upkeep/"))
+    ontoSel.append(el("option", { value: "" }, `${repo.focus_branch || "focus branch"} (focus)`), ...names.filter(b => b !== repo.focus_branch).map(b => el("option", { value: b }, b)))
+    ontoSel.value = pre.onto || ""
+  }
   const title = el("input", { value: pre.title || "", placeholder: "What needs doing, in a line", "aria-label": "Title", style: "width:100%" })
   const kind = el("select", { "aria-label": "Kind" }, ...Object.entries(KIND_LABEL).map(([k, v]) => el("option", { value: k }, v)))
   kind.value = pre.kind || "fix"
@@ -2063,33 +2118,48 @@ async function taskDialog(pre = {}) {
     ...(about.length ? [] : [el("span", { class: "muted small" }, "Not linked to a commit or request.")]))
   drawChips()
   let close
-  const send = async (btn, to) => busy(btn, { here: "Making its branch…", hermes: "Starting Hermes…", wiki: "Parking…", orb: "Parking…" }[to] || "Saving…", async () => {
+  const send = (btn, to) => busy(btn, DEST[to]?.busy || "Saving…", async () => {
     if (!title.value.trim()) { title.focus(); return toast("Give the task a title", "error") }
-    const res = await api(apiUrl("/api/tasks"), { method: "POST", body: JSON.stringify({ repo: repoSel.value, title: title.value, body: body.value, kind: kind.value, about, upstream: pre.upstream, to: to || undefined }) })
-    if (!res.ok) { toast(`Saved the task, but: ${res.error}`, "error"); close(); return route(`/work?task=${res.task.id}`) }
+    const res = await api(apiUrl("/api/tasks"), { method: "POST", body: JSON.stringify({ repo: repoSel.value, title: title.value, body: body.value, kind: kind.value, about,
+      upstream: pre.upstream, onto: ontoSel.value || undefined, to: to || undefined }) })
+    if (!res.ok && !res.task) return toast(res.error, "error")
     close(); refreshWorkCount()
+    if (!res.ok) { toast(`Saved the task, but: ${res.error}`, "error"); return route(`/work?task=${res.task.id}`) }
     afterSend(res, to)
   })
-  const btn = (label, to, cls, why) => {
-    const b = el("button", { class: `btn ${cls || "ghost"}`, title: why || null }, label)
-    b.onclick = () => send(b, to)
-    return b
+  const dests = el("div", { class: "dest-grid" })
+  const suggestLine = el("div", { class: "suggest" })
+  let suggested = null
+  drawDests = () => {
+    dests.replaceChildren(...Object.entries(DEST).map(([k, d]) => {
+      const st = k === "here" ? { ok: true } : ints[k] || {}
+      const b = el("button", { class: `btn ${k === suggested ? "" : "ghost"} dest${st.ok ? "" : " dim"}`, title: st.ok ? d.why : `${d.label.replace(/^(Send to|Park in|Hand to) /, "")}: ${st.error || "not set up"} (Settings)` }, d.label)
+      b.onclick = () => st.ok ? send(b, k) : toast(`${d.label}: ${st.error || "not set up"}. Set it up in Settings.`, "error")
+      return b
+    }))
   }
-  const h = ints.hermes || {}, o = ints.orb || {}, w = ints.wiki || {}
-  const hermesBtn = btn("Hand to Hermes", "hermes", "ghost", h.ok ? "Start a Hermes session for a longer, bigger job" : `Hermes: ${h.error || "not set up"} (Settings → Hermes)`)
-  const wikiBtn = btn("Park in LLM wiki", "wiki", "ghost", w.ok ? "Save it to the wiki's inbox for later" : "The LLM wiki isn't set up (Settings → LLM wiki)")
-  const orbBtn = btn("Park in Pondering Orb", "orb", "ghost", o.ok ? `A task in Orb's ${o.list} list` : `Pondering Orb: ${o.error || "not set up"} (Settings → Pondering Orb)`)
-  if (!h.ok) hermesBtn.classList.add("dim"); if (!w.ok) wikiBtn.classList.add("dim"); if (!o.ok) orbBtn.classList.add("dim")
+  let sugTimer
+  const askSuggestion = () => { clearTimeout(sugTimer); sugTimer = setTimeout(async () => {
+    const r = await api(apiUrl("/api/tasks/suggest"), { method: "POST", body: JSON.stringify({ repo: repoSel.value, title: title.value, body: body.value, kind: kind.value, about }) }).catch(() => null)
+    if (!r) return
+    suggested = r.to; drawDests()
+    suggestLine.replaceChildren(el("span", {}, "Suggested: "), el("strong", {}, DEST[r.to].label), el("span", { class: "muted" }, ` — ${r.why}. `),
+      el("span", { class: "muted small" }, "Take it, or pick another."))
+  }, 250) }
+  for (const x of [title, body]) x.addEventListener("input", askSuggestion)
+  kind.onchange = askSuggestion
+  repoSel.onchange = () => { loadBranches(); askSuggestion() }
+  drawDests(); askSuggestion(); loadBranches()
   close = openDialog(pre.dialogTitle || "New task",
-    el("div", { class: "col", style: "gap:10px;min-width:min(560px,80vw)" },
-      el("div", { class: "row", style: "gap:8px;flex-wrap:wrap" }, el("label", { class: "col", style: "gap:4px;flex:1;min-width:160px" }, "Repo", repoSel), el("label", { class: "col", style: "gap:4px" }, "Kind", kind)),
+    el("div", { class: "col", style: "gap:10px;min-width:min(620px,80vw)" },
+      el("div", { class: "row", style: "gap:8px;flex-wrap:wrap" }, el("label", { class: "col", style: "gap:4px;flex:1;min-width:160px" }, "Repo", repoSel),
+        el("label", { class: "col", style: "gap:4px;min-width:150px" }, "Work on branch", ontoSel), el("label", { class: "col", style: "gap:4px" }, "Kind", kind)),
       el("label", { class: "col", style: "gap:4px" }, "Title", title),
       el("label", { class: "col", style: "gap:4px" }, "Details", body),
       el("div", { class: "col", style: "gap:4px" }, el("span", {}, "About"), chips),
-      el("div", { class: "row", style: "gap:8px;flex-wrap:wrap;margin-top:6px" },
-        btn("Work on it now", "here", "", "Open a chat about it, with its own branch to change code in"), hermesBtn,
-        el("div", { class: "spacer" }), btn("Save for later", null), wikiBtn, orbBtn),
-      el("p", { class: "muted small", style: "margin:0" }, "Code work happens on the task's own branch; nothing reaches your focus branch until you approve it.")))
+      suggestLine, dests,
+      el("div", { class: "row", style: "gap:8px;align-items:center" }, (() => { const b = el("button", { class: "btn ghost small" }, "Just save it"); b.onclick = () => send(b, null); return b })(),
+        el("span", { class: "muted small" }, "Code work happens on the task's own branch; nothing reaches the branch you picked until you approve it."))))
   setTimeout(() => title.focus(), 0)
 }
 
@@ -2100,7 +2170,7 @@ function afterSend(res, to) {
     toast(res.where.workspace ? `Branch upkeep/${res.where.workspace} is ready for this task` : "Chat opened for this task", "ok")
     return route(`/repo/${t.repo_id}?session=${res.where.session}`)
   }
-  if (to === "hermes") { toast("Hermes is on it", "ok"); return route(`/work?task=${t.id}`) }
+  if (["hermes", "herdr", "studio"].includes(to)) { toast(`${DEST[to].label.replace(/^(Send to|Hand to) /, "")} is on it`, "ok"); return route(`/work?task=${t.id}`) }
   if (to === "wiki") return toast(`Parked in the LLM wiki: ${res.where.note}`, "ok")
   if (to === "orb") return toast(`Parked in Pondering Orb (${res.where.list})`, "ok")
   toast("Task saved", "ok")
@@ -2121,12 +2191,12 @@ function taskRow(t, onPick, selected) {
     el("div", { class: "row", style: "gap:6px;align-items:center;min-width:0" },
       badge(STATUS_CLS[t.status] || "", t.status), el("span", { class: "muted small" }, KIND_LABEL[t.kind] || t.kind),
       el("strong", { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0" }, t.title)),
-    el("div", { class: "muted small", style: "text-align:left" }, `${t.repo_name} · ${where ? WHERE_LABEL[where] : "not started"}${running ? " · Hermes is working…" : ""} · ${t.updated_at.slice(0, 16).replace("T", " ")}`))
+    el("div", { class: "muted small", style: "text-align:left" }, `${t.repo_name}${t.onto ? ` → ${t.onto}` : ""} · ${where ? WHERE_LABEL[where] : "not started"}${running ? " · working…" : ""} · ${t.updated_at.slice(0, 16).replace("T", " ")}`))
 }
 
 async function renderWork() {
   const params = new URLSearchParams(location.search)
-  const main = $("#main")
+  const main = $("#content")
   let filter = store_.get("workFilter", "active"), repoF = params.get("repo") || "", picked = params.get("task")
   const listBox = el("div", { class: "task-list", role: "list" }), detail = el("div", { class: "task-detail panel" })
   const repoSel = el("select", { "aria-label": "Repo" }, el("option", { value: "" }, "All repos"))
@@ -2151,21 +2221,24 @@ async function renderWork() {
   const newBtn = el("button", { class: "btn", onclick: () => taskDialog({ repo: repoF || undefined }) }, "+ New task")
   main.replaceChildren(
     el("div", { class: "row", style: "margin-bottom:12px;gap:10px;flex-wrap:wrap;align-items:center" }, el("h1", { class: "page", style: "margin:0" }, "Work"),
-      el("span", { class: "muted" }, "Fixes, bugs and changes for the agent: work on them here, hand them to Hermes, or park them."), el("div", { class: "spacer" }), repoSel, newBtn),
+      el("span", { class: "muted" }, "Fixes, bugs and changes for your coding agents: work on them here, send them to herdr or Studio, or park them."), el("div", { class: "spacer" }), repoSel, newBtn),
     el("div", { class: "work-grid" }, el("div", { class: "panel", style: "min-width:0" }, fbar, listBox), detail))
   await draw()
 }
 
 async function taskDetail(box, t, redraw) {
-  stopHermesPoll()
+  stopAgentPoll()
   const ints = await loadIntegrations()
   const act = (label, fn, cls = "ghost") => { const b = el("button", { class: `btn ${cls} small` }, label); b.onclick = () => busy(b, null, fn); return b }
   const send = (to, message) => async () => {
+    const st = to === "here" ? { ok: true } : ints[to] || {}
+    if (!st.ok) return toast(`${DEST[to].label}: ${st.error || "not set up"}. Set it up in Settings.`, "error")
     const res = await api(apiUrl(`/api/tasks/${t.id}/send`), { method: "POST", body: JSON.stringify({ to, message }) }).catch(e => ({ ok: false, error: e.message }))
     if (!res.ok) return toast(res.error, "error")
     refreshWorkCount()
-    if (to === "hermes") { await redraw(); return }
-    afterSend(res, to); if (to !== "here") await redraw()
+    if (to === "here") return afterSend(res, to)
+    if (!["hermes", "herdr", "studio"].includes(to)) afterSend(res, to)
+    await redraw()
   }
   const setStatus = (status) => async () => { await api(apiUrl(`/api/tasks/${t.id}`), { method: "POST", body: JSON.stringify({ status }) }); refreshWorkCount(); await redraw() }
   const where = t.where || {}
@@ -2174,68 +2247,386 @@ async function taskDetail(box, t, redraw) {
     chip.onclick = () => a.type === "commit" ? showCommit(t.repo_id, a.id) : a.type === "request" ? route("/requests") : a.url ? open(a.url, "_blank", "noopener") : null
     return chip
   }))
-  const h = ints.hermes || {}
-  const actions = el("div", { class: "row", style: "gap:6px;flex-wrap:wrap" },
-    where.type === "here" ? act("Open its chat", async () => route(`/repo/${t.repo_id}?session=${where.session}`), "") : act("Work on it now", send("here"), ""),
-    where.type === "hermes" ? null : act("Hand to Hermes", async () => h.ok ? send("hermes")() : toast(`Hermes: ${h.error || "not set up"}. Set it up in Settings → Hermes.`, "error")),
-    act("Park in LLM wiki", send("wiki")), act("Park in Pondering Orb", send("orb")),
+  // where it should go, when it hasn't gone anywhere yet: agree, or pick another
+  let suggestion = null
+  if (!where.type && t.status === "open") {
+    const sg = await api(apiUrl(`/api/tasks/${t.id}/suggest`)).catch(() => null)
+    if (sg) suggestion = el("div", { class: "suggest panel", style: "padding:10px" },
+      el("div", {}, el("span", {}, `${t.by === "agent" ? "An agent wrote this down. " : ""}Suggested: `), el("strong", {}, DEST[sg.to].label), el("span", { class: "muted" }, ` — ${sg.why}`)),
+      el("div", { class: "row", style: "gap:6px;margin-top:6px" }, act("Agree", send(sg.to), ""), el("span", { class: "muted small" }, "or pick another below")))
+  }
+  const destBtns = ["here", "herdr", "studio", "hermes", "wiki", "orb"].filter(k => !(where.type === k && k !== "here"))
+    .map(k => k === "here" && where.type === "here" ? act("Open its chat", async () => route(`/repo/${t.repo_id}?session=${where.session}`), "") : act(DEST[k].label, send(k)))
+  const actions = el("div", { class: "row", style: "gap:6px;flex-wrap:wrap" }, ...destBtns,
     el("div", { class: "spacer" }),
     t.status === "done" ? act("Reopen", setStatus("open")) : act("Mark done", setStatus("done")),
     t.status !== "dropped" && t.status !== "done" ? act("Drop", setStatus("dropped")) : null,
-    menu("More", [{ label: "Delete task", danger: true, run: async () => { if (!confirm("Delete this task? Anything it started (a branch, a Hermes session, a parked note) stays.")) return
+    menu("More", [{ label: "Delete task", danger: true, run: async () => { if (!confirm("Delete this task? Anything it started (a branch, an agent session, a parked note) stays.")) return
       await api(apiUrl(`/api/tasks/${t.id}`), { method: "DELETE", body: "{}" }); refreshWorkCount(); history.replaceState({}, "", `${BASE}/work`); renderWork() } }]))
   const whereLine = where.type ? el("div", { class: "small", style: "color:var(--info)" }, WHERE_LABEL[where.type],
-    where.workspace ? ` · branch upkeep/${where.workspace}` : "", where.type === "wiki" ? ` · ${where.note}` : "",
-    where.type === "orb" && where.url ? el("a", { href: where.url, target: "_blank", rel: "noopener", style: "margin-left:6px" }, "open in Orb") : null) : null
-  const bodyBox = el("div", { class: "md", style: "margin-top:4px" }); bodyBox.innerHTML = renderMarkdown(t.body || "_No details._")
+    where.type === "herdr" ? ` · agent ${where.agent} (${where.kind})` : "",
+    where.workspace ? ` · branch upkeep/${where.workspace}` : "", t.onto ? ` → ${t.onto}` : "", where.type === "wiki" ? ` · ${where.note}` : "",
+    (where.type === "orb" || where.type === "studio") && where.url ? el("a", { href: where.url, target: "_blank", rel: "noopener", style: "margin-left:6px" }, where.type === "studio" ? "open in Studio" : "open in Orb") : null) : null
+  const bodyBox = el("div", { class: "md task-body", style: "margin-top:4px" }); if (t.body) bodyBox.innerHTML = renderMarkdown(t.body); else { bodyBox.textContent = "No details."; bodyBox.classList.add("muted") }
   const log = el("details", {}, el("summary", { class: "muted small" }, `History (${t.log.length})`),
     el("ul", { class: "small muted", style: "margin:4px 0 0 18px;padding:0" }, ...t.log.slice().reverse().map(l => el("li", {}, `${l.at.slice(0, 16).replace("T", " ")} · ${l.text}`))))
   const parts = [el("div", { class: "row", style: "gap:8px;align-items:center;flex-wrap:wrap" }, badge(STATUS_CLS[t.status] || "", t.status), el("span", { class: "muted" }, `${KIND_LABEL[t.kind]} · ${t.repo_name}${t.by === "agent" ? " · written down by an agent" : ""}`)),
-    el("h2", { style: "margin:6px 0" }, t.title), whereLine, aboutChips, bodyBox, actions, log]
-  if (where.type === "hermes") parts.push(hermesPanel(t))
-  box.replaceChildren(el("div", { class: "col", style: "gap:10px;padding:14px" }, ...parts))
+    el("h2", { style: "margin:6px 0" }, t.title), whereLine, aboutChips, bodyBox, suggestion, actions]
+  const agentBox = ["hermes", "herdr", "studio"].includes(where.type) ? agentPanel(t) : null
+  const branchBox = where.workspace ? branchPanel(t, redraw) : null
+  box.replaceChildren(el("div", { class: "col", style: "gap:10px;padding:14px" }, ...parts,
+    agentBox || branchBox ? el("div", { class: "agent-grid" }, agentBox, branchBox) : null, log))
 }
 
-let hermesTimer = null
-const stopHermesPoll = () => { if (hermesTimer) clearTimeout(hermesTimer); hermesTimer = null }
-function hermesPanel(t) {
-  const wrap = el("div", { class: "hermes" })
-  const log = el("div", { class: "chat-box", role: "log", "aria-live": "polite", "aria-label": "Hermes conversation", style: "max-height:52vh" })
+let agentTimer = null
+const stopAgentPoll = () => { if (agentTimer) clearTimeout(agentTimer); agentTimer = null }
+const stopHermesPoll = stopAgentPoll
+// What the agent is doing: a Hermes/Studio conversation, or a herdr agent's screen; and a box to tell it more.
+function agentPanel(t) {
+  const w = t.where || {}
+  const name = { hermes: "Hermes", studio: "Hermes Studio", herdr: `herdr · ${w.kind || "agent"}` }[w.type]
+  const wrap = el("div", { class: "agent-box panel" })
+  const log = el("div", { class: "chat-box", role: "log", "aria-live": "polite", "aria-label": `${name} conversation`, style: "max-height:46vh" })
   const state = el("div", { class: "small muted" })
-  const msgIn = el("textarea", { rows: "2", placeholder: "Tell Hermes more… (Enter to send)", "aria-label": "Message to Hermes" })
+  const msgIn = el("textarea", { rows: "2", placeholder: `Tell ${name.split(" ·")[0]} more… (Enter to send)`, "aria-label": `Message to ${name}` })
   const sendBtn = el("button", { class: "btn" }, "Send")
-  let shown = -1
+  let shown = ""
   const poll = async () => {
-    if (!wrap.isConnected) return stopHermesPoll()
-    const r = await api(apiUrl(`/api/tasks/${t.id}/hermes`)).catch(e => ({ ok: false, error: e.message, messages: [] }))
+    if (!wrap.isConnected) return stopAgentPoll()
+    const r = await api(apiUrl(`/api/tasks/${t.id}/agent`)).catch(e => ({ ok: false, error: e.message, messages: [] }))
     const running = r.run?.running
-    state.textContent = !r.ok ? `Can't read the Hermes session: ${r.error}` : running ? "Hermes is working on it… (big jobs can take a while; you can leave this page)" : r.run?.error ? `Last message failed: ${r.run.error}` : `Hermes session ${r.session}`
+    state.textContent = !r.ok ? `Can't reach it: ${r.error}` : r.type === "herdr" ? `Agent ${r.agent}: ${r.status}${r.cwd ? ` in ${r.cwd}` : ""}`
+      : running ? "Working on it… (big jobs take a while; you can leave this page)" : r.run?.error ? `Last message failed: ${r.run.error}` : "Waiting for you"
     state.style.color = !r.ok || r.run?.error ? "var(--bad)" : running ? "var(--info)" : ""
-    sendBtn.disabled = !!running
-    if ((r.messages || []).length !== shown) {
-      shown = r.messages.length
-      log.replaceChildren(...r.messages.map(m => {
-        const d = el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.role === "tool" ? " tool" : ""}` })
-        if (m.role === "assistant") d.innerHTML = renderMarkdown(m.content); else d.textContent = m.role === "tool" ? `⚙ ${m.content}` : m.content
-        return d
-      }))
-      if (!shown) log.append(el("p", { class: "muted" }, running ? "Waiting for Hermes' first reply…" : "No messages yet."))
+    sendBtn.disabled = !!running && r.type !== "herdr"
+    const sig = JSON.stringify([r.messages?.length, r.output?.length, r.status])
+    if (sig !== shown) {
+      shown = sig
+      if (r.type === "herdr") log.replaceChildren(el("pre", { class: "term" }, r.output || "(no output yet)"))
+      else {
+        log.replaceChildren(...(r.messages || []).map(m => {
+          const d = el("div", { class: `msg ${m.role === "user" ? "user" : "bot"}${m.role === "tool" ? " tool" : ""}` })
+          if (m.role === "assistant") d.innerHTML = renderMarkdown(m.content); else d.textContent = m.role === "tool" ? `⚙ ${m.content}` : m.content
+          return d
+        }))
+        if (!(r.messages || []).length) log.append(el("p", { class: "muted" }, running ? "Waiting for the first reply…" : "No messages yet."))
+      }
       log.scrollTop = log.scrollHeight
     }
-    hermesTimer = setTimeout(poll, running ? 3000 : 15000)
+    agentTimer = setTimeout(poll, running ? 3000 : 12000)
   }
   sendBtn.onclick = () => {
     const text = msgIn.value.trim(); if (!text) return
     busy(sendBtn, "Sending…", async () => {
-      const res = await api(apiUrl(`/api/tasks/${t.id}/send`), { method: "POST", body: JSON.stringify({ to: "hermes", message: text }) }).catch(e => ({ ok: false, error: e.message }))
+      const res = await api(apiUrl(`/api/tasks/${t.id}/send`), { method: "POST", body: JSON.stringify({ to: w.type, message: text }) }).catch(e => ({ ok: false, error: e.message }))
       if (!res.ok) return toast(res.error, "error")
-      msgIn.value = ""; stopHermesPoll(); poll()
+      msgIn.value = ""; stopAgentPoll(); poll()
     })
   }
   msgIn.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendBtn.click() } })
-  wrap.append(el("h4", { style: "margin:8px 0 4px" }, "Hermes"), state, log, el("div", { class: "composer" }, msgIn, el("div", { class: "row" }, el("div", { class: "spacer" }), sendBtn)))
+  wrap.append(el("div", { class: "row", style: "gap:8px;align-items:center" }, el("h4", { style: "margin:0" }, name),
+      w.type === "studio" && w.url ? el("a", { href: w.url, target: "_blank", rel: "noopener", class: "small" }, "open in Studio ↗") : null), state, log,
+    el("div", { class: "composer" }, msgIn, el("div", { class: "row" }, el("div", { class: "spacer" }), sendBtn)))
   setTimeout(poll, 0)
   return wrap
+}
+
+// The task's branch, coding-agent style: its commits, the files it changed (click for the diff),
+// what's not committed yet, and a commit box with the message the agent proposed, for you to edit.
+function branchPanel(t, redraw) {
+  const wrap = el("div", { class: "branch-box panel" }, loading("Reading the task's branch…"))
+  const draw = async () => {
+    const c = await api(apiUrl(`/api/tasks/${t.id}/changes`)).catch(e => ({ ok: false, error: e.message }))
+    if (!c.ok) return wrap.replaceChildren(el("p", { class: "muted", style: "padding:10px" }, c.error))
+    const fileRow = (f) => {
+      const b = el("button", { class: "file-row", title: "Show the diff" },
+        el("span", { class: `fst ${f.committed ? "c" : "u"}` }, f.committed ? `+${f.added} −${f.removed}` : (f.status === "??" ? "new" : f.status)),
+        el("span", { class: "nm" }, f.path))
+      b.onclick = async () => {
+        const d = await api(apiUrl(`/api/tasks/${t.id}/diff?path=${encodeURIComponent(f.path)}`))
+        const pre = el("pre", { class: "code-pre", tabindex: "0" })
+        for (const line of (d.diff || "(no changes)").split("\n")) {
+          const cls = line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "del" : line.startsWith("@@") ? "hunk" : ""
+          pre.append(el("div", { class: `dl ${cls}` }, line || " "))
+        }
+        openDialog(f.path, pre)
+      }
+      return b
+    }
+    const uncommitted = c.files.filter(f => !f.committed), committed = c.files.filter(f => f.committed)
+    const msg = el("textarea", { rows: "4", "aria-label": "Commit message", placeholder: "Subject line\n\nWhy this change", style: "width:100%;font:13px var(--mono)" })
+    msg.value = c.proposed_message || ""
+    const commitBtn = el("button", { class: "btn small" }, "Commit")
+    commitBtn.onclick = () => busy(commitBtn, "Committing…", async () => {
+      const r = await api(apiUrl(`/api/tasks/${t.id}/commit`), { method: "POST", body: JSON.stringify({ message: msg.value }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!r.ok) return toast(r.error, "error")
+      toast(`Committed ${r.sha}`, "ok"); draw()
+    })
+    const submitBtn = el("button", { class: "btn small" }, "Ask for approval")
+    submitBtn.onclick = () => busy(submitBtn, "Raising…", async () => {
+      const r = await api(apiUrl(`/api/tasks/${t.id}/submit`), { method: "POST", body: "{}" }).catch(e => ({ ok: false, error: e.message }))
+      if (!r.ok) return toast(r.error, "error")
+      toast(`Request raised: it merges into ${c.onto} when you approve`, "ok"); refreshPendingCount()
+    })
+    wrap.replaceChildren(...[
+      el("div", { class: "row", style: "gap:8px;align-items:center;flex-wrap:wrap" }, el("h4", { style: "margin:0" }, "Branch"),
+        el("code", { class: "small" }, c.branch), el("span", { class: "muted small" }, `→ ${c.onto}`), el("div", { class: "spacer" }),
+        el("button", { class: "btn ghost small", onclick: () => draw() }, "Refresh")),
+      el("div", { class: "muted small" }, c.next_step),
+      el("h5", {}, `Commits (${c.commits.length})`),
+      c.commits.length ? el("div", { class: "col", style: "gap:2px" }, ...c.commits.map(x => el("div", { class: "commit-line" },
+        el("button", { class: "linkish", onclick: () => showCommit(t.repo_id, x.full) }, el("code", {}, x.sha)), el("span", {}, x.subject),
+        el("span", { class: "muted small" }, ` · ${x.author}`)))) : el("div", { class: "muted small" }, "No commits on the branch yet."),
+      el("h5", {}, `Changed files (${committed.length} committed, ${uncommitted.length} not yet)`),
+      el("div", { class: "col", style: "gap:2px" }, ...uncommitted.map(fileRow), ...committed.slice(0, 25).map(fileRow),
+        ...[committed.length > 25 ? (() => { const b = el("button", { class: "linkish small" }, `show ${committed.length - 25} more committed files`)
+          b.onclick = () => b.replaceWith(...committed.slice(25).map(fileRow)); return b })() : null].filter(Boolean)),
+      uncommitted.length ? el("div", { class: "col", style: "gap:6px;margin-top:8px" },
+        el("label", { class: "small" }, c.proposed_message ? "Commit message (proposed by the agent — edit it before committing)" : "Commit message"), msg,
+        el("div", { class: "row", style: "gap:6px" }, commitBtn)) : null,
+      c.ready ? el("div", { class: "row", style: "gap:6px;margin-top:8px" }, submitBtn, el("span", { class: "muted small" }, `Raises an approval request to merge it into ${c.onto}.`)) : null].filter(Boolean))
+  }
+  draw()
+  return wrap
+}
+
+// ------------------------------------------------------------------ References
+// A library of things to look things up in: repos cloned for reference (with a branch of your own if
+// you like) and any files (PDFs, zips, images, videos, notes), sorted into folders. Point a chat at a
+// folder or file ("Use in a chat"); agents read it through MCP or straight from its folder.
+const REF_ICON = { folder: "📁", repo: "📦", pdf: "📕", zip: "🗜", image: "🖼", video: "🎞", text: "📄", file: "📎" }
+const fmtSize = b => b == null ? "" : fmtBytes(b)
+async function renderReferences() {
+  const main = $("#content")
+  const params = new URLSearchParams(location.search)
+  let current = params.get("path") || "", selected = null, sortBy = store_.get("refSort", "name")
+  const tree = el("div", { class: "ref-tree", role: "tree", "aria-label": "Reference folders" })
+  const right = el("div", { class: "ref-main panel" })
+  const rootInfo = el("span", { class: "muted small" })
+  const go = (path, sel = null) => { current = path; selected = sel; history.replaceState({}, "", `${BASE}/references${path ? `?path=${encodeURIComponent(path)}` : ""}`); drawRight(); markTree() }
+  // left: folders and repos, expandable
+  const branch = async (path, box, depth) => {
+    const r = await api(apiUrl(`/api/refs?path=${encodeURIComponent(path)}`)).catch(e => ({ items: [], error: e.message }))
+    if (!path) rootInfo.textContent = r.root ? `on disk: ${r.root}` : ""
+    box.replaceChildren(...(r.items || []).filter(i => i.kind === "folder" || i.kind === "repo").map(i => {
+      const kids = el("div", { role: "group", hidden: "" })
+      const row = el("div", { class: "trow", role: "treeitem", tabindex: "0", "data-path": i.path, "aria-expanded": "false", style: `padding-left:${8 + depth * 14}px` },
+        el("span", { class: "tw", "aria-hidden": "true" }, "▸"), el("span", { "aria-hidden": "true" }, REF_ICON[i.kind]), el("span", { class: "nm" }, i.name),
+        i.job ? el("span", { class: `muted small` }, i.job.state === "failed" ? " · clone failed" : " · cloning…") : i.branch ? el("span", { class: "muted small" }, ` · ${i.branch}`) : null)
+      const toggle = async (open) => {
+        row.setAttribute("aria-expanded", String(open)); row.firstChild.textContent = open ? "▾" : "▸"; kids.hidden = !open
+        if (open && !kids.children.length && i.kind === "folder") await branch(i.path, kids, depth + 1)
+      }
+      row.firstChild.onclick = (e) => { e.stopPropagation(); toggle(row.getAttribute("aria-expanded") !== "true") }
+      row.onclick = () => { go(i.path); if (i.kind === "folder") toggle(true) }
+      row.onkeydown = (e) => { if (e.key === "Enter") row.click(); if (e.key === "ArrowRight") toggle(true); if (e.key === "ArrowLeft") toggle(false) }
+      // drop items (dragged from the list) onto a folder to move them there
+      if (i.kind === "folder") {
+        row.ondragover = (e) => { e.preventDefault(); row.classList.add("drop") }
+        row.ondragleave = () => row.classList.remove("drop")
+        row.ondrop = async (e) => { e.preventDefault(); row.classList.remove("drop"); await dropOn(i.path, e) }
+      }
+      return el("div", {}, row, kids)
+    }))
+  }
+  const rootRow = el("div", { class: "trow", role: "treeitem", tabindex: "0", "data-path": "", onclick: () => go("") }, el("span", { "aria-hidden": "true" }, "📚"), el("span", { class: "nm" }, "Library"))
+  rootRow.ondragover = (e) => { e.preventDefault(); rootRow.classList.add("drop") }
+  rootRow.ondragleave = () => rootRow.classList.remove("drop")
+  rootRow.ondrop = async (e) => { e.preventDefault(); rootRow.classList.remove("drop"); await dropOn("", e) }
+  const treeBody = el("div")
+  const markTree = () => tree.querySelectorAll(".trow").forEach(r => r.classList.toggle("sel", r.dataset.path === (selected ?? current)))
+  const refreshTree = async () => { await branch("", treeBody, 1); markTree() }
+  tree.append(rootRow, treeBody)
+  const dropOn = async (folder, e) => {
+    const moving = e.dataTransfer.getData("text/x-ref-path")
+    if (moving) {
+      const r = await api(apiUrl("/api/refs/move"), { method: "POST", body: JSON.stringify({ path: moving, to: folder }) }).catch(x => ({ ok: false, error: x.message }))
+      if (!r.ok) return toast(r.error, "error")
+      toast(`Moved to ${folder || "the library"}`, "ok"); await refreshTree(); return drawRight()
+    }
+    if (e.dataTransfer.files?.length) await upload(folder, e.dataTransfer.files)
+  }
+  const upload = async (folder, files) => {
+    const fd = new FormData(); fd.append("folder", folder)
+    for (const f of files) fd.append("file", f)
+    toast(`Uploading ${files.length} file${files.length > 1 ? "s" : ""}…`, "info")
+    const resp = await fetch(apiUrl("/api/refs/upload"), { method: "POST", body: fd, headers: { "X-Upstream-Upload": "1" } })
+    const r = await resp.json().catch(() => ({ ok: false, error: `HTTP ${resp.status}` }))
+    if (!r.ok) toast(r.error, "error"); else toast(`Added ${r.saved.length} file${r.saved.length > 1 ? "s" : ""}`, "ok")
+    await refreshTree(); drawRight()
+  }
+  // toolbar
+  const fileIn = el("input", { type: "file", multiple: "", hidden: "" })
+  fileIn.onchange = () => { if (fileIn.files.length) upload(current, fileIn.files); fileIn.value = "" }
+  const newFolder = el("button", { class: "btn ghost small" }, "+ Folder")
+  newFolder.onclick = async () => {
+    const name = prompt(`New folder in ${current || "the library"}:`); if (!name) return
+    const r = await api(apiUrl("/api/refs/folder"), { method: "POST", body: JSON.stringify({ parent: current, name }) }).catch(e => ({ ok: false, error: e.message }))
+    if (!r.ok) return toast(r.error, "error")
+    await refreshTree(); go(r.path)
+  }
+  const cloneBtn = el("button", { class: "btn small" }, "+ Clone a repo")
+  cloneBtn.onclick = () => {
+    const url = el("input", { placeholder: "https://github.com/owner/repo (or any git URL)", style: "width:100%", "aria-label": "Repo URL" })
+    const name = el("input", { placeholder: "folder name (optional)", style: "width:100%", "aria-label": "Folder name" })
+    const br = el("input", { placeholder: "branch (optional; default branch otherwise)", style: "width:100%", "aria-label": "Branch" })
+    const go2 = el("button", { class: "btn" }, "Clone")
+    let close
+    go2.onclick = () => busy(go2, "Starting…", async () => {
+      const r = await api(apiUrl("/api/refs/clone"), { method: "POST", body: JSON.stringify({ url: url.value, folder: current, name: name.value, branch: br.value }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!r.ok) return toast(r.error, "error")
+      close(); toast("Cloning in the background (history only; files download when opened)", "ok"); await refreshTree(); drawRight(); pollClones()
+    })
+    close = openDialog(`Clone a reference repo into ${current || "the library"}`, el("div", { class: "col", style: "gap:8px;min-width:min(520px,80vw)" }, url, name, br, el("div", {}, go2)))
+    setTimeout(() => url.focus(), 0)
+  }
+  let cloneTimer = null
+  const pollClones = () => { clearTimeout(cloneTimer); cloneTimer = setTimeout(async () => {
+    if (!right.isConnected) return
+    await refreshTree(); await drawRight()
+    if (right.querySelector("[data-cloning]") || tree.textContent.includes("cloning…")) pollClones()
+  }, 2000) }
+  const sortSel = el("select", { "aria-label": "Sort by" }, ...[["name", "Name"], ["added", "Newest"], ["kind", "Type"], ["size", "Size"]].map(([v, l]) => el("option", { value: v }, `Sort: ${l}`)))
+  sortSel.value = sortBy
+  sortSel.onchange = () => { sortBy = sortSel.value; store_.set("refSort", sortBy); drawRight() }
+  const searchIn = el("input", { type: "search", placeholder: "Search names and repo text…", "aria-label": "Search references", style: "min-width:200px" })
+  searchIn.onkeydown = async (e) => {
+    if (e.key !== "Enter" || !searchIn.value.trim()) return
+    const r = await api(apiUrl(`/api/refs/search?q=${encodeURIComponent(searchIn.value.trim())}`)).catch(x => ({ ok: false, error: x.message, items: [] }))
+    right.replaceChildren(el("div", { style: "padding:12px" }, el("h3", { style: "margin-top:0" }, `Found ${r.items.length} for “${searchIn.value.trim()}”`),
+      r.ok ? null : el("p", { class: "muted" }, r.error),
+      ...r.items.map(i => el("button", { class: "file-row", onclick: () => { const parent = i.path.split("/").slice(0, -1).join("/"); go(parent, i.path) } },
+        el("span", {}, REF_ICON[i.kind] || "📄"), el("span", { class: "nm" }, i.path), el("span", { class: "muted small" }, i.match === "name" ? "" : ` ${i.match}`)))))
+  }
+  // right: the folder's contents, or one item
+  const sorters = { name: (a, b) => a.name.localeCompare(b.name), added: (a, b) => (b.added || b.modified || "").localeCompare(a.added || a.modified || ""),
+    kind: (a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name), size: (a, b) => (b.size || 0) - (a.size || 0) }
+  const drawRight = async () => {
+    if (selected && selected !== current) return drawItem(selected)
+    const r = await api(apiUrl(`/api/refs?path=${encodeURIComponent(current)}`)).catch(e => ({ ok: false, error: e.message, items: [] }))
+    if (r.ok === false) return right.replaceChildren(el("p", { class: "muted", style: "padding:12px" }, r.error))
+    const items = [...r.items].sort((a, b) => ((a.kind === "folder") === (b.kind === "folder") ? 0 : a.kind === "folder" ? -1 : 1) || sorters[sortBy](a, b))
+    const crumbs = el("div", { class: "row", style: "gap:4px;flex-wrap:wrap;align-items:center" }, el("button", { class: "linkish", onclick: () => go("") }, "Library"),
+      ...current.split("/").filter(Boolean).flatMap((part, i, all) => [el("span", { class: "muted" }, "/"), el("button", { class: "linkish", onclick: () => go(all.slice(0, i + 1).join("/")) }, part)]))
+    const isRepo = r.in_repo === current && current
+    const rows = items.map(i => {
+      const row = el("div", { class: "ref-row", draggable: "true", tabindex: "0", ...(i.job?.state === "cloning" ? { "data-cloning": "1" } : {}) },
+        el("span", { "aria-hidden": "true" }, REF_ICON[i.kind] || "📎"),
+        el("span", { class: "nm" }, i.name),
+        el("span", { class: "muted small" }, i.job ? (i.job.state === "failed" ? `clone failed: ${i.job.error}` : "cloning…") : i.kind === "repo" ? `${i.branch} · ${i.url || i.source || ""}` : i.kind === "folder" ? "" : i.kind),
+        el("span", { class: "muted small", style: "text-align:right" }, fmtSize(i.size)),
+        el("span", { class: "muted small" }, (i.added || i.modified || "").slice(0, 10)))
+      row.ondragstart = (e) => e.dataTransfer.setData("text/x-ref-path", i.path)
+      row.onclick = () => i.job?.state === "failed" ? api(apiUrl("/api/refs/dismiss"), { method: "POST", body: JSON.stringify({ path: i.path }) }).then(() => drawRight())
+        : i.kind === "folder" ? go(i.path) : go(current, i.path)
+      row.onkeydown = (e) => { if (e.key === "Enter") row.click() }
+      return row
+    })
+    const drop = el("div", { class: "ref-drop", role: "list" }, ...rows,
+      rows.length ? null : el("p", { class: "muted", style: "padding:16px" }, isRepo ? "This repo's files are shown on its page." : "Empty. Drop files here, upload, or clone a repo into this folder."))
+    drop.ondragover = (e) => { if (e.dataTransfer.types.includes("Files")) { e.preventDefault(); drop.classList.add("drop") } }
+    drop.ondragleave = () => drop.classList.remove("drop")
+    drop.ondrop = async (e) => { e.preventDefault(); drop.classList.remove("drop"); if (e.dataTransfer.files?.length) await upload(current, e.dataTransfer.files) }
+    right.replaceChildren(el("div", { class: "col", style: "gap:8px;padding:12px" },
+      el("div", { class: "row", style: "gap:8px;align-items:center;flex-wrap:wrap" }, crumbs, el("div", { class: "spacer" }),
+        current ? el("button", { class: "btn ghost small", onclick: () => useInChat(current, current.split("/").pop()) }, "Use this folder in a chat") : null,
+        current ? itemMenu({ path: current, name: current.split("/").pop(), kind: "folder" }) : null),
+      el("div", { class: "ref-head muted small" }, el("span", {}), el("span", {}, "Name"), el("span", {}, ""), el("span", { style: "text-align:right" }, "Size"), el("span", {}, "Added")),
+      drop, el("div", { class: "muted small" }, "Drag files from your computer onto this list to upload them here; drag an item onto a folder on the left to move it.")))
+    if (rows.some(r => r.dataset.cloning)) pollClones()
+  }
+  const itemMenu = (i) => menu(`More for ${i.name}`, [
+    { label: "Copy its path on disk", run: async () => { const t = await api(apiUrl("/api/refs")); navigator.clipboard?.writeText(`${t.root}/${i.path}`); toast("Path copied", "ok") } },
+    { label: "Rename…", run: async () => { const n = prompt("New name:", i.name); if (!n || n === i.name) return
+      const r = await api(apiUrl("/api/refs/move"), { method: "POST", body: JSON.stringify({ path: i.path, to: i.path.split("/").slice(0, -1).join("/"), name: n }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!r.ok) return toast(r.error, "error"); await refreshTree(); go(r.path.split("/").slice(0, -1).join("/"), i.kind === "folder" ? null : r.path) } },
+    { label: "Delete", danger: true, run: async () => { if (!confirm(`Delete ${i.path} from the reference library? This removes it from disk.`)) return
+      const r = await api(apiUrl("/api/refs/delete"), { method: "POST", body: JSON.stringify({ path: i.path }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!r.ok) return toast(r.error, "error"); await refreshTree(); go(i.path.split("/").slice(0, -1).join("/")) } },
+  ])
+  const drawItem = async (path) => {
+    right.replaceChildren(loading())
+    const r = await api(apiUrl(`/api/refs/read?path=${encodeURIComponent(path)}`)).catch(e => ({ ok: false, error: e.message }))
+    if (r.ok === false) return right.replaceChildren(el("p", { class: "muted", style: "padding:12px" }, r.error))
+    const name = path.split("/").pop(), raw = apiUrl(`/api/refs/raw?path=${encodeURIComponent(path)}`)
+    let view
+    if (r.kind === "image") view = el("img", { src: raw, alt: name, style: "max-width:100%;max-height:70vh;border-radius:8px" })
+    else if (r.kind === "video") view = el("video", { src: raw, controls: "", style: "max-width:100%;max-height:70vh" })
+    else if (r.kind === "pdf") view = el("div", { class: "col", style: "gap:8px" }, el("iframe", { src: raw, title: name, style: "width:100%;height:60vh;border:0;background:#fff;border-radius:6px" }),
+      el("details", {}, el("summary", { class: "muted small" }, "The text a model reads from it"), el("pre", { class: "code-pre", style: "white-space:pre-wrap;max-height:40vh" }, r.text || "")))
+    else if (/\.md$/i.test(name)) { view = el("div", { class: "md" }); view.innerHTML = renderMarkdown(r.text || "") }
+    else view = el("pre", { class: "code-pre", style: "white-space:pre-wrap;max-height:65vh" }, r.text ?? "(a binary file)")
+    const note = el("textarea", { rows: "2", placeholder: "A note about this (why you kept it, what to look at)…", style: "width:100%", "aria-label": "Note" }); note.value = r.note || ""
+    note.onchange = () => api(apiUrl("/api/refs/note"), { method: "POST", body: JSON.stringify({ path, note: note.value }) }).then(() => toast("Note saved", "ok"))
+    const parts = [el("div", { class: "row", style: "gap:8px;align-items:center;flex-wrap:wrap" },
+        el("button", { class: "linkish", onclick: () => go(current) }, "← back"), el("strong", {}, `${REF_ICON[r.kind] || ""} ${name}`),
+        el("span", { class: "muted small" }, [r.kind, fmtSize(r.size), r.source ? `from ${r.source}` : "", r.added ? `added ${r.added.slice(0, 10)}` : ""].filter(Boolean).join(" · ")),
+        el("div", { class: "spacer" }),
+        el("button", { class: "btn small", onclick: () => useInChat(path, name) }, "Use in a chat"),
+        r.kind !== "folder" && r.kind !== "repo" ? el("a", { class: "btn ghost small", href: raw + "&download=1" }, "Download") : null, itemMenu({ path, name, kind: r.kind })),
+      note]
+    if (r.kind === "repo") parts.push(await repoBox(path))
+    parts.push(view)
+    right.replaceChildren(el("div", { class: "col", style: "gap:10px;padding:12px" }, ...parts))
+  }
+  // a reference repo: its branch, switch to another, make your own, update
+  const repoBox = async (path) => {
+    const info = (await api(apiUrl(`/api/refs?path=${encodeURIComponent(path.split("/").slice(0, -1).join("/"))}`))).items.find(i => i.path === path) || {}
+    const sel = el("select", { "aria-label": "Branch" }, ...(info.branches || []).map(b => el("option", { value: b }, b)))
+    sel.value = info.branch
+    const more = el("button", { class: "btn ghost small" }, "Remote branches…")
+    more.onclick = () => busy(more, "Listing…", async () => {
+      const r = await api(apiUrl(`/api/refs/branches?path=${encodeURIComponent(path)}`)).catch(e => ({ items: [], error: e.message }))
+      for (const b of r.items) if (![...sel.options].some(o => o.value === b)) sel.append(el("option", { value: b }, `${b} (remote)`))
+      toast(r.error || `${r.items.length} branches on the remote`, r.error ? "error" : "ok")
+    })
+    sel.onchange = async () => {
+      const r = await api(apiUrl("/api/refs/switch"), { method: "POST", body: JSON.stringify({ path, branch: sel.value }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!r.ok) { toast(r.error, "error"); sel.value = info.branch; return }
+      toast(`Now on ${r.branch}`, "ok"); drawItem(path); refreshTree()
+    }
+    const mk = el("button", { class: "btn ghost small" }, "+ My own branch")
+    mk.onclick = async () => { const n = prompt(`New branch of ${path.split("/").pop()} (from ${sel.value}):`); if (!n) return
+      const r = await api(apiUrl("/api/refs/branch"), { method: "POST", body: JSON.stringify({ path, name: n }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!r.ok) return toast(r.error, "error"); toast(`Made branch ${r.branch}`, "ok"); drawItem(path); refreshTree() }
+    const upd = el("button", { class: "btn ghost small" }, "Update")
+    upd.onclick = () => busy(upd, "Pulling…", async () => {
+      const r = await api(apiUrl("/api/refs/update"), { method: "POST", body: JSON.stringify({ path }) }).catch(e => ({ ok: false, error: e.message }))
+      toast(r.ok ? "Up to date" : r.error, r.ok ? "ok" : "error")
+    })
+    return el("div", { class: "row", style: "gap:8px;flex-wrap:wrap;align-items:center" }, el("span", { class: "muted small" }, "Branch"), sel, more, mk, upd,
+      el("span", { class: "muted small" }, info.url || ""))
+  }
+  main.replaceChildren(
+    el("div", { class: "row", style: "margin-bottom:12px;gap:10px;flex-wrap:wrap;align-items:center" }, el("h1", { class: "page", style: "margin:0" }, "References"),
+      el("span", { class: "muted" }, "Repos and files to look things up in. Any chat or agent can read them."), el("div", { class: "spacer" }),
+      searchIn, sortSel, newFolder, el("button", { class: "btn ghost small", onclick: () => fileIn.click() }, "Upload files"), cloneBtn, fileIn),
+    el("div", { class: "ref-grid" }, el("div", { class: "panel", style: "min-width:0;padding:6px 0" }, tree, el("div", { style: "padding:6px 10px" }, rootInfo)), right))
+  await refreshTree()
+  const sel0 = params.get("item"); if (sel0) selected = sel0
+  await drawRight()
+}
+
+// Attach a reference to a chat: a general one, or one about a repo.
+async function useInChat(path, label) {
+  const repos = await api(apiUrl("/api/repos")).catch(() => [])
+  const list = Array.isArray(repos) ? repos : repos.repos || []
+  const sel = el("select", { "aria-label": "Which chat" }, el("option", { value: GENERAL }, "A general chat"), ...list.map(r => el("option", { value: r.id }, `${r.name || r.id}'s chat`)))
+  const go = el("button", { class: "btn" }, "Attach and open the chat")
+  let close
+  go.onclick = () => {
+    const key = sel.value, tags = loadTags(key)
+    if (!tags.some(t => t.type === "ref" && t.id === path)) {
+      if (tags.length >= MAX_TAGS) return toast(`That chat already has ${MAX_TAGS} attachments; remove one first.`, "error")
+      tags.push({ type: "ref", id: path, label: `📚 ${label}` }); saveTags(key, tags)
+    }
+    close()
+    route(key === GENERAL ? `/chats?repo=${GENERAL}` : `/repo/${key}`)
+    toast(`${label} goes with your next message`, "ok")
+  }
+  close = openDialog(`Use “${label}” in a chat`, el("div", { class: "col", style: "gap:10px;min-width:min(420px,80vw)" },
+    el("p", { class: "muted", style: "margin:0" }, "The model reads it with your next messages: a PDF's text, a zip's file list, a folder's tree and READMEs; pictures go to models that can see (Settings → model)."),
+    sel, el("div", {}, go)))
 }
 
 // The Work tab on a repo page: that repo's tasks.
@@ -2259,6 +2650,17 @@ async function integrationsSetup() {
   const hProfile = el("input", { value: h.profile || "", placeholder: "(default profile)", style: "width:100%" })
   const hModel = el("input", { value: h.model || "", placeholder: "(Hermes' own default)", style: "width:100%" })
   const hKey = el("input", { type: "password", autocomplete: "off", placeholder: h.key_set ? "•••• set (type to replace)" : "API_SERVER_KEY from Hermes", style: "width:100%" })
+  const hd = ints.herdr || {}, st = ints.studio || {}
+  const hdOn = el("input", { type: "checkbox", style: "height:auto" }); hdOn.checked = !!hd.enabled
+  const hdSock = el("input", { value: (hd.socket || "").startsWith("/") && hd.enabled ? hd.socket : "", placeholder: hd.socket || "~/.config/herdr/herdr.sock", style: "width:100%" })
+  const hdKind = el("select", { "aria-label": "Agent to start" }, ...["claude", "codex", "hermes", "opencode", "copilot", "cursor", "pi", "droid", "kimi", "qwen", "grok"].map(k => el("option", { value: k }, k)))
+  hdKind.value = hd.kind || "claude"
+  const stOn = el("input", { type: "checkbox", style: "height:auto" }); stOn.checked = !!st.enabled
+  const stUrl = el("input", { value: st.url || "", placeholder: "http://127.0.0.1:8648", style: "width:100%" })
+  const stAgent = el("select", { "aria-label": "Studio agent" }, el("option", { value: "" }, "Hermes (Studio's own)"), ...["claude-code", "codex", "opencode", "pi", "grok"].map(k => el("option", { value: k }, k)))
+  stAgent.value = st.agent || ""
+  const stUser = el("input", { placeholder: "Studio username", autocomplete: "off", style: "width:100%" })
+  const stPass = el("input", { type: "password", placeholder: st.token_set ? "•••• signed in (sign in again to replace)" : "password", autocomplete: "off", style: "width:100%" })
   const oUrl = el("input", { value: o.url || "", placeholder: "http://192.168.20.5:8095", style: "width:100%" })
   const oList = el("input", { value: o.list || "Inbox", style: "width:100%" })
   const oKey = el("input", { type: "password", autocomplete: "off", placeholder: o.token_set ? "•••• set (type to replace)" : "an ORB_API_TOKENS token (if Orb uses them)", style: "width:100%" })
@@ -2269,7 +2671,11 @@ async function integrationsSetup() {
     if (hKey.value.trim()) keys.hermes_api_key = hKey.value.trim()
     if (oKey.value.trim()) keys.orb_token = oKey.value.trim()
     if (Object.keys(keys).length) await api(apiUrl("/api/credentials"), { method: "POST", body: JSON.stringify(keys) })
-    await api(apiUrl("/api/integrations/settings"), { method: "POST", body: JSON.stringify({ hermes: { enabled: hOn.checked, url: hUrl.value, profile: hProfile.value, model: hModel.value }, orb: { url: oUrl.value, list: oList.value } }) })
+    const r = await api(apiUrl("/api/integrations/settings"), { method: "POST", body: JSON.stringify({ hermes: { enabled: hOn.checked, url: hUrl.value, profile: hProfile.value, model: hModel.value },
+      herdr: { enabled: hdOn.checked, socket: hdSock.value, kind: hdKind.value }, studio: { enabled: stOn.checked, url: stUrl.value, agent: stAgent.value },
+      ...(stUser.value.trim() ? { studio_login: { username: stUser.value.trim(), password: stPass.value } } : {}),
+      orb: { url: oUrl.value, list: oList.value } }) }).catch(e => ({ ok: false, error: e.message }))
+    if (r.ok === false) return toast(r.error, "error")
     toast("Saved", "ok"); box.replaceWith(await integrationsSetup())
   })
   const mcpCmd = `hermes mcp add upstream --command upstream-mcp --env UPSTREAM_APP_URL=${location.origin}${BASE}`
@@ -2281,6 +2687,17 @@ async function integrationsSetup() {
       el("label", { class: "col", style: "gap:4px" }, "API key (kept with your accounts)", hKey), line(h, `Connected to ${h.url}${h.profile ? ` (profile ${h.profile})` : ""}.`),
       el("div", { class: "small muted" }, "So Hermes can see repos and hand changes back for approval, give it Upstream Manager's tools (run on the Hermes machine):"),
       el("pre", { class: "code-pre", style: "white-space:pre-wrap" }, mcpCmd)),
+    el("h4", { style: "margin-top:20px" }, "herdr"),
+    el("div", { class: "muted" }, "Start a coding agent (Claude Code, Codex, Hermes…) in herdr, on the task's branch. herdr is reached over its local socket, so it must run as you on this machine; it can hand work on to other machines itself (herdr --machine)."),
+    el("div", { class: "col", style: "margin-top:8px" }, el("label", { class: "row" }, hdOn, "Use herdr"),
+      el("div", { class: "row", style: "gap:8px" }, el("label", { class: "col", style: "gap:4px;flex:1" }, "Socket (empty for the default)", hdSock), el("label", { class: "col", style: "gap:4px" }, "Agent to start", hdKind)),
+      line(hd, `Connected to herdr ${hd.version || ""} at ${hd.socket}.`)),
+    el("h4", { style: "margin-top:20px" }, "Hermes Studio"),
+    el("div", { class: "muted" }, "Hand a task to a Studio run in the task's folder; follow it here or in Studio's own chat."),
+    el("div", { class: "col", style: "margin-top:8px" }, el("label", { class: "row" }, stOn, "Use Hermes Studio"),
+      el("div", { class: "row", style: "gap:8px" }, el("label", { class: "col", style: "gap:4px;flex:1" }, "Studio address", stUrl), el("label", { class: "col", style: "gap:4px" }, "Agent", stAgent)),
+      el("div", { class: "row", style: "gap:8px" }, el("label", { class: "col", style: "gap:4px;flex:1" }, "Sign in (kept as a token with your accounts)", stUser), el("label", { class: "col", style: "gap:4px;flex:1" }, "\u00a0", stPass)),
+      line(st, `Connected to Studio at ${st.url}${st.agent ? `, using ${st.agent}` : ""}.`)),
     el("h4", { style: "margin-top:20px" }, "Pondering Orb"),
     el("div", { class: "muted" }, "Park a task as a to-do in Orb (it syncs to your CalDAV lists)."),
     el("div", { class: "col", style: "margin-top:8px" }, el("label", { class: "col", style: "gap:4px" }, "Orb address", oUrl),
@@ -2397,7 +2814,9 @@ async function renderChats() {
   content.replaceChildren(loading())
   const params = new URLSearchParams(location.search)
   let [chats, repos] = await Promise.all([api(apiUrl("/api/chats")), api(apiUrl("/api/repos"))])
-  let pick = { repo: params.get("repo") || chats[0]?.repo_id || GENERAL, session: params.get("session") || chats[0]?.id || null }
+  const wantRepo = params.get("repo") || chats[0]?.repo_id || GENERAL
+  // a repo asked for without a chat: its newest chat (never another repo's)
+  let pick = { repo: wantRepo, session: params.get("session") || chats.find(c => c.repo_id === wantRepo)?.id || null }
   content.innerHTML = ""
   const filterSel = el("select", { "aria-label": "Show chats of" }, el("option", { value: "" }, "All chats"), el("option", { value: GENERAL }, "General (no repo)"),
     ...repos.map(r => el("option", { value: r.id }, r.name || r.id)))
@@ -2496,7 +2915,7 @@ function currentView() {
   if (BASE && path.startsWith(BASE)) path = path.slice(BASE.length)
   const parts = path.split('/').filter(Boolean)
   if (parts[0] === 'repo' && parts[1]) return ['repo', decodeURIComponent(parts[1])]
-  if (['requests', 'settings', 'chats', 'workflows', 'work'].includes(parts[0])) return [parts[0]]
+  if (['requests', 'settings', 'chats', 'workflows', 'work', 'references'].includes(parts[0])) return [parts[0]]
   if (!parts.length || parts[0] === 'repos') return ['repos']
   return ['notfound']
 }
@@ -2519,6 +2938,7 @@ async function router() {
     else if (view === "workflows") await renderWorkflows()
     else if (view === "requests") await renderRequests()
     else if (view === "work") await renderWork()
+    else if (view === "references") await renderReferences()
     else if (view === "settings") await renderSettings()
     else $("#content").replaceChildren(el("div", { class: "card", style: "max-width:520px;margin:40px auto;text-align:center" },
       el("h1", { class: "page" }, "Page not found"), el("p", { class: "muted" }, `There is no page at ${location.pathname}.`),

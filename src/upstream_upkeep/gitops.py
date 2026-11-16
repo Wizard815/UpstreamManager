@@ -21,14 +21,15 @@ _ENV_KEYS = {
 
 
 def _run(args: list[str], cwd: str | None = None, check: bool = False,
-         extra_env: dict[str, str] | None = None, timeout: float | None = None) -> subprocess.CompletedProcess:
+         extra_env: dict[str, str] | None = None, timeout: float | None = None,
+         input: str | None = None) -> subprocess.CompletedProcess:
     env = {k: v for k, v in __import__("os").environ.items() if k.upper() in _ENV_KEYS}
     env["GIT_TERMINAL_PROMPT"] = "0"  # never hang waiting for a password
     env.update(extra_env or {})  # e.g. a one-off auth header for a push (see github.py)
     try:
         return subprocess.run(
             args, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            env=env, check=check, timeout=timeout,
+            env=env, check=check, timeout=timeout, input=input,
         )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 124, "", f"timed out after {timeout:.0f}s")

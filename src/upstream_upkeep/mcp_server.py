@@ -566,6 +566,30 @@ def update_task(
     return _call("POST", f"/api/tasks/{quote(task, safe='')}", {"status": status or None, "note": note or None})["task"]
 
 
+# ------------------------------------------------------------------ references
+RefPath = Annotated[str, Field(description='A path in the reference library from list_references ("" for the top); '
+                                           '"file.zip!inner/file.txt" reads a file inside a zip.')]
+
+
+@server.tool(annotations=READ)
+def list_references(path: RefPath = "") -> dict:
+    """The user's reference library: repos cloned for reference and uploaded files (PDFs, zips, images...) in folders.
+    Returns the folder's items and the library's folder on disk (you may also read it directly)."""
+    return _call("GET", "/api/refs", path=path)
+
+
+@server.tool(annotations=READ)
+def read_reference(path: RefPath) -> dict:
+    """Read a reference: a file's text, a PDF's text, a zip's file list, or a folder's tree and READMEs."""
+    return _call("GET", "/api/refs/read", path=path)
+
+
+@server.tool(annotations=READ)
+def search_references(query: _text("Words to find in file names and in the text of cloned reference repos.", 200)) -> list[dict]:
+    """Search the reference library by file name and content."""
+    return _call("GET", "/api/refs/search", q=query)["items"]
+
+
 def main() -> None:
     server.run("stdio")
 

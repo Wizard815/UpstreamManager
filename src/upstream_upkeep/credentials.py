@@ -27,8 +27,9 @@ FIELDS = {
     "wiki_api_key": "UPSTREAM_WIKI_API_KEY",  # the vault's Obsidian Local REST API key
     "orb_token": "UPSTREAM_ORB_TOKEN",        # a Pondering Orb API token (ORB_API_TOKENS on the Orb side)
     "hermes_api_key": "UPSTREAM_HERMES_API_KEY",  # the Hermes API server's key
+    "studio_token": "UPSTREAM_STUDIO_TOKEN",      # a Hermes Studio sign-in token (JWT)
 }
-SECRET_FIELDS = {"github_token", "dockerhub_token", "wiki_api_key", "orb_token", "hermes_api_key"}  # usernames are not secret
+SECRET_FIELDS = {"github_token", "dockerhub_token", "wiki_api_key", "orb_token", "hermes_api_key", "studio_token"}  # usernames are not secret
 
 
 def _file() -> Path:

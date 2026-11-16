@@ -104,6 +104,7 @@ SYSTEM_PROMPT += "\n\n" + edits.EDIT_INSTRUCTIONS
 
 ATTACH_CHARS = 8000
 MAX_ATTACHMENTS = 6  # keep in step with MAX_TAGS in static/app.js
+REF_CHARS = 20000     # a reference (folder overview, PDF text...) may say more than a file
 
 
 def repo_facts(repo: dict) -> str:
@@ -213,6 +214,14 @@ def attachments_block(repo: dict, attachments: list[dict]) -> str:
     parts = []
     home = repo
     for a in attachments[:MAX_ATTACHMENTS]:
+        if a.get("type") == "ref":  # an item of the reference library (a folder, repo, PDF, zip, image...)
+            from . import references
+            try:
+                text, _images = references.for_model(a["id"], REF_CHARS)
+                parts.append(text)
+            except Exception as e:
+                parts.append(f"[Reference {a.get('id')} could not be read: {e}]")
+            continue
         repo = store.get_repo(a["repo"]) if a.get("repo") else home
         if not repo or not repo.get("path"):
             continue
@@ -368,11 +377,32 @@ def session_tags_block(repo: dict, session: dict) -> str:
     return "This chat is about:\n\n" + "\n\n".join(p for p in parts if p)
 
 
+def task_repo(repo: dict, session: dict) -> dict:
+    """In a chat that works on a task, the repo is the task's branch folder (edits land there)."""
+    from . import tasks, workspaces
+    t = tasks.get(session.get("task")) if session.get("task") else None
+    ws = t and ((t.get("where") or {}).get("workspace") or t.get("workspace"))
+    if not ws or not repo.get("path"):
+        return repo
+    try:
+        st = workspaces.status(repo, ws)
+    except workspaces.WorkspaceError:
+        return repo
+    return {**repo, "path": st["path"], "task": {"title": t["title"], "branch": st["branch"], "onto": st["focus_branch"],
+                                                  "commits": st["commits_beyond_focus"], "uncommitted": st["uncommitted"][:20]}}
+
+
 def build_messages(repo: dict, session: dict, message: str, attachments: list[dict] | None = None) -> list[dict]:
     if repo["id"] == store.GENERAL:
         system = GENERAL_PROMPT + "\n\n" + general_facts()
     else:
         system = SYSTEM_PROMPT + "\n\n" + repo_facts(repo)
+    if repo.get("task"):
+        tk = repo["task"]
+        system += (f"\n\nThis chat works on the task \"{tk['title']}\" on its own branch {tk['branch']}"
+                   f" (it goes into {tk['onto']} when the user approves). Your edits apply there, not to {tk['onto']}."
+                   f" Commits on it so far: {tk['commits']}. Uncommitted files: {', '.join(tk['uncommitted']) or 'none'}."
+                   " When a change is done, propose a commit message (subject line, blank line, why) for the user to edit.")
     about = session_tags_block(repo, session)
     if about:
         system += "\n\n" + about
@@ -397,7 +427,24 @@ def build_messages(repo: dict, session: dict, message: str, attachments: list[di
     if prefs:
         head.append(prefs)
     user = "\n\n".join(head) + f"\n\n---\n\n{message}" if head else message
+    images = _images(attachments or [])
+    if images:  # a model that can see gets the pictures themselves (OpenAI-style content parts)
+        user = [{"type": "text", "text": user}] + [{"type": "image_url", "image_url": {"url": i["url"]}} for i in images]
     return [{"role": "system", "content": system}, *_history(session), {"role": "user", "content": user}]
+
+
+def _images(attachments: list[dict]) -> list[dict]:
+    if not store.load_llm_config().get("vision"):
+        return []
+    from . import references
+    out = []
+    for a in attachments[:MAX_ATTACHMENTS]:
+        if a.get("type") == "ref":
+            try:
+                out += references.for_model(a["id"])[1]
+            except Exception:
+                pass
+    return out[:4]
 
 
 def chat(repo_id: str, message: str, session_id: str | None = None, attachments: list[dict] | None = None) -> dict:
@@ -407,6 +454,7 @@ def chat(repo_id: str, message: str, session_id: str | None = None, attachments:
         return {"ok": False, "error": "repo not found"}
     session = store.get_session(repo_id, session_id)
     cfg = config()
+    repo = task_repo(repo, session)
     messages = build_messages(repo, session, message, attachments)
     sent = store.add_chat_message(repo_id, session["id"], "user", message, attachments=attachments or None)
     memory.record_message(repo_id, session["id"], "user", message, sent["timestamp"])
