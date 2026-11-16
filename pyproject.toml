@@ -12,6 +12,7 @@ dependencies = [
     "keyring>=25.7.0",
     "mcp>=2.3,<3",
     "pynacl>=1.6.2",
+    "pypdf>=7.1.0",
     "pyyaml>=6.0.3",
     "requests>=2.31",
     "waitress>=3.0.2",
