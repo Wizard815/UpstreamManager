@@ -525,6 +525,47 @@ def stack_exec(
                                                   "timeout": timeout})
 
 
+# ------------------------------------------------------------------ tasks
+TaskId = Annotated[str, Field(min_length=4, description="Task id from list_tasks or create_task.")]
+
+
+@server.tool(annotations=READ)
+def list_tasks(
+    repo: Annotated[str, Field(description="Only this repo (id from list_repos); empty for every repo.")] = "",
+    status: Annotated[Literal["", "open", "working", "parked", "done", "dropped"], Field(
+        description="Only tasks with this status; empty for all.")] = "",
+) -> list[dict]:
+    """Tasks the user (or an agent) wrote down: fixes, bugs, changes, ideas, and where each lives now."""
+    return _call("GET", "/api/tasks", repo=repo, status=status)["items"]
+
+
+@server.tool(annotations=WRITE)
+def create_task(
+    repo: ChatRepo,
+    title: _text("Short title, e.g. 'Fix the off-by-one in fetch paging'.", 200),
+    body: Annotated[str, Field(max_length=20000, description="What and why, steps to reproduce, ideas.")] = "",
+    kind: Annotated[Literal["fix", "bug", "feature", "chore", "merge", "idea"], Field(description="What sort of work.")] = "fix",
+    commits: Annotated[list[str], Field(max_length=12, description="Commit ids this is about (fix this commit, etc.).")] = [],
+    park: Annotated[Literal["", "wiki", "orb"], Field(
+        description='"wiki" parks it in the LLM wiki inbox, "orb" in Pondering Orb; empty keeps it in Upstream Manager.')] = "",
+) -> dict:
+    """Write down a piece of work for later or for the user: it shows on the Work page, linked to its commits.
+    Use it when you find a bug or a follow-up that is outside what you were asked to do."""
+    about = [{"type": "commit", "id": c, "label": c[:12]} for c in commits]
+    return _call("POST", "/api/tasks", {"repo": repo, "title": title, "body": body, "kind": kind, "about": about,
+                                         **({"to": park} if park else {})})
+
+
+@server.tool(annotations=WRITE)
+def update_task(
+    task: TaskId,
+    status: Annotated[Literal["", "open", "working", "parked", "done", "dropped"], Field(description="New status; empty to keep it.")] = "",
+    note: Annotated[str, Field(max_length=2000, description="A line for the task's log: progress, what you found, what is left.")] = "",
+) -> dict:
+    """Report progress on a task, or mark it done when the change is submitted."""
+    return _call("POST", f"/api/tasks/{quote(task, safe='')}", {"status": status or None, "note": note or None})["task"]
+
+
 def main() -> None:
     server.run("stdio")
 

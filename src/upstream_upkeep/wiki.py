@@ -330,3 +330,30 @@ def about_text(repo: dict) -> str:
         out.append(f"[[{n['note']}]]" + (" (draft)" if n["status"] == "draft" else "") + ":")
         out += [f"  {l}" for l in n["lines"]]
     return "\n".join(out)
+
+
+# ------------------------------------------------------------------ parking a task
+def park(title: str, content: str) -> dict:
+    """Park something for later in the vault's inbox (its short-term tier; Capture files it later).
+
+    Uses the vault's memory_capture tool when the MCP writer is set (LLMWIKI_MCP_URL), else writes
+    inbox/YYYY-MM-DD HH:MM - <title>.md the same way through the reader's folder or REST access.
+    Never anything under wiki/, and never a secret."""
+    from datetime import datetime
+    title, content = redact(title).strip()[:120] or "Task", redact(content)
+    if enabled():
+        res = call_tool("memory_capture", {"title": title, "content": content})
+        return {"via": "mcp", "note": res.strip()[:300]}
+    s = settings()
+    if not s["enabled"]:
+        raise WikiError("the LLM wiki isn't set up: set LLMWIKI_MCP_URL, or a vault folder / REST API in Settings")
+    v = vault()
+    safe = re.sub(r"\s+", " ", re.sub(r'[\\/:*?"<>|#^\[\]]+', " ", title)).strip()[:80] or "Task"
+    stamp = datetime.now().strftime("%Y-%m-%d %H%M")
+    rel = f"inbox/{stamp} - {safe}.md"
+    n = 2
+    while v.read(rel) is not None:
+        rel = f"inbox/{stamp} - {safe} ({n}).md"
+        n += 1
+    v.write(rel, content)
+    return {"via": s["mode"], "note": rel}

@@ -35,8 +35,8 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, render_template_string, abort
 
-from . import (actions, agent_context, components, config, credentials, daily_check, edits, github, gitops, memory,
-               pull_report, registry, stacks, storage, store, upstream_check, wiki, workflows, workspaces)
+from . import (actions, agent_context, components, config, credentials, daily_check, edits, github, gitops, hermes,
+               memory, orb, pull_report, registry, stacks, storage, store, tasks, upstream_check, wiki, workflows, workspaces)
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -1442,7 +1442,8 @@ def api_chat_history(repo_id):
             m["edits"] = [{k: v for k, v in edits.preview(repo["path"], e).items() if k != "_new"}
                           for e in edits.parse(m["content"])]
     return jsonify({"session": session["id"], "title": session.get("title"), "messages": session["messages"],
-                    "tags": session.get("tags", []), "repo_id": repo_id, "repo_name": repo.get("name")})
+                    "tags": session.get("tags", []), "task": session.get("task"),
+                    "repo_id": repo_id, "repo_name": repo.get("name")})
 
 
 @flask_app.route("/api/repo/<repo_id>/sessions")
@@ -1577,6 +1578,146 @@ def api_memory_daylog(repo_id):
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "day must be YYYY-MM-DD"}), 400
     return jsonify(memory.write_day_log(repo_id, day))
+
+
+# ---------------------------------------------------------------- tasks
+def _task_out(t: dict) -> dict:
+    out = dict(t)
+    sid = (t.get("where") or {}).get("hermes")
+    if sid:
+        out["hermes_run"] = hermes.run_state(sid)
+    repo = store.get_repo(t["repo_id"])
+    out["repo_name"] = (repo or {}).get("name") or t["repo_id"]
+    return out
+
+
+@flask_app.route("/api/tasks")
+def api_tasks():
+    """Tasks, newest first: ?repo= and ?status= narrow them."""
+    items = tasks.list_tasks(request.args.get("repo") or None, request.args.get("status") or None)
+    return jsonify({"ok": True, "items": [_task_out(t) for t in items]})
+
+
+@flask_app.route("/api/tasks", methods=["POST"])
+def api_task_create():
+    """New task: {repo, title, body?, kind?, about?: [{type, id, label}], upstream? (merge tasks), to?: here|hermes|wiki|orb}."""
+    data = request.get_json(silent=True) or {}
+    try:
+        t = tasks.create(data.get("repo") or store.GENERAL, data.get("title"), data.get("body"),
+                         data.get("kind") or "fix", data.get("about"), by="agent" if _from_agent() else "user",
+                         upstream=data.get("upstream"))
+    except tasks.TaskError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    out = {"ok": True, "task": t}
+    if data.get("to"):
+        out.update(_send_task(t["id"], data["to"], data.get("message")))
+        out["task"] = tasks.get(t["id"])
+    return jsonify(_task_json(out))
+
+
+def _task_json(out: dict) -> dict:
+    if out.get("task"):
+        out["task"] = _task_out(out["task"])
+    return out
+
+
+def _send_task(task_id: str, to: str, message=None) -> dict:
+    if to == "hermes" and (denied := _user_only("Handing work to Hermes")):
+        return {"ok": False, "error": denied[0].get_json()["error"]}
+    try:
+        return {"ok": True, **tasks.send_to(task_id, to, message if isinstance(message, str) else None)}
+    except (tasks.TaskError, workspaces.WorkspaceError) as e:
+        return {"ok": False, "error": str(e)}
+    except (hermes.HermesError, orb.OrbError, wiki.WikiError) as e:
+        tasks.update(task_id, note=f"couldn't send to {to}: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+@flask_app.route("/api/tasks/<task_id>")
+def api_task(task_id):
+    t = tasks.get(task_id) or abort(404)
+    return jsonify({"ok": True, "task": _task_out(t)})
+
+
+@flask_app.route("/api/tasks/<task_id>", methods=["POST"])
+def api_task_update(task_id):
+    """Change {title, body, kind, about, status, note}."""
+    data = request.get_json(silent=True) or {}
+    try:
+        t = tasks.update(task_id, **{k: data.get(k) for k in ("title", "body", "kind", "about", "status", "note")})
+    except KeyError:
+        abort(404)
+    except tasks.TaskError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    return jsonify({"ok": True, "task": _task_out(t)})
+
+
+@flask_app.route("/api/tasks/<task_id>", methods=["DELETE"])
+def api_task_delete(task_id):
+    if (denied := _user_only("Deleting tasks")):
+        return denied
+    if not tasks.delete(task_id):
+        abort(404)
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/tasks/<task_id>/send", methods=["POST"])
+def api_task_send(task_id):
+    """Send it to {to: here|hermes|wiki|orb, message?}."""
+    if not tasks.get(task_id):
+        abort(404)
+    data = request.get_json(silent=True) or {}
+    out = _send_task(task_id, data.get("to"), data.get("message"))
+    out["task"] = tasks.get(task_id)
+    return jsonify(_task_json(out)), (200 if out["ok"] else 400)
+
+
+@flask_app.route("/api/tasks/<task_id>/hermes")
+def api_task_hermes(task_id):
+    """The task's Hermes conversation, and whether Hermes is working on it right now."""
+    t = tasks.get(task_id) or abort(404)
+    sid = (t.get("where") or {}).get("hermes")
+    if not sid:
+        return jsonify({"ok": False, "error": "not handed to Hermes", "messages": []})
+    try:
+        msgs = hermes.messages(sid)
+    except hermes.HermesError as e:
+        return jsonify({"ok": False, "error": str(e), "messages": [], "run": hermes.run_state(sid)})
+    return jsonify({"ok": True, "session": sid, "messages": msgs, "run": hermes.run_state(sid)})
+
+
+@flask_app.route("/api/integrations")
+def api_integrations():
+    """Where tasks can go: Hermes, Pondering Orb, the LLM wiki."""
+    w = wiki.status()
+    return jsonify({"ok": True, "hermes": hermes.status(), "orb": orb.status(),
+                    "wiki": {"ok": bool(w.get("writer")) or bool(w.get("ok")), "writer": w.get("writer"), "reader": w.get("ok"),
+                             "error": w.get("error")}})
+
+
+@flask_app.route("/api/integrations/settings", methods=["POST"])
+def api_integrations_settings():
+    """{hermes: {enabled, url, profile, model}, orb: {url, list}}; keys go through /api/credentials."""
+    if (denied := _user_only("Changing connections")):
+        return denied
+    data = request.get_json(silent=True) or {}
+    patch = {}
+    if isinstance(data.get("hermes"), dict):
+        h = data["hermes"]
+        url = str(h.get("url") or "").strip()
+        if url and not re.match(r"^https?://", url):
+            return jsonify({"ok": False, "error": "the Hermes address must start with http:// or https://"}), 400
+        patch["hermes"] = {"enabled": bool(h.get("enabled")), "url": url or "http://127.0.0.1:8642",
+                           "profile": re.sub(r"[^A-Za-z0-9_.-]", "", str(h.get("profile") or "")),
+                           "model": str(h.get("model") or "").strip()[:100]}
+    if isinstance(data.get("orb"), dict):
+        o = data["orb"]
+        url = str(o.get("url") or "").strip()
+        if url and not re.match(r"^https?://", url):
+            return jsonify({"ok": False, "error": "the Orb address must start with http:// or https://"}), 400
+        patch["orb"] = {"url": url.rstrip("/"), "list": str(o.get("list") or "Inbox").strip()[:80] or "Inbox"}
+    save_settings(patch)
+    return api_integrations()
 
 
 @flask_app.route("/api/storage")
@@ -1953,6 +2094,12 @@ TEMPLATE = r"""<!DOCTYPE html>
     .btn { height: 40px; } .btn.small { height: 34px; } .tab { height: 38px; }
     .path { max-width: 100%; }
   }
+.work-grid{display:grid;grid-template-columns:minmax(280px,380px) 1fr;gap:14px;align-items:start}
+@media (max-width:900px){.work-grid{grid-template-columns:1fr}}
+.task-list{display:flex;flex-direction:column;max-height:calc(100vh - 220px);overflow:auto}
+.task-row{display:flex;flex-direction:column;gap:3px;align-items:stretch;text-align:left;background:none;border:0;border-bottom:1px solid var(--line);padding:9px 12px;color:inherit;cursor:pointer;font:inherit;width:100%}
+.task-row:hover{background:var(--raise)}.task-row.sel{background:var(--raise);box-shadow:inset 3px 0 0 var(--accent, #4c7dff)}
+.task-detail{min-width:0}.btn.dim{opacity:.6}.msg.tool{font-size:12px;opacity:.75;font-family:ui-monospace,monospace}
 .tbl{border-collapse:collapse}.tbl th,.tbl td{padding:4px 8px;border-bottom:1px solid var(--line, rgba(127,127,127,.2))}.tbl th{position:sticky;top:0;background:var(--panel, var(--bg));font-weight:600}
 </style>
 <link rel="stylesheet" href="{{ base_url }}/static/vendor/codemirror/codemirror.css">
@@ -1965,6 +2112,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   </a>
   <nav class="main" aria-label="Main">
     <a href="{{ base_url }}/repos" data-view="repos">Repos</a>
+    <a href="{{ base_url }}/work" data-view="work">Work <span class="count" id="work-count"></span></a>
     <a href="{{ base_url }}/chats" data-view="chats">Chats</a>
     <a href="{{ base_url }}/workflows" data-view="workflows">Workflows</a>
     <a href="{{ base_url }}/requests" data-view="requests">Requests <span class="count" id="pending-count"></span></a>

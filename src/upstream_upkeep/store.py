@@ -265,13 +265,22 @@ def new_session(repo_id: str) -> dict:
     repo = chat_owner(repo_id)
     sessions = _sessions(repo)
     # abandoned empty chats are clutter: drop them when starting another
-    sessions[:] = [s for s in sessions if s.get("messages") or s.get("tags")]
+    sessions[:] = [s for s in sessions if s.get("messages") or s.get("tags") or s.get("task")]
     sid = f"s-{uuid.uuid4().hex[:8]}"
     session = {"id": sid, "title": None, "created_at": config.now_iso(), "messages": []}
     sessions.append(session)
     repo["active_session"] = sid
     save_state()
     return session
+
+
+@_locked
+def mark_task_session(repo_id: str, session_id: str, title: str, task_id: str) -> None:
+    """A chat that works on a task: titled after it and kept even while empty."""
+    session = get_session(repo_id, session_id)
+    session["title"] = title[:120]
+    session["task"] = task_id
+    save_state()
 
 
 @_locked
