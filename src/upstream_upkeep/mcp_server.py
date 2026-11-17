@@ -682,6 +682,23 @@ def edited_references() -> list[dict]:
     return _call("GET", "/api/refs/edited")["items"]
 
 
+@server.tool(annotations=READ)
+def list_integrations() -> dict:
+    """What the user's setup is integrated with and whether each part works right now: the built-in connections
+    (herdr, Hermes Studio, the Hermes gateway, Pondering Orb, the LLM wiki), the services they added (other
+    containers), and every repo marked integrated, partly integrated, to integrate, or not needed. Use it to know
+    what to build against and what is still to do."""
+    return _call("GET", "/api/services")
+
+
+@server.tool(annotations=WRITE)
+def mark_integration(repo: Repo,
+                     state: Annotated[str, Field(description='"integrated", "partial", "planned" (to integrate) or "none" (not needed).')],
+                     note: _text("What works, what is missing, or how it connects.", 1000) = "") -> dict:
+    """Record how far a repo is integrated, e.g. after finishing or checking an integration."""
+    return _call("POST", _r(repo) + "/integration", {"state": state, "note": note})
+
+
 def main() -> None:
     server.run("stdio")
 

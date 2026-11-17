@@ -347,7 +347,12 @@ def general_facts() -> str:
                         + (f", conflicts in {', '.join(c.conflict_files[:5])}" if c.conflict else ""))
         lines.append(f"- {r.get('name') or r['id']} (id {r['id']}, {r.get('path')}), focus {focus}: "
                      + ("; ".join(bits) or "no upstreams"))
-    return "Watched repositories:\n" + ("\n".join(lines) or "- none yet")
+    from . import services
+    try:
+        ints = "\n\n" + services.for_agents(live=False)
+    except Exception:
+        ints = ""
+    return "Watched repositories:\n" + ("\n".join(lines) or "- none yet") + ints
 
 
 def session_tags_block(repo: dict, session: dict) -> str:
