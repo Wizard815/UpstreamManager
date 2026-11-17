@@ -5,6 +5,7 @@
 #   scripts/install.sh --port 5000     # another port
 #   scripts/install.sh --system        # a system-wide service (asks for sudo) instead of a user one
 #   scripts/install.sh --no-service    # only set up; run it yourself with: uv run upstream-manager
+#   scripts/install.sh --home /data/ManagerFiles   # where Repos/ and References/ live (default ~/ManagerFiles)
 #
 # What it does, in order: checks git and uv (installs uv for this user if missing, unless
 # --no-uv-install), installs the app's dependencies, writes .env from .env.example if there is none
@@ -13,16 +14,18 @@
 # Safe to run again: an existing .env is never changed, and the service is simply restarted.
 set -euo pipefail
 
-PORT=5001; MODE=user; SERVICE=1; START=1; UV_INSTALL=1
+PORT=5001; MODE=user; SERVICE=1; START=1; UV_INSTALL=1; HOME_DIR="$HOME/ManagerFiles"
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="${2:?--port needs a number}"; shift 2 ;;
     --port=*) PORT="${1#*=}"; shift ;;
     --system) MODE=system; shift ;;
+    --home) HOME_DIR="${2:?--home needs a folder}"; shift 2 ;;
+    --home=*) HOME_DIR="${1#*=}"; shift ;;
     --no-service) SERVICE=0; shift ;;
     --no-start) START=0; shift ;;
     --no-uv-install) UV_INSTALL=0; shift ;;
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -80,6 +83,9 @@ open(".env", "w", encoding="utf-8").write("\n".join(lines))
 PYSET
   }
   setenv PORT "$PORT"
+  setenv UPSTREAM_HOME "$HOME_DIR"
+  mkdir -p "$HOME_DIR/Repos" "$HOME_DIR/References"
+  note "your files: $HOME_DIR/Repos (repos) and $HOME_DIR/References (the reference library)"
   setenv UPSTREAM_APP_URL "http://127.0.0.1:$PORT"
   if [ -S "${HERDR_SOCKET_PATH:-$HOME/.config/herdr/herdr.sock}" ]; then
     note "herdr: running here, it will be used automatically"

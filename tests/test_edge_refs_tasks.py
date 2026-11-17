@@ -227,11 +227,12 @@ def test_files_with_bangs_in_their_names_can_go_to_a_chat(client, lib):
     assert "bang" in text
 
 
-def test_agents_may_not_move_or_copy_local_repos(client, lib, repos):
+def test_agents_may_sort_but_not_delete_or_copy_local_repos(client, lib, repos):
     upr, mine = repos
     up(client, "", "x.txt")
     agent = {"X-Upstream-Client": "agent"}
-    assert client.post("/api/refs/move", json={"path": "x.txt", "to": "", "name": "y.txt"}, headers=agent).status_code == 403
+    assert client.post("/api/refs/move", json={"path": "x.txt", "to": "", "name": "y.txt"}, headers=agent).get_json()["ok"]
+    assert client.post("/api/refs/delete", json={"path": "y.txt"}, headers=agent).status_code == 403
     for url in [str(mine), f"file://{mine}"]:
         assert client.post("/api/refs/clone", json={"url": url}, headers=agent).status_code == 403
     assert client.post("/api/refs/clone", json={"url": f"file://{mine}", "name": "mine-copy"}).get_json()["ok"]

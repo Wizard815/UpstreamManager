@@ -6,7 +6,8 @@ images, videos, notes. A model or agent can be pointed at a folder or a file: `f
 into text it can read (PDF text, a zip's listing, a folder's tree and READMEs), and images go to
 models that can see them.
 
-Layout: everything lives under one root folder (Settings, default <data dir>/references), as an
+Layout: everything lives under one root folder (Settings, else UPSTREAM_REFERENCES_DIR, else
+<UPSTREAM_HOME>/References next to <UPSTREAM_HOME>/Repos), as an
 ordinary file tree you can also open yourself. `.refs.json` at the root keeps where each item came
 from and when it was added."""
 from __future__ import annotations
@@ -67,7 +68,7 @@ def set_root(path: str) -> str:
 
 
 def root() -> Path:
-    r = (store.settings().get("references") or {}).get("root") or str(config.CONFIG_PATH.parent / "references")
+    r = (store.settings().get("references") or {}).get("root") or str(config.references_dir())
     p = Path(r).expanduser()
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -139,6 +140,8 @@ def _move_meta(old: str, new: str | None) -> None:
 
 
 def kind_of(p: Path) -> str:
+    if p.is_symlink() and not p.exists():
+        return "broken-link"
     if p.is_dir():
         return "repo" if (p / ".git").exists() else "folder"
     ext = p.suffix.lower()
@@ -181,10 +184,14 @@ def tree(rel: str = "") -> dict:
         st = c.lstat()
         e = {"name": c.name, "path": r, "kind": kind_of(c), "size": st.st_size if c.is_file() else None,
              "modified": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(st.st_mtime)), **meta.get(r, {})}
+        if c.is_symlink():
+            e.update(link_to=_link_target(c))
         if r in jobs:
             e.update(job=jobs[r])
         elif e["kind"] == "repo":
             e.update(_repo_info(c))
+            if not c.is_symlink():
+                e.update(edited=edited(c))
         items.append(e)
     for r, j in jobs.items():  # clones that haven't made their folder yet
         if Path(r).parent.as_posix() in (rel or ".",) and not any(i["path"] == r for i in items):
@@ -245,8 +252,11 @@ def clone(url: str, folder: str = "", name: str | None = None, branch: str | Non
     name = _clean_name(name or re.sub(r"\.git$", "", url.rstrip("/").split("/")[-1].split(":")[-1]) or "repo")
     dest = parent / name
     rel = _rel(dest)
-    if dest.exists():
+    if dest.exists() or dest.is_symlink():
         raise RefError(f"{rel} already exists")
+    if not branch and (have := find_clone(url)):   # cloned once already: link to that copy
+        out = link(have, folder, name)
+        return {**out, "linked": True}
     with _LOCK:
         if rel in _JOBS and _JOBS[rel]["state"] == "cloning":
             raise RefError(f"{rel} is already being cloned")
@@ -330,13 +340,245 @@ def remote_branches(rel: str) -> list[str]:
     return sorted(line.split("refs/heads/", 1)[1] for line in out.splitlines() if "refs/heads/" in line)[:500]
 
 
+def edited(p: Path) -> dict | None:
+    """What makes a reference repo yours rather than a plain copy: files changed, or commits that are on no
+    branch of its origin. None when it is untouched (then it is safe to bring up to date)."""
+    p = Path(p)
+    st = gitops._run(["git", "status", "--porcelain", "-z"], cwd=str(p)).stdout
+    changed = [x[3:] for x in st.split("\0") if len(x) > 3 and not x.startswith("!!")]
+    ahead = gitops._run(["git", "rev-list", "--count", "HEAD", "--not", "--remotes"], cwd=str(p)).stdout.strip()
+    ahead = int(ahead) if ahead.isdigit() else 0
+    if not changed and not ahead:
+        return None
+    return {"files": changed[:50], "files_count": len(changed), "commits": ahead,
+            "branch": gitops._run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(p)).stdout.strip()}
+
+
 def update(rel: str) -> dict:
+    """Bring one reference repo up to date with where it was cloned from. An edited one is only fetched:
+    your changes are never merged over."""
     p = _repo(rel)
-    r = gitops._run(["git", "pull", "--ff-only", "-q"], cwd=str(p), timeout=1800)
-    if r.returncode:
-        raise RefError((r.stderr or r.stdout).strip()[-400:] or "update failed")
+    mine = edited(p)
+    f = gitops._run(["git", "fetch", "-q", "--prune", "origin"], cwd=str(p), timeout=1800)
+    if f.returncode:
+        raise RefError(_explain((f.stderr or f.stdout).strip()[-400:]) or "update failed")
+    if mine:
+        _note(rel, updated=config.now_iso())
+        return {**_repo_info(p), "edited": mine, "skipped": "it has your changes, so only the newest commits were fetched"}
+    up = gitops._run(["git", "rev-parse", "--abbrev-ref", "@{upstream}"], cwd=str(p)).stdout.strip()
+    if up:
+        r = gitops._run(["git", "merge", "--ff-only", "-q", up], cwd=str(p), timeout=1800)
+        if r.returncode:
+            raise RefError((r.stderr or r.stdout).strip()[-400:] or "update failed")
     _note(rel, updated=config.now_iso())
     return _repo_info(p)
+
+
+def all_repos() -> list[str]:
+    """Every cloned reference repo once (links to one are not counted again), as library paths."""
+    base, out = root(), []
+    for dirpath, dirnames, _files in os.walk(base):      # links are not followed
+        d = Path(dirpath)
+        if ".git" in dirnames or (d / ".git").is_file():
+            if d != base:
+                out.append(_rel(d))
+            dirnames[:] = []
+            continue
+        dirnames[:] = [x for x in dirnames if x not in ("node_modules", ".venv", "__pycache__")]
+    return sorted(out)
+
+
+_UPDATE_ALL: dict = {"state": "idle"}
+
+
+def update_all(wait: bool = False) -> dict:
+    """One command for the whole library: fetch every reference repo and fast-forward the untouched ones.
+    Runs in the background; returns the last (or running) result."""
+    with _LOCK:
+        if _UPDATE_ALL.get("state") == "running":
+            return dict(_UPDATE_ALL)
+        _UPDATE_ALL.clear()
+        _UPDATE_ALL.update(state="running", started=config.now_iso(), done=[], edited=[], failed=[])
+
+    def run():
+        from concurrent.futures import ThreadPoolExecutor
+        repos = all_repos()
+        _UPDATE_ALL["total"] = len(repos)
+
+        def one(rel):
+            try:
+                r = update(rel)
+                (_UPDATE_ALL["edited"] if r.get("edited") else _UPDATE_ALL["done"]).append(rel)
+            except Exception as e:   # one bad clone mustn't stop the rest
+                _UPDATE_ALL["failed"].append({"path": rel, "error": str(e)[:300]})
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(one, repos))
+        with _LOCK:
+            _UPDATE_ALL.update(state="finished", finished=config.now_iso())
+        try:
+            store.save_settings({"references": {**(store.settings().get("references") or {}), "last_update_all": config.now_iso()}})
+        except Exception:
+            pass
+
+    t = threading.Thread(target=run, daemon=True, name="refs-update-all")
+    t.start()
+    if wait:
+        t.join()
+    return dict(_UPDATE_ALL)
+
+
+def update_all_status() -> dict:
+    with _LOCK:
+        return {**_UPDATE_ALL, "last": (store.settings().get("references") or {}).get("last_update_all")}
+
+
+def auto_update_hours() -> float:
+    """How often the library updates itself (Settings, else UPSTREAM_REFS_UPDATE_HOURS, else daily; 0 = never)."""
+    v = (store.settings().get("references") or {}).get("auto_update_hours")
+    if v is None:
+        v = os.environ.get("UPSTREAM_REFS_UPDATE_HOURS", "24")
+    try:
+        return max(0.0, float(v))
+    except (TypeError, ValueError):
+        return 24.0
+
+
+def start_background() -> None:
+    """Keep reference repos up to date on their own (they are copies to read, so updating is safe)."""
+    def loop():
+        from datetime import datetime
+        while True:
+            try:
+                hours = auto_update_hours()
+                last = (store.settings().get("references") or {}).get("last_update_all")
+                age = (datetime.now(tz=__import__("datetime").timezone.utc) - datetime.fromisoformat(last)).total_seconds() / 3600 \
+                    if last else 1e9
+                if hours and age >= hours and all_repos():
+                    update_all(wait=True)
+            except Exception:
+                pass
+            time.sleep(600)
+    threading.Thread(target=loop, daemon=True, name="refs-auto-update").start()
+
+
+def edited_repos() -> list[dict]:
+    """Reference repos you have changed: these join your chats like the repos you work on."""
+    out = []
+    for rel in all_repos():
+        try:
+            e = edited(root() / rel)
+        except Exception:
+            e = None
+        if e:
+            head = gitops._run(["git", "rev-parse", "--short", "HEAD"], cwd=str(root() / rel)).stdout.strip()
+            out.append({"path": rel, "name": Path(rel).name, "head": head, **e})
+    return out
+
+
+def _changes_text(p: Path, limit: int) -> str:
+    """Your changes in an edited reference repo, for a model."""
+    e = edited(p)
+    if not e:
+        return ""
+    parts = [f"Edited by the user on branch {e['branch']}: {e['files_count']} changed file(s), {e['commits']} commit(s) not on its origin."]
+    if e["commits"]:
+        parts.append(gitops._run(["git", "log", "--oneline", "-n", "20", "HEAD", "--not", "--remotes"], cwd=str(p)).stdout.strip())
+    diff = gitops._run(["git", "diff", "HEAD"], cwd=str(p)).stdout
+    if diff:
+        parts.append(diff[:limit] + ("\n...(diff truncated)" if len(diff) > limit else ""))
+    return "\n".join(parts)
+
+
+# ------------------------------------------------------------------ links
+def _link_target(p: Path) -> str | None:
+    try:
+        t = (p.parent / os.readlink(p)).resolve()
+        return _rel(t) if root().resolve() in t.parents else None
+    except OSError:
+        return None
+
+
+def link(target: str, into: str, name: str | None = None) -> dict:
+    """Put a reference in another folder without copying it: a link to the one copy. Sort the same repo
+    under several projects, and it is cloned, updated and stored once."""
+    target, into = norm(target), norm(into)
+    if not target:
+        raise RefError("pick what to link")
+    src = _p(target)
+    if src.is_symlink():                        # link to the real thing, never a chain of links
+        src = src.resolve()
+        target = _rel(src)
+    d = _p(into)
+    if not d.is_dir():
+        raise RefError("links go into a folder")
+    if _inside_repo(d):
+        raise RefError("keep your own folders out of cloned repos")
+    dst = d / _clean_name(name or src.name)
+    if dst.exists() or dst.is_symlink():
+        raise RefError(f"{_rel(dst)} already exists")
+    if src.is_dir() and (d.resolve() == src.resolve() or src.resolve() in d.resolve().parents):
+        raise RefError("can't link a folder into itself")
+    os.symlink(os.path.relpath(src, d.resolve()), dst, target_is_directory=src.is_dir())
+    _note(_rel(dst), added=config.now_iso(), link_to=target)
+    return {"path": _rel(dst), "link_to": target}
+
+
+def _links() -> list[Path]:
+    """Every link in the library (they only live in your own folders, never inside clones)."""
+    base, out = root(), []
+    for dirpath, dirnames, filenames in os.walk(base):
+        d = Path(dirpath)
+        if ".git" in dirnames:
+            dirnames[:] = []
+            continue
+        for n in dirnames + filenames:
+            if (d / n).is_symlink():
+                out.append(d / n)
+    return out
+
+
+def links_to(rel: str) -> list[str]:
+    rel = norm(rel)
+    return [_rel(l) for l in _links() if (t := _link_target(l)) and (t == rel or t.startswith(rel + "/"))]
+
+
+def _retarget_links(old: str, new: str | None) -> list[str]:
+    """After a move, point links at the new place; after a delete, remove them. Returns the links touched."""
+    touched = []
+    for l in _links():
+        raw = os.readlink(l)
+        t = (l.parent / raw).resolve() if not os.path.isabs(raw) else Path(raw).resolve()
+        base = root().resolve()
+        try:
+            tr = t.relative_to(base).as_posix()
+        except ValueError:
+            continue
+        if tr == old or tr.startswith(old + "/"):
+            touched.append(_rel(l))
+            l.unlink()
+            if new is not None:
+                os.symlink(os.path.relpath(base / (new + tr[len(old):]), l.parent.resolve()), l)
+            else:
+                _move_meta(_rel(l), None)
+    return touched
+
+
+def find_clone(url: str) -> str | None:
+    """A reference repo already cloned from this URL (so a second project links to it instead of cloning again)."""
+    want = _same_url(url)
+    for rel in all_repos():
+        got = gitops._run(["git", "remote", "get-url", "origin"], cwd=str(root() / rel)).stdout.strip()
+        if got and _same_url(got) == want:
+            return rel
+    return None
+
+
+def _same_url(u: str) -> str:
+    u = (u or "").strip().lower().removesuffix("/").removesuffix(".git")
+    u = re.sub(r"^file://", "", u)
+    u = re.sub(r"^(https?|ssh|git)://([^@/]+@)?", "", u)
+    u = re.sub(r"^[^@/]+@([^:/]+):", r"\1/", u)
+    return u
 
 
 def save_upload(folder: str, filename: str, stream, size: int | None = None) -> dict:
@@ -395,12 +637,21 @@ def move(rel: str, to_folder: str, new_name: str | None = None) -> dict:
         raise RefError("can't move a folder into itself")
     if _inside_repo(dst_dir) and _inside_repo(dst_dir) != rel:
         raise RefError("keep your own files out of cloned repos: move it into a folder")
+    was_link = src.is_symlink()
+    if was_link:   # moving a link moves the link, still pointing at the same thing
+        target = (src.parent / os.readlink(src)).resolve()
+        src.unlink()
+        os.symlink(os.path.relpath(target, dst_dir.resolve()), dst, target_is_directory=target.is_dir())
+        _move_meta(rel, _rel(dst))
+        return {"path": _rel(dst)}
     shutil.move(str(src), str(dst))
     _move_meta(rel, _rel(dst))
-    return {"path": _rel(dst)}
+    relinked = _retarget_links(rel, _rel(dst))
+    return {"path": _rel(dst), **({"relinked": relinked} if relinked else {})}
 
 
-def delete(rel: str) -> None:
+def delete(rel: str) -> list[str]:
+    """Delete an item (links to it are removed too; returns those). Deleting a link leaves what it points at."""
     rel = norm(rel)
     if not rel:
         raise RefError("can't delete the library itself")
@@ -410,9 +661,13 @@ def delete(rel: str) -> None:
             raise RefError("a clone is still running in there: wait for it to finish")
     if p.is_dir() and not p.is_symlink():
         shutil.rmtree(p)
-    else:
-        p.unlink()
+        _move_meta(rel, None)
+        return _retarget_links(rel, None)   # links to it would lead nowhere: they go too
+    p.unlink()
     _move_meta(rel, None)
+    if not p.is_symlink():
+        _retarget_links(rel, None)
+    return []
 
 
 def set_note(rel: str, note: str) -> None:
@@ -468,6 +723,9 @@ def read(rel: str, limit: int = TEXT_LIMIT) -> dict:
     try:
         if inner is not None:
             return {**out, "path": f"{rel}!{inner}", "kind": "text", "text": _zip_member(p, inner, limit)}
+        if k == "repo" and (mine := edited(p)):
+            changes = _changes_text(p, limit // 2)
+            return {**out, "edited": mine, "text": changes + "\n\n" + folder_overview(rel, limit - len(changes))}
         if k in ("folder", "repo"):
             return {**out, "text": folder_overview(rel, limit)}
         if k == "pdf":

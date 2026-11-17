@@ -26,16 +26,18 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import components, gitops
+from . import components, config, gitops
 from .config import PROJECT_ROOT
 from . import store
 from . import upstream_check
 
-WATCH_FOLDERS = [
+WATCH_FOLDERS = [p for p in (
+    config.repos_dir(),             # UPSTREAM_HOME/Repos, or UPSTREAM_REPOS_DIR / REPOS_DIR
     Path("/home/codebox/Repos"),
     PROJECT_ROOT / "watch",
     Path("/home/codebox/OnePiece"),
-]
+) if p]
+WATCH_FOLDERS = list(dict.fromkeys(WATCH_FOLDERS))
 
 
 def _free_id(base: str, path: str) -> str:

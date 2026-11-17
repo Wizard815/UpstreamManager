@@ -21,17 +21,29 @@ an existing `.env` is never changed. Afterwards:
 systemctl --user status upstream-manager     # or restart / stop; logs: journalctl --user -u upstream-manager -f
 ```
 
+Your files go in one folder, **`~/ManagerFiles`** unless you pass `--home /other/folder`:
+
+```
+ManagerFiles/
+  Repos/        repos you clone in the app (and any you move here; they are picked up)
+  References/   the reference library
+```
+
+`UPSTREAM_HOME` in `.env` names that folder; `UPSTREAM_REPOS_DIR` or `UPSTREAM_REFERENCES_DIR`
+move one part on its own, and Settings can still move the library.
+
 This is the better fit when herdr runs on the same machine: Upstream Manager, herdr and your repos
 then see the same folders as the same user, with nothing to map.
 
 ### With Docker
 
 ```bash
-cp .env.example .env          # set REPOS_DIR (the folder that holds your repos); see the Docker lines at the end
+cp .env.example .env          # set UPSTREAM_HOME to your ManagerFiles folder
+mkdir -p ~/ManagerFiles/Repos ~/ManagerFiles/References   # so the folders are yours, not root's
 docker compose up -d --build
 ```
 
-The container shares the host's network and mounts your repos, its data folder and herdr's socket
+The container shares the host's network and mounts your ManagerFiles folder, its data folder and herdr's socket
 folder **at the same paths they have on the host**, because agents are told where a task's branch
 folder is. Set `UPSTREAM_UID`/`UPSTREAM_GID` to your own ids (`id -u`, `id -g`) so files stay
 yours. Two things differ from the native install: demo stacks (the Stack tab) need Docker inside
@@ -51,7 +63,7 @@ For agents, set in `.env` (the install script fills in what it finds):
 
 | What | Setting | Then |
 |---|---|---|
-| herdr on this machine | nothing | tasks start agents (Claude Code, Codex, Hermes...) in herdr |
+| herdr on this machine | nothing | tasks start agents in herdr: Hermes by default; pick Claude Code, Codex... per task, or set `UPSTREAM_HERDR_KIND` |
 | Hermes Studio | `HERMES_STUDIO_URL`, and a token or `HERMES_STUDIO_USER`/`HERMES_STUDIO_PASSWORD` | "Send to Hermes Studio", and Hermes agents link to their Studio session |
 | Hermes gateway | `HERMES_API_URL` (8642), `HERMES_API_KEY` (Hermes' `API_SERVER_KEY`) | "Hand to Hermes"; its sessions show in Studio's history |
 
@@ -199,6 +211,23 @@ What stays with you: answering an agent's questions, committing, approving and d
 and the **Hermes API server** (`HERMES_API_URL`, `HERMES_API_KEY`) can also take a task directly.
 **Pondering Orb** (`ORB_URL`, `UPSTREAM_ORB_TOKEN`) and the **LLM wiki** (`LLMWIKI_MCP_URL`,
 `LLMWIKI_API_KEY`) are where a task is parked for later.
+
+## References
+
+The References page is a library of repos and files to look things up in (PDFs, zips, images,
+notes), sorted into folders under `ManagerFiles/References`. Any chat or agent can read them.
+
+- **One copy, many folders.** "Also put it in another folder (link)" shows the same item under
+  several projects without copying it. Cloning a repo that is already in the library makes a link
+  to that copy. Links follow when the original is moved, and go when it is deleted.
+- **Kept up to date.** Reference repos update themselves once a day (`UPSTREAM_REFS_UPDATE_HOURS`,
+  0 = never), and **Update all** does every one now (agents: `update_references`).
+- **Edited references join your chats.** A reference repo with changed files, or commits that are
+  not on its origin, is marked *edited*. It is then only fetched, never changed by an update, and it
+  joins every chat's attachments with its changes, as the repos you work on do. Remove it from a
+  chat and it stays out of that chat until it changes again.
+- **Agents may sort it**: make folders, move, rename, link, add notes and clone
+  (`organize_references`, `clone_reference`). Deleting stays with you.
 
 ## Memory and day logs
 

@@ -640,6 +640,48 @@ def search_references(query: _text("Words to find in file names and in the text 
     return _call("GET", "/api/refs/search", q=query)["items"]
 
 
+@server.tool(annotations=WRITE)
+def organize_references(action: Annotated[str, Field(description='"folder" makes a folder; "move" moves or renames an item; '
+                                                                '"link" puts an item in another folder too without copying it; "note" sets its note.')],
+                        path: Annotated[str, Field(description='The item: for "folder" the parent folder ("" for the top).')] = "",
+                        to: Annotated[str, Field(description='"move" and "link": the folder it goes into.')] = "",
+                        name: Annotated[str, Field(description='"folder": its name. "move" and "link": a new name (optional).')] = "",
+                        note: Annotated[str, Field(description='"note": the text.')] = "") -> dict:
+    """Sort the user's reference library. Prefer "link" when one reference belongs under several projects:
+    there is then one copy to update and store. Deleting is left to the user."""
+    if action == "folder":
+        return _call("POST", "/api/refs/folder", {"parent": path, "name": name})
+    if action == "move":
+        return _call("POST", "/api/refs/move", {"path": path, "to": to, "name": name or None})
+    if action == "link":
+        return _call("POST", "/api/refs/link", {"target": path, "into": to, "name": name or None})
+    if action == "note":
+        return _call("POST", "/api/refs/note", {"path": path, "note": note})
+    raise AppError('action is one of "folder", "move", "link", "note"')
+
+
+@server.tool(annotations=WRITE)
+def clone_reference(url: _text("The git URL (https://github.com/org/repo).", 500),
+                    folder: Annotated[str, Field(description="The library folder to put it in.")] = "",
+                    name: Annotated[str, Field(description="Its folder name (optional).")] = "") -> dict:
+    """Add a repo to the reference library. If it was cloned before, the new place is a link to that copy."""
+    return _call("POST", "/api/refs/clone", {"url": url, "folder": folder, "name": name or None})
+
+
+@server.tool(annotations=WRITE)
+def update_references() -> dict:
+    """Bring every reference repo up to date with where it came from (one command; runs in the background).
+    Repos the user edited are only fetched, never changed. Call again to see how it went."""
+    return _call("POST", "/api/refs/update-all")
+
+
+@server.tool(annotations=READ)
+def edited_references() -> list[dict]:
+    """Reference repos the user (or an agent) changed: their changed files and own commits. Treat these like the
+    repos being worked on in this conversation."""
+    return _call("GET", "/api/refs/edited")["items"]
+
+
 def main() -> None:
     server.run("stdio")
 

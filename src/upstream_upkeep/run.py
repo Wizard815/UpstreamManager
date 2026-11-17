@@ -16,12 +16,13 @@ import os
 
 from waitress import serve
 
-from . import memory
+from . import memory, references
 from .app import flask_app
 
 
 def main(default_port: int = 5000) -> None:
     memory.start_background()  # writes the log of each finished day that had activity
+    references.start_background()  # keeps reference repos up to date (daily unless set otherwise)
     serve(
         flask_app,
         host=os.environ.get("HOST", "127.0.0.1"),
