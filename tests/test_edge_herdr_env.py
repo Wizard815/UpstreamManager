@@ -17,7 +17,7 @@ def hd(client, repos):
     repo = registry.add_repo(str(mine), None, "mine")
     client.post("/api/integrations/settings", json={"herdr": {"enabled": True, "socket": f.path, "kind": "claude"}})
     yield f, repo
-    f.srv.close()
+    f.close()
 
 
 # ---------------------------------------------------------------- the folder map
@@ -89,8 +89,7 @@ def test_a_task_record_without_its_agent_is_explained_not_a_crash(client, hd):
 def test_herdr_stopping_mid_task_is_reported_everywhere_without_errors(client, hd):
     f, repo = hd
     t = new_task(client, repo, to="herdr")
-    f.srv.close()
-    os.unlink(f.path)
+    f.close()
     assert client.get("/api/tasks").status_code == 200
     a = client.get(f"/api/tasks/{t['task']['id']}/agent").get_json()
     assert a["ok"] is False and "isn't running" in a["error"] and not a.get("gone")   # not "gone": herdr itself is down

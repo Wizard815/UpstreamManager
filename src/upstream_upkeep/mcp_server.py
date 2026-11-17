@@ -566,6 +566,56 @@ def update_task(
     return _call("POST", f"/api/tasks/{quote(task, safe='')}", {"status": status or None, "note": note or None})["task"]
 
 
+@server.tool(annotations=READ)
+def herdr_agents() -> list[dict]:
+    """The coding agents herdr is running now, on this machine and every machine herdr reaches: name, kind,
+    status (idle, working, blocked, done) and the task each is on. Use it to pick who gets a task."""
+    return _call("GET", "/api/herdr/agents")["items"]
+
+
+@server.tool(annotations=WRITE)
+def send_task(
+    task: TaskId,
+    to: Annotated[Literal["herdr", "studio", "hermes", "wiki", "orb"], Field(
+        description="herdr: a coding agent in herdr; studio: a Hermes Studio run; hermes: the Hermes gateway; "
+                    "wiki / orb: park it in the LLM wiki or Pondering Orb for later.")],
+    agent_kind: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$|^$", description="For herdr: start a new agent of this kind (claude, codex, hermes...); empty for the default.")] = "",
+    agent: Annotated[str, Field(pattern=r"^([a-z][a-z0-9_-]{0,31}|w\d+:p\d+)$|^$", description="For herdr: give it to this running agent instead (a name from herdr_agents).")] = "",
+    machine: Annotated[str, Field(max_length=100, description="For herdr: one of its saved machines; empty for the usual one.")] = "",
+    message: Annotated[str, Field(max_length=20000, description="A follow-up for a task that is already with an agent; empty sends the task itself.")] = "",
+) -> dict:
+    """Hand a task to an agent (it works on the task's own branch; the user reviews and approves the result),
+    or park it. Create the task first with create_task. Sending to agents can be switched off by the user,
+    and only a few agent-sent tasks may run at once; an agent that asks something is answered by the user."""
+    body = {"to": to, **({"agent_kind": agent_kind} if agent_kind else {}), **({"agent": agent} if agent else {}),
+            **({"machine": machine} if machine else {}), **({"message": message} if message else {})}
+    out = _call("POST", f"/api/tasks/{quote(task, safe='')}/send", body)
+    return {"where": out.get("where"), "status": (out.get("task") or {}).get("status")}
+
+
+@server.tool(annotations=READ)
+def task_progress(task: TaskId) -> dict:
+    """How a task that is with an agent is going: the agent's status and recent output (herdr) or conversation
+    (Studio, Hermes), plus the task's branch: its commits and changed files. Poll this rather than waiting."""
+    tid = quote(task, safe="")
+    out = {"task": _call("GET", f"/api/tasks/{tid}")["task"]}
+    try:
+        a = _call("GET", f"/api/tasks/{tid}/agent")
+        out["agent"] = {k: a.get(k) for k in ("type", "agent", "kind", "machine", "status", "pending", "studio_url", "url", "run") if a.get(k) is not None}
+        out["agent"]["output"] = (a.get("output") or "")[-4000:] or None
+        out["agent"]["messages"] = (a.get("messages") or [])[-6:] or None
+    except AppError as e:
+        out["agent"] = {"error": str(e)}
+    try:
+        c = _call("GET", f"/api/tasks/{tid}/changes")
+        out["branch"] = {k: c.get(k) for k in ("branch", "onto", "path", "next_step", "ready", "warning", "proposed_message")}
+        out["branch"]["commits"] = [{"sha": x["sha"], "subject": x["subject"]} for x in c.get("commits") or []][:30]
+        out["branch"]["files"] = c.get("files", [])[:60]
+    except AppError as e:
+        out["branch"] = {"error": str(e)}
+    return out
+
+
 # ------------------------------------------------------------------ references
 RefPath = Annotated[str, Field(description='A path in the reference library from list_references ("" for the top); '
                                            '"file.zip!inner/file.txt" reads a file inside a zip.')]

@@ -3,6 +3,7 @@
 The env vars must be set before the app is imported (config reads them at import).
 """
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -29,7 +30,12 @@ def commit_file(repo, name, text, msg):
 
 @pytest.fixture(autouse=True)
 def fresh_state():
+    """Each test starts from nothing: no repos or settings, and none of an earlier test's task branches,
+    workspaces or reference files. (Tests reuse repo ids like "mine"; identical commits made in the same
+    second get identical ids, so a leftover workspace folder would otherwise be mistaken for another repo's.)"""
     store._STATE = {"repos": [], "settings": {}}
+    for leftover in ("workspaces", "references"):
+        shutil.rmtree(os.path.join(_STATE_DIR, leftover), ignore_errors=True)
     yield
 
 

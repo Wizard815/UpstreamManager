@@ -107,9 +107,11 @@ def test_hand_to_hermes_runs_in_the_background_and_shows_the_conversation(client
     credentials.set("hermes_api_key", "k" * 40)
     try:
         t = client.post("/api/tasks", json={"repo": repo["id"], "title": "Port the fetch code", "kind": "feature"}).get_json()["task"]
-        # an agent may not hand work to Hermes
+        # with the switch off, an agent may not hand work to Hermes
+        client.post("/api/integrations/settings", json={"agents_dispatch": False})
         r = client.post(f"/api/tasks/{t['id']}/send", json={"to": "hermes"}, headers={"X-Upstream-Client": "agent"})
-        assert r.status_code == 400 and "up to the user" in r.get_json()["error"]
+        assert r.status_code == 400 and "switched off" in r.get_json()["error"]
+        client.post("/api/integrations/settings", json={"agents_dispatch": True})
         r = client.post(f"/api/tasks/{t['id']}/send", json={"to": "hermes"}).get_json()
         assert r["ok"] and r["where"]["hermes"] == "api_1" and r["where"]["workdir"] != repo["path"]
         for _ in range(400):

@@ -136,13 +136,17 @@ def fake_herdr():
     srv.bind(path)
     srv.listen(8)
 
+    stop = []
+
     def serve():
-        while True:
+        while not stop:
             try:
                 c, _ = srv.accept()
             except OSError:
                 return
             with c:
+                if stop:
+                    return
                 req = json.loads(c.makefile().readline())
                 calls.append(req)
                 m, res = req["method"], {}
@@ -158,8 +162,16 @@ def fake_herdr():
                     res = {"type": "pane_read", "read": {"text": "Editing parse.py…"}}
                 c.sendall((json.dumps({"id": req["id"], "result": res}) + "\n").encode())
 
-    threading.Thread(target=serve, daemon=True).start()
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
     yield path, calls
+    stop.append(1)   # get the thread out of accept() before closing: see FakeHerdr.close in test_herdr_logic
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as poke:
+            poke.connect(path)
+    except OSError:
+        pass
+    th.join(timeout=5)
     srv.close()
 
 
@@ -170,7 +182,9 @@ def test_hand_a_task_to_a_herdr_agent(client, repos, fake_herdr):
     client.post("/api/integrations/settings", json={"herdr": {"enabled": True, "socket": path, "kind": "codex"}})
     assert client.get("/api/integrations").get_json()["herdr"]["ok"]
     t = client.post("/api/tasks", json={"repo": repo["id"], "title": "Fix parse", "kind": "bug"}).get_json()["task"]
+    client.post("/api/integrations/settings", json={"agents_dispatch": False})
     assert client.post(f"/api/tasks/{t['id']}/send", json={"to": "herdr"}, headers={"X-Upstream-Client": "agent"}).status_code == 400
+    client.post("/api/integrations/settings", json={"agents_dispatch": True})
     r = client.post(f"/api/tasks/{t['id']}/send", json={"to": "herdr"}).get_json()
     assert r["ok"], r
     ws_call = next(c for c in calls if c["method"] == "workspace.create")["params"]
