@@ -38,7 +38,7 @@ def status() -> dict:
     if not s["url"]:
         return {**out, "ok": False, "error": "no Pondering Orb address set"}
     try:
-        r = requests.get(s["url"].rstrip("/") + "/api/c/tasks", headers=_headers(), timeout=TIMEOUT, params={"limit": 1})
+        r = requests.get(s["url"].rstrip("/") + "/api/c/tasks", headers=_headers(), timeout=2.5, params={"limit": 1})
         if r.status_code in (401, 403):
             return {**out, "ok": False, "error": f"Orb refused the token ({r.status_code})"}
         r.raise_for_status()

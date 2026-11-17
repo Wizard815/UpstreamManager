@@ -19,6 +19,7 @@ import requests
 from . import config, credentials, store
 
 TIMEOUT = 15
+STATUS_TIMEOUT = 2.5   # a status check must never hold a page up
 TURN_TIMEOUT = 3600
 _RUNS: dict[str, dict] = {}   # session id -> {"since", "error", "running"}
 _LOCK = threading.Lock()
@@ -78,7 +79,7 @@ def status() -> dict:
     if not s["enabled"]:
         return {**out, "ok": False, "error": "off"}
     try:
-        caps = _req("GET", "/v1/capabilities")
+        caps = _req("GET", "/v1/capabilities", timeout=STATUS_TIMEOUT)
         return {**out, "ok": True, "version": caps.get("version") or caps.get("object")}
     except HermesError as e:
         return {**out, "ok": False, "error": str(e)}

@@ -2195,10 +2195,12 @@ function afterSend(res, to) {
     return route(`/repo/${t.repo_id}?session=${res.where.session}`)
   }
   if (["hermes", "herdr", "studio"].includes(to)) { toast(`${DEST[to].label.replace(/^(Send to|Hand to) /, "")} is on it`, "ok"); return route(`/work?task=${t.id}`) }
-  if (to === "wiki") return toast(`Parked in the LLM wiki: ${res.where.note}`, "ok")
-  if (to === "orb") return toast(`Parked in Pondering Orb (${res.where.list})`, "ok")
+  if (to === "wiki") { toast(`Parked in the LLM wiki: ${res.where.note}`, "ok"); return onWork() && route(`/work?task=${t.id}`) }
+  if (to === "orb") { toast(`Parked in Pondering Orb (${res.where.list})`, "ok"); return onWork() && route(`/work?task=${t.id}`) }
   toast("Task saved", "ok")
+  route(`/work?task=${t.id}`)   // show it where it now lives, ready to send somewhere
 }
+const onWork = () => currentView()[0] === "work"
 
 async function refreshWorkCount() {
   const c = document.getElementById("work-count")
@@ -2772,7 +2774,7 @@ async function integrationsSetup() {
   const mcpCmd = `hermes mcp add upstream --command upstream-mcp --env UPSTREAM_APP_URL=${location.origin}${BASE}`
   const ef = ints.env_file || {}
   box.append(el("h4", { style: "margin-top:20px" }, "Connections"),
-    el("div", { class: "muted" }, ef.path ? `Reading ${ef.keys.length} setting${ef.keys.length === 1 ? "" : "s"} from ${ef.path}${ef.keys.length ? ` (${ef.keys.join(", ")})` : ""}. What you save below wins over the file.`
+    el("div", { class: "muted", style: ef.missing ? "color:var(--bad)" : null }, ef.missing ? `The env file named by UPSTREAM_ENV_FILE isn't there: ${ef.missing}. No connections were read from a file.` : ef.path ? `Reading ${ef.keys.length} setting${ef.keys.length === 1 ? "" : "s"} from ${ef.path}${ef.keys.length ? ` (${ef.keys.join(", ")})` : ""}. What you save below wins over the file.`
       : `Every connection below can also be set in an env file: copy .env.example to .env (${(ef.looked || []).join(" or ")}) and restart. What you save here wins over the file.`),
     el("h4", { style: "margin-top:20px" }, "Hermes"),
     el("div", { class: "muted" }, "Hand bigger or longer tasks to a Hermes agent. Turn on Hermes' API server (API_SERVER_ENABLED=true and an API_SERVER_KEY), then point this at it. Each task gets its own branch; Hermes works there and you approve the result here."),

@@ -1910,6 +1910,9 @@ def api_task_agent(task_id):
         if w.get("type") == "studio":
             return jsonify({"ok": True, "type": "studio", "url": w.get("url"), "messages": studio.messages(w["studio"]), "run": studio.run_state(w["studio"])})
         if w.get("type") == "herdr":
+            if not w.get("agent"):
+                return jsonify({"ok": False, "type": "herdr", "gone": True, "messages": [], "run": {"running": False},
+                                "error": "this task has lost track of its agent. Send it to herdr again to start a new one."})
             a = herdr.agent(w["agent"], w.get("machine"))
             t = tasks.herdr_sync(t, a)
             w = t["where"]
@@ -1933,7 +1936,7 @@ def api_task_keys(task_id):
         return denied
     t = tasks.get(task_id) or abort(404)
     w = t.get("where") or {}
-    if w.get("type") != "herdr":
+    if w.get("type") != "herdr" or not w.get("agent"):
         return jsonify({"ok": False, "error": "this task is not with a herdr agent"}), 400
     try:
         herdr.send_keys(w["agent"], (request.get_json(silent=True) or {}).get("keys"), w.get("machine"))
@@ -2151,6 +2154,7 @@ def api_integrations():
     _AVAIL["at"] = 0.0
     return jsonify({"ok": True, "hermes": hermes.status(), "herdr": herdr.status(), "studio": studio.status(), "orb": orb.status(),
                     "env_file": {"path": str(config.ENV_FILE) if config.ENV_FILE else None, "keys": config.ENV_KEYS,
+                                 "missing": config.ENV_MISSING,
                                  "looked": [str(config.PROJECT_ROOT / ".env"), str(config.PROJECT_ROOT / "data" / ".env")]},
                     "suggest": (store.settings().get("work") or {}).get("suggest", "ask"),
                     "wiki": {"ok": bool(w.get("writer")) or bool(w.get("ok")), "writer": w.get("writer"), "reader": w.get("ok"),
@@ -2598,7 +2602,9 @@ TEMPLATE = r"""<!DOCTYPE html>
 .fst{font-size:11px;min-width:64px;font-family:var(--mono)}.fst.c{color:var(--good)}.fst.u{color:#e0a060}
 .commit-line{display:flex;gap:6px;align-items:baseline;font-size:13px}.linkish{background:none;border:0;color:var(--accent2,#9fb4ff);cursor:pointer;font:inherit;padding:0}
 pre.term{margin:0;font:12px/1.35 var(--mono);white-space:pre-wrap;color:#cfd6e4}
-.ref-grid{display:grid;grid-template-columns:minmax(220px,300px) 1fr;gap:14px;align-items:start}@media (max-width:900px){.ref-grid{grid-template-columns:1fr}}
+.ref-grid{display:grid;grid-template-columns:minmax(220px,300px) minmax(0,1fr);gap:14px;align-items:start}.ref-grid>*{min-width:0;overflow-wrap:anywhere}
+@media (max-width:900px){.ref-grid,.work-grid{grid-template-columns:minmax(0,1fr)}.ref-row,.ref-head{grid-template-columns:22px minmax(0,1fr) minmax(0,.8fr)}.ref-row>span:nth-child(n+4),.ref-head>span:nth-child(n+4){display:none}}
+.repo-card,.task-detail,.agent-box,.branch-box{overflow-wrap:anywhere}.repo-card pre,.repo-card code{white-space:pre-wrap}
 .ref-tree .trow{display:flex;gap:6px;align-items:center;padding:4px 8px;cursor:pointer;border-radius:6px}.ref-tree .trow:hover{background:var(--raise)}
 .ref-tree .trow.sel{background:var(--raise);box-shadow:inset 3px 0 0 var(--accent,#4c7dff)}.ref-tree .tw{width:12px;color:var(--muted)}
 .trow.drop,.ref-drop.drop{outline:2px dashed var(--accent,#4c7dff);outline-offset:-2px}

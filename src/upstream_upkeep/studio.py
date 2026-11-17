@@ -113,7 +113,7 @@ def status() -> dict:
     if not s["enabled"]:
         return {**out, "ok": False, "error": "off"}
     try:
-        _req("GET", "/api/studio/sessions", params={"limit": 1})
+        _req("GET", "/api/studio/sessions", timeout=2.5, params={"limit": 1})
         return {**out, "ok": True}
     except StudioError as e:
         return {**out, "ok": False, "error": str(e)}
