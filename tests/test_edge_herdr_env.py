@@ -180,3 +180,33 @@ def test_connections_that_hang_dont_hang_the_page(client, monkeypatch):
     assert took < 9, f"{took:.1f}s"
     assert not d["hermes"]["ok"] and not d["studio"]["ok"] and not d["orb"]["ok"]
     assert "timed out" in d["hermes"]["error"]
+
+
+# ---------------------------------------------------------------- inside Hermes Studio's /upstream tab
+def test_writes_through_studios_proxy_are_accepted_and_forgeries_are_not(client, monkeypatch):
+    from upstream_upkeep import app as appmod
+    studio_origin = {"Origin": "http://192.168.20.5:6060"}
+    # a page on another site: refused as before
+    assert client.post("/api/tasks", json={"title": "x"}, headers=studio_origin).status_code == 403
+    # Studio's proxy on this machine adds X-Upstream-Base: accepted
+    ok = client.post("/api/tasks", json={"title": "from the Studio tab"}, headers={**studio_origin, "X-Upstream-Base": "/upstream"})
+    assert ok.status_code == 200 and ok.get_json()["ok"]
+    # the same header from another machine is not enough...
+    far = {"REMOTE_ADDR": "172.18.0.5"}
+    r = client.post("/api/tasks", json={"title": "x"}, headers={**studio_origin, "X-Upstream-Base": "/upstream"}, environ_overrides=far)
+    assert r.status_code == 403
+    # ...unless that address is listed (Studio in a container)
+    monkeypatch.setattr(appmod, "_TRUSTED_PROXIES", ["172.18.0.0/16", "not-an-ip"])
+    r = client.post("/api/tasks", json={"title": "from Studio in docker"}, headers={**studio_origin, "X-Upstream-Base": "/upstream"}, environ_overrides=far)
+    assert r.status_code == 200
+    # a form post is still refused whatever the headers
+    r = client.post("/api/tasks", data="title=x", content_type="text/plain", headers={"X-Upstream-Base": "/upstream"})
+    assert r.status_code == 415
+
+
+def test_hermes_sessions_use_the_source_studio_lists(client, monkeypatch):
+    from upstream_upkeep import hermes
+    sent = {}
+    monkeypatch.setattr(hermes, "_req", lambda m, p, **kw: sent.update(kw.get("json") or {}) or {"session": {"id": "s1"}})
+    assert hermes.start("Fix it", "be careful") == "s1"
+    assert sent["source"] == "api_server" and sent["title"] == "⇅ Fix it"
