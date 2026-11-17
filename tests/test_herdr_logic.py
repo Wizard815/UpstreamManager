@@ -25,7 +25,29 @@ class FakeHerdr:
         self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.srv.bind(self.path)
         self.srv.listen(8)
-        threading.Thread(target=self.serve, daemon=True).start()
+        self.stopped = False
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        """Stop for good. The serving thread must be out of accept() before the socket is closed: a thread
+        left blocked there retries on the same descriptor number after a signal, and that number will by
+        then belong to the next test's fake, whose connections it would answer with this one's state."""
+        if self.stopped:
+            return
+        self.stopped = True
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as poke:   # wake accept()
+                poke.settimeout(1)
+                poke.connect(self.path)
+        except OSError:
+            pass
+        self.thread.join(timeout=5)
+        self.srv.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
 
     def info(self, a):
         return {"name": a["name"], "agent": a["kind"], "agent_status": a["status"], "pane_id": a["pane"], "workspace_id": a["pane"].split(":")[0],
@@ -77,12 +99,14 @@ class FakeHerdr:
         raise HerdrSays("unknown_method")
 
     def serve(self):
-        while True:
+        while not self.stopped:
             try:
                 c, _ = self.srv.accept()
             except OSError:
                 return
             with c:
+                if self.stopped:
+                    return
                 try:
                     req = json.loads(c.makefile().readline())
                     self.calls.append(req)
@@ -105,7 +129,7 @@ def hd(client, repos):
     repo = registry.add_repo(str(mine), None, "mine")
     client.post("/api/integrations/settings", json={"herdr": {"enabled": True, "socket": f.path, "kind": "claude"}})
     yield f, repo
-    f.srv.close()
+    f.close()
 
 
 def new_task(client, repo, title="Fix the parser!", **extra):
@@ -233,7 +257,7 @@ def test_on_the_same_box_herdr_is_found_without_any_setting(client, repos, monke
     monkeypatch.setenv("UPSTREAM_HERDR", "off")
     monkeypatch.setenv("HERDR_SOCKET_PATH", f.path)
     assert client.get("/api/integrations").get_json()["herdr"]["enabled"] is False
-    f.srv.close()
+    f.close()
 
 
 @pytest.fixture
@@ -278,8 +302,8 @@ print(r["result"]["read"]["text"] if m == "agent.read" else json.dumps(r), end="
                                                               "path_map": f"{config.CONFIG_PATH.parent}=/srv/far"}})
     monkeypatch.setenv("UPSTREAM_HERDR_BIN", str(exe))
     yield near, far, repo, tmp_path
-    near.srv.close()
-    far.srv.close()
+    near.close()
+    far.close()
 
 
 def test_another_machine_is_reached_through_herdr_itself(client, remote):
@@ -340,3 +364,63 @@ def test_the_env_file_sets_connections_and_real_env_wins(tmp_path, monkeypatch):
     finally:
         for k in keys:
             os.environ.pop(k, None)
+
+
+# ---------------------------------------------------------------- agents handing work on (Studio's agent, a herdr agent...)
+AGENT = {"X-Upstream-Client": "agent"}
+
+
+def test_an_agent_can_hand_a_task_to_herdr_and_follow_it(client, hd):
+    f, repo = hd
+    t = client.post("/api/tasks", json={"repo": repo["id"], "title": "From Studio's agent", "kind": "bug"}, headers=AGENT).get_json()["task"]
+    assert t["by"] == "agent"
+    r = client.post(f"/api/tasks/{t['id']}/send", json={"to": "herdr", "agent_kind": "codex"}, headers=AGENT).get_json()
+    assert r["ok"], r
+    assert r["where"]["kind"] == "codex" and f.agents[r["where"]["agent"]]["prompts"]
+    task = tasks.get(t["id"])
+    assert task["dispatched_by"] == "agent" and "sent to herdr by an agent" in [x["text"] for x in task["log"]]
+    assert client.get(f"/api/tasks/{t['id']}/agent", headers=AGENT).get_json()["status"] == "working"
+    assert client.get("/api/herdr/agents", headers=AGENT).get_json()["items"][0]["task"]["id"] == t["id"]
+    # what stays with the person: answering the agent, committing, deleting
+    assert client.post(f"/api/tasks/{t['id']}/keys", json={"keys": ["y"]}, headers=AGENT).status_code == 403
+    assert client.post(f"/api/tasks/{t['id']}/commit", json={"message": "x"}, headers=AGENT).status_code == 403
+    assert client.delete(f"/api/tasks/{t['id']}", json={}, headers=AGENT).status_code == 403
+
+
+def test_the_switch_and_the_limit_hold_agents_back(client, hd):
+    from upstream_upkeep import app as appmod
+    f, repo = hd
+    ids = []
+    for i in range(appmod.AGENT_DISPATCH_LIMIT):
+        t = client.post("/api/tasks", json={"repo": repo["id"], "title": f"Job {i}"}, headers=AGENT).get_json()["task"]
+        assert client.post(f"/api/tasks/{t['id']}/send", json={"to": "herdr"}, headers=AGENT).get_json()["ok"]
+        ids.append(t["id"])
+    extra = client.post("/api/tasks", json={"repo": repo["id"], "title": "One too many"}, headers=AGENT).get_json()["task"]
+    r = client.post(f"/api/tasks/{extra['id']}/send", json={"to": "herdr"}, headers=AGENT)
+    assert r.status_code == 400 and "limit" in r.get_json()["error"] and len(f.workspaces) == appmod.AGENT_DISPATCH_LIMIT
+    # a follow-up to a task that is already running is not a new one
+    assert client.post(f"/api/tasks/{ids[0]}/send", json={"to": "herdr", "message": "also this"}, headers=AGENT).get_json()["ok"]
+    # parking never counts, and you are never limited
+    assert client.post(f"/api/tasks/{extra['id']}/send", json={"to": "herdr"}).get_json()["ok"]
+    # when one finishes there is room again
+    client.post(f"/api/tasks/{ids[1]}", json={"status": "done"})
+    more = client.post("/api/tasks", json={"repo": repo["id"], "title": "Now there is room"}, headers=AGENT).get_json()["task"]
+    assert client.post(f"/api/tasks/{more['id']}/send", json={"to": "herdr"}, headers=AGENT).get_json()["ok"]
+    # the switch: off means only you hand tasks to agents; agents can't flip it
+    assert client.post("/api/integrations/settings", json={"agents_dispatch": False}, headers=AGENT).status_code == 403
+    client.post("/api/integrations/settings", json={"agents_dispatch": False})
+    assert client.get("/api/integrations").get_json()["agents_dispatch"] is False
+    last = client.post("/api/tasks", json={"repo": repo["id"], "title": "Refused"}, headers=AGENT).get_json()["task"]
+    r = client.post(f"/api/tasks/{last['id']}/send", json={"to": "herdr"}, headers=AGENT)
+    assert r.status_code == 400 and "switched off" in r.get_json()["error"]
+    assert client.post(f"/api/tasks/{last['id']}/send", json={"to": "herdr"}).get_json()["ok"]
+
+
+def test_the_mcp_tools_for_handing_work_on_exist_and_describe_themselves():
+    import asyncio
+    from upstream_upkeep import mcp_server
+    tools = {t.name: t for t in asyncio.run(mcp_server.server.list_tools())}
+    for name in ("herdr_agents", "send_task", "task_progress", "create_task", "list_tasks", "update_task"):
+        assert name in tools, name
+    props = tools["send_task"].input_schema["properties"]
+    assert set(props) == {"task", "to", "agent_kind", "agent", "machine", "message"} and all(p.get("description") for p in props.values())

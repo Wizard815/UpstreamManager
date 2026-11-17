@@ -2774,7 +2774,15 @@ async function integrationsSetup() {
   })
   const mcpCmd = `hermes mcp add upstream --command upstream-mcp --env UPSTREAM_APP_URL=${location.origin}${BASE}`
   const ef = ints.env_file || {}
-  box.append(el("h4", { style: "margin-top:20px" }, "Connections"),
+  const dispatchIn = el("input", { type: "checkbox", style: "height:auto" }); dispatchIn.checked = ints.agents_dispatch !== false
+  dispatchIn.onchange = async () => {
+    const r = await api(apiUrl("/api/integrations/settings"), { method: "POST", body: JSON.stringify({ agents_dispatch: dispatchIn.checked }) }).catch(e => ({ ok: false, error: e.message }))
+    toast(r.ok === false ? r.error : dispatchIn.checked ? "Agents may hand tasks to other agents" : "Only you hand tasks to agents now", r.ok === false ? "error" : "ok")
+  }
+  box.append(el("h4", { style: "margin-top:20px" }, "Work"),
+    el("label", { class: "row", style: "gap:6px" }, dispatchIn, `Agents (in Hermes Studio, herdr, Claude Code…) may hand tasks to herdr, Studio or Hermes through Upstream Manager`),
+    el("div", { class: "muted small" }, `At most ${ints.agents_dispatch_limit || 5} agent-sent tasks run at once. Each still works on its own branch; you review, commit and approve. Answering an agent's questions stays with you.`),
+    el("h4", { style: "margin-top:20px" }, "Connections"),
     el("div", { class: "muted", style: ef.missing ? "color:var(--bad)" : null }, ef.missing ? `The env file named by UPSTREAM_ENV_FILE isn't there: ${ef.missing}. No connections were read from a file.` : ef.path ? `Reading ${ef.keys.length} setting${ef.keys.length === 1 ? "" : "s"} from ${ef.path}${ef.keys.length ? ` (${ef.keys.join(", ")})` : ""}. What you save below wins over the file.`
       : `Every connection below can also be set in an env file: copy .env.example to .env (${(ef.looked || []).join(" or ")}) and restart. What you save here wins over the file.`),
     el("h4", { style: "margin-top:20px" }, "Hermes"),

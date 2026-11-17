@@ -1728,11 +1728,36 @@ def _task_json(out: dict) -> dict:
     return out
 
 
+AGENT_DISPATCH_LIMIT = 5   # tasks an agent may have running with other agents at once
+
+
+def _agents_may_dispatch() -> bool:
+    """Whether a coding agent (Studio's, a herdr agent, Claude Code...) may hand tasks to herdr, Studio
+    or Hermes through this app. Your switch in Settings; UPSTREAM_AGENT_DISPATCH=off turns it off."""
+    saved = (store.settings().get("work") or {}).get("agents_dispatch")
+    if saved is not None:
+        return bool(saved)
+    return os.environ.get("UPSTREAM_AGENT_DISPATCH", "on").strip().lower() not in ("0", "off", "false", "no")
+
+
 def _send_task(task_id: str, to: str, message=None, opts: dict | None = None) -> dict:
-    if to in ("hermes", "herdr", "studio") and (denied := _user_only("Handing work to a coding agent")):
-        return {"ok": False, "error": denied[0].get_json()["error"]}
+    if to in ("hermes", "herdr", "studio") and _from_agent():
+        if not _agents_may_dispatch():
+            return {"ok": False, "error": "handing work to another agent is switched off for agents (Settings → Work): ask the user to send this task"}
+        t = tasks.get(task_id) or {}
+        already = (t.get("where") or {}).get("type") in ("hermes", "herdr", "studio")
+        running = [x for x in tasks.list_tasks(status="working") if x.get("dispatched_by") == "agent"]
+        if not already and len(running) >= AGENT_DISPATCH_LIMIT:
+            return {"ok": False, "error": f"{len(running)} tasks sent by agents are still running (the limit is {AGENT_DISPATCH_LIMIT}): "
+                                          "wait for one to finish, or ask the user"}
     try:
-        return {"ok": True, **tasks.send_to(task_id, to, message if isinstance(message, str) else None, opts)}
+        out = {"ok": True, **tasks.send_to(task_id, to, message if isinstance(message, str) else None, opts)}
+        if to in ("hermes", "herdr", "studio"):   # who set an agent to work on it, for the task's history and the limit
+            t = tasks.get(task_id)
+            if t is not None and t.get("dispatched_by") != ("agent" if _from_agent() else "user"):
+                t["dispatched_by"] = "agent" if _from_agent() else "user"
+                tasks.update(task_id, note=f"sent to {to} by {'an agent' if _from_agent() else 'you'}")
+        return out
     except (tasks.TaskError, workspaces.WorkspaceError) as e:
         return {"ok": False, "error": str(e)}
     except (hermes.HermesError, herdr.HerdrError, studio.StudioError, orb.OrbError, wiki.WikiError) as e:
@@ -2183,6 +2208,7 @@ def api_integrations():
                                  "missing": config.ENV_MISSING,
                                  "looked": [str(config.PROJECT_ROOT / ".env"), str(config.PROJECT_ROOT / "data" / ".env")]},
                     "suggest": (store.settings().get("work") or {}).get("suggest", "ask"),
+                    "agents_dispatch": _agents_may_dispatch(), "agents_dispatch_limit": AGENT_DISPATCH_LIMIT,
                     "wiki": {"ok": bool(w.get("writer")) or bool(w.get("ok")), "writer": w.get("writer"), "reader": w.get("ok"),
                              "error": w.get("error") or (None if (w.get("writer") or w.get("ok")) else "not set up")}})
 
@@ -2219,8 +2245,13 @@ def api_integrations_settings():
         patch["studio"] = {"enabled": bool(st.get("enabled")), "url": url.rstrip("/") or "http://127.0.0.1:8648",
                            "profile": re.sub(r"[^A-Za-z0-9_.-]", "", str(st.get("profile") or "")),
                            "agent": re.sub(r"[^a-z0-9_-]", "", str(st.get("agent") or ""))}
-    if data.get("suggest") in ("ask", "auto"):
-        patch["work"] = {"suggest": data["suggest"]}
+    if data.get("suggest") in ("ask", "auto") or isinstance(data.get("agents_dispatch"), bool):
+        work = dict(store.settings().get("work") or {})
+        if data.get("suggest") in ("ask", "auto"):
+            work["suggest"] = data["suggest"]
+        if isinstance(data.get("agents_dispatch"), bool):
+            work["agents_dispatch"] = data["agents_dispatch"]
+        patch["work"] = work
     if isinstance(data.get("orb"), dict):
         o = data["orb"]
         url = str(o.get("url") or "").strip()

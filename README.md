@@ -188,6 +188,13 @@ the file, and what you save in Settings wins over both.
   Studio's address is set (`HERMES_STUDIO_URL`); run `herdr integration install hermes` once so
   herdr knows Hermes' sessions.
 
+**Agents can use all of this themselves.** An agent that has this app's MCP tools (Studio's
+Hermes, a herdr agent, Claude Code) can check repos (`list_repos`, `repo_briefing`, `list_commits`,
+`pull_report`), see herdr's agents (`herdr_agents`), write a task down (`create_task`), hand it to
+herdr, Studio or Hermes or park it (`send_task`), and follow it (`task_progress`). At most five
+agent-sent tasks run at once, and Settings → Work switches this off (`UPSTREAM_AGENT_DISPATCH=off`).
+What stays with you: answering an agent's questions, committing, approving and deleting.
+
 **Hermes Studio** (`HERMES_STUDIO_URL`, plus a token or `HERMES_STUDIO_USER`/`HERMES_STUDIO_PASSWORD`)
 and the **Hermes API server** (`HERMES_API_URL`, `HERMES_API_KEY`) can also take a task directly.
 **Pondering Orb** (`ORB_URL`, `UPSTREAM_ORB_TOKEN`) and the **LLM wiki** (`LLMWIKI_MCP_URL`,
