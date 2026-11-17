@@ -165,15 +165,28 @@ memory through the vault's MCP endpoint. It never writes the vault's long-term
 wiki; the vault's own Ingest and Rollover workflows file what it sends.
 
 ```bash
-export LLMWIKI_MCP_URL=http://192.168.20.5:27123/mcp
-export LLMWIKI_API_KEY=...   # the Local REST API key; read from the environment, never stored
+export LLMWIKI_MCP_URL=http://192.168.20.5:27123/family-mcp
+export LLMWIKI_API_KEY=llmw_...   # read from the environment, never stored
 ```
+
+On a family vault (one wiki, a private folder per person), give Upstream
+Manager its own **service token** and the `/family-mcp` endpoint. A service
+writes only to the shared `household/` memory and can't read anyone's private
+notes. Make the token in the vault:
+
+```bash
+node scripts/family-setup.mjs add-service upstream-manager "Upstream Manager"
+node scripts/family-setup.mjs token upstream-manager
+```
+
+A single-user vault uses `/mcp` with the Local REST API key instead; the tool
+calls are the same.
 
 - After each daily check, one line in today's daily note (`memory_log`), for
   example `Upkeep: omi-local fast-forwarded 12; argos request raised (2 conflicts) (upstream-manager)`.
   Nothing is written on a day when nothing moved.
 - When a finished day's repo logs are all written, they go to the vault once
-  as `raw/sources/YYYY-MM-DD - Upstream Manager.md` (`memory_add_source`),
+  as `raw/sources/YYYY-MM-DD - Upstream Manager.md` (`memory_add_source`; `household/raw/sources/` on a family vault),
   one section per repo. A source is never rewritten; a day whose logs failed
   (the model was down) waits for the next pass.
 
