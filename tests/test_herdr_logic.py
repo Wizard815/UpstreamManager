@@ -173,7 +173,7 @@ def test_when_the_agent_is_gone_a_new_one_is_started(client, hd):
     assert a["ok"] is False and a["gone"] and "no longer running" in a["error"]
     assert next(x for x in client.get("/api/tasks").get_json()["items"] if x["id"] == tid)["agent_status"] == "gone"
     r = client.post(f"/api/tasks/{tid}/send", json={"to": "herdr", "message": "carry on"}).get_json()
-    assert r["ok"] and name in f.agents and len(f.workspaces) == 2
+    assert r["ok"] and r["where"]["agent"] == name + "-2" and r["where"]["agent"] in f.agents and len(f.workspaces) == 2
 
 
 def test_finishing_is_noted_and_its_own_workspace_can_be_closed(client, hd):

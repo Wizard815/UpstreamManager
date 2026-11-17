@@ -81,17 +81,36 @@ def remote_path(path: str, machine: str | None) -> str:
     """Where a local folder is on another machine: the same path (a shared mount) unless a map says otherwise."""
     if not machine:
         return path
+    best = None
     for pair in settings()["path_map"].split(","):
         local, _, remote = pair.partition("=")
         local, remote = local.strip().rstrip("/"), remote.strip().rstrip("/")
-        if local and remote and (path == local or path.startswith(local + "/")):
-            return remote + path[len(local):]
-    return path
+        if local and remote and (path == local or path.startswith(local + "/")) and (best is None or len(local) > len(best[0])):
+            best = (local, remote)
+    return best[1] + path[len(best[0]):] if best else path
+
+
+_TARGET = re.compile(r"^([a-z][a-z0-9_-]{0,31}|w\d+:p\d+)$")     # a live agent's name, or the pane it is in
+
+
+def check_target(name) -> str:
+    if not isinstance(name, str) or not _TARGET.fullmatch(name):
+        raise HerdrError("pick an agent by its herdr name (like reviewer) or its pane (like w1:p1)", "invalid_agent_name")
+    return name
+
+
+def check_machine(machine) -> str | None:
+    if machine in (None, ""):
+        return None
+    if not isinstance(machine, str) or machine.startswith("-") or "\0" in machine or len(machine) > 100:
+        raise HerdrError("that isn't one of herdr's saved machines", "invalid_machine")
+    return machine
 
 
 def call(method: str, params: dict | None = None, timeout: float = TIMEOUT, machine: str | None = None) -> dict:
     """One herdr API call: over the local socket, or through herdr's own machine forwarding
     (`herdr --machine <label> ...`, JSON over SSH) when the agent lives on another machine."""
+    machine = check_machine(machine)
     if machine:
         return _cli(machine, method, params or {}, timeout)
     path = socket_path()
@@ -134,7 +153,8 @@ def _argv(method: str, p: dict) -> list[str]:
         return ["agent", "start", p["name"], "--kind", p["kind"], "--pane", p["pane_id"], "--timeout", str(p.get("timeout_ms", 30000)),
                 *(["--", *p["args"]] if p.get("args") else [])]
     if method == "agent.prompt":
-        return ["agent", "prompt", p["target"], p["text"]]
+        text = p["text"]  # the CLI must never read the task's words as one of its own flags
+        return ["agent", "prompt", p["target"], (" " + text) if text.lstrip().startswith("-") else text]
     if method == "agent.get":
         return ["agent", "get", p["target"]]
     if method == "agent.read":
@@ -192,7 +212,7 @@ def status() -> dict:
     if not s["enabled"]:
         return {**out, "ok": False, "error": "off" if not s.get("auto") else f"herdr isn't running here (no socket at {out['socket']})"}
     try:
-        r = call("ping", machine=s["machine"] or None)
+        r = call("ping", machine=s["machine"] or None, timeout=4)
         where = f"on {s['machine']}" if s["machine"] else "on this machine"
         return {**out, "ok": True, "version": r.get("version"), "where": where, "machines": [m for m in machines() if m["enabled"]]}
     except HerdrError as e:
@@ -226,16 +246,18 @@ def all_agents() -> tuple[list[dict], dict]:
     return out, errors
 
 
-def agent_name(title: str, task_id: str) -> str:
-    """A name a person can read in herdr's sidebar, unique per task: fix-the-parser-8f2a."""
-    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:26].strip("-") or "task"
+def agent_name(title: str, task_id: str, attempt: int = 1) -> str:
+    """A name a person can read in herdr's sidebar, unique per task: fix-the-parser-8f2a
+    (and fix-the-parser-8f2a-2 for the task's second agent)."""
+    tail = f"-{task_id[:4].lower()}" + (f"-{attempt}" if attempt > 1 else "")
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[: 31 - len(tail)].strip("-") or "task"
     if not slug[0].isalpha():
-        slug = "t-" + slug[:24]
-    return f"{slug}-{task_id[:4].lower()}"[:32]
+        slug = ("t-" + slug)[: 31 - len(tail)].strip("-")
+    return slug + tail
 
 
 def start(task_id: str, title: str, workdir: str, prompt: str, kind: str | None = None, env: dict | None = None,
-          machine: str | None = None) -> dict:
+          machine: str | None = None, attempt: int = 1) -> dict:
     """Open a herdr workspace in the task's folder and start an agent there. The task is prompted once
     the agent is ready; if it comes up blocked (a trust dialog, a login), the prompt is kept for later."""
     s = settings()
@@ -253,9 +275,10 @@ def start(task_id: str, title: str, workdir: str, prompt: str, kind: str | None 
     wid = (ws.get("workspace") or {}).get("workspace_id")
     if not pane:
         raise HerdrError("herdr made no pane for the workspace")
-    name = agent_name(title, task_id)
+    name = agent_name(title, task_id, attempt)
     args = [a for a in s["args"].split() if a] if s["args"] else []
-    out = {"agent": name, "kind": kind, "workspace_id": wid, "pane_id": pane, "ours": True, "pending": None, "machine": machine or ""}
+    out = {"agent": name, "kind": kind, "workspace_id": wid, "pane_id": pane, "ours": True, "pending": None, "machine": machine or "",
+           "attempt": attempt}
     try:
         C("agent.start", {"name": name, "kind": kind, "pane_id": pane, **({"args": args} if args else {}), "timeout_ms": 120000}, timeout=150)
     except HerdrError as e:
@@ -276,12 +299,14 @@ def start(task_id: str, title: str, workdir: str, prompt: str, kind: str | None 
 
 
 def prompt(name: str, text: str, machine: str | None = None) -> None:
+    check_target(name)
     call("agent.prompt", {"target": name, "text": text}, machine=machine or None)
 
 
 def agent(name: str, machine: str | None = None) -> dict:
     """{status, output, session...}: what the agent is doing and its recent screen."""
     machine = machine or None
+    check_target(name)
     info = _info(call("agent.get", {"target": name}, machine=machine).get("agent") or {})
     try:
         text = (call("agent.read", {"target": name, "source": "recent-unwrapped", "lines": 200}, machine=machine).get("read") or {}).get("text", "")
@@ -295,8 +320,9 @@ _KEY = re.compile(r"^(enter|esc|tab|up|down|left|right|backspace|space|ctrl\+[a-
 
 def send_keys(name: str, keys: list[str], machine: str | None = None) -> None:
     """Answer an agent's dialog (or interrupt it) with logical keys: enter, esc, y, 1, ctrl+c..."""
-    if not keys or len(keys) > 20 or not all(isinstance(k, str) and _KEY.fullmatch(k) for k in keys):
-        raise HerdrError("keys are names like enter, esc, y, 1 or ctrl+c")
+    if not isinstance(keys, list) or not keys or len(keys) > 20 or not all(isinstance(k, str) and _KEY.fullmatch(k) for k in keys):
+        raise HerdrError("keys are a list of names like enter, esc, y, 1 or ctrl+c")
+    check_target(name)
     call("agent.send_keys", {"target": name, "keys": keys}, machine=machine or None)
 
 

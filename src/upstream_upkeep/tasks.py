@@ -298,7 +298,8 @@ def send_to(task_id: str, to: str, message: str | None = None, opts: dict | None
                     first = first.replace(workdir, herdr.remote_path(workdir, m))
                 herdr.prompt(opts["agent"], first, m)
                 kind = next((a["kind"] for a in herdr.agents(m or None) if a["name"] == opts["agent"]), None)
-                where = {"type": "herdr", "agent": opts["agent"], "kind": kind, "ours": False, "pending": None, "machine": m or ""}
+                where = {"type": "herdr", "agent": opts["agent"], "kind": kind, "ours": False, "pending": None, "machine": m or "",
+                         "attempt": int(prev.get("attempt") or 0) if prev.get("type") == "herdr" else 0}
             elif prev.get("type") == "herdr" and prev.get("agent") and not opts.get("kind") and machine in (None, prev.get("machine", "")):
                 try:
                     herdr.prompt(prev["agent"], text, prev.get("machine"))
@@ -312,7 +313,8 @@ def send_to(task_id: str, to: str, message: str | None = None, opts: dict | None
                 m = machine if machine is not None else herdr.settings()["machine"]
                 if m:
                     first = first.replace(workdir, herdr.remote_path(workdir, m))
-                info = herdr.start(task_id, task["title"], workdir, first, kind=opts.get("kind"), env=env, machine=m)
+                info = herdr.start(task_id, task["title"], workdir, first, kind=opts.get("kind"), env=env, machine=m,
+                                   attempt=int(prev.get("attempt") or 0) + 1 if prev.get("type") == "herdr" else 1)
                 where = {"type": "herdr", **info}
             where = {**where, "workspace": ws and ws["name"], "workdir": workdir}
         else:
