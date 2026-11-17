@@ -1,7 +1,64 @@
 # UpstreamManager
 Upstreams and Branches, Manage it all and have a IDE and chat to work along with it
 
-## Run
+## Install
+
+Two ways; both read their settings from `.env` (see `.env.example`).
+
+### On the machine itself (recommended)
+
+```bash
+git clone https://github.com/Wizard815/UpstreamManager && cd UpstreamManager
+scripts/install.sh            # add --system for a system-wide service, --port N for another port
+```
+
+The script installs the dependencies (and `uv` if it is missing), writes `.env` with what it
+finds on the machine (herdr's socket, Hermes Studio, the Hermes gateway and its key), installs a
+systemd service on **port 5001**, starts it and shows what it connected to. Run it again any time:
+an existing `.env` is never changed. Afterwards:
+
+```bash
+systemctl --user status upstream-manager     # or restart / stop; logs: journalctl --user -u upstream-manager -f
+```
+
+This is the better fit when herdr runs on the same machine: Upstream Manager, herdr and your repos
+then see the same folders as the same user, with nothing to map.
+
+### With Docker
+
+```bash
+cp .env.example .env          # set REPOS_DIR (the folder that holds your repos); see the Docker lines at the end
+docker compose up -d --build
+```
+
+The container shares the host's network and mounts your repos, its data folder and herdr's socket
+folder **at the same paths they have on the host**, because agents are told where a task's branch
+folder is. Set `UPSTREAM_UID`/`UPSTREAM_GID` to your own ids (`id -u`, `id -g`) so files stay
+yours. Two things differ from the native install: demo stacks (the Stack tab) need Docker inside
+the container and are not available, and other machines through `herdr --machine` need the herdr
+command, which the image does not carry. If Docker Hub rate-limits the build, set
+`PYTHON_IMAGE=mirror.gcr.io/library/python:3.13-slim-bookworm`.
+
+### Inside Hermes Studio
+
+Studio has an **Upstream** tab that shows this app. It looks for it at `http://127.0.0.1:5001`,
+which is where both installs put it, so on one machine there is nothing to set. Otherwise start
+Studio with `UPSTREAM_UPKEEP_TARGET=http://host:port`; if Studio runs in a container, also list
+the address it calls from in `UPSTREAM_TRUSTED_PROXIES` and let this app listen there (`HOST`).
+Studio checks that you are its administrator before it forwards anything.
+
+For agents, set in `.env` (the install script fills in what it finds):
+
+| What | Setting | Then |
+|---|---|---|
+| herdr on this machine | nothing | tasks start agents (Claude Code, Codex, Hermes...) in herdr |
+| Hermes Studio | `HERMES_STUDIO_URL`, and a token or `HERMES_STUDIO_USER`/`HERMES_STUDIO_PASSWORD` | "Send to Hermes Studio", and Hermes agents link to their Studio session |
+| Hermes gateway | `HERMES_API_URL` (8642), `HERMES_API_KEY` (Hermes' `API_SERVER_KEY`) | "Hand to Hermes"; its sessions show in Studio's history |
+
+Give Hermes this app's tools once, so its agents can read repos and hand changes back for approval:
+`hermes mcp add upstream --command /path/to/UpstreamManager/.venv/bin/upstream-mcp --env UPSTREAM_APP_URL=http://127.0.0.1:5001`.
+
+### For development
 
 ```bash
 uv sync

@@ -101,7 +101,8 @@ def instructions(repo: dict, workdir: str, mcp: bool = True) -> str:
 
 def start(title: str, system_prompt: str) -> str:
     s = settings()
-    body = {"title": title[:120], "system_prompt": system_prompt, "source": "upstream-manager"}
+    # "api_server" is the source Hermes Studio lists in its history, so the session shows up there too.
+    body = {"title": f"⇅ {title}"[:120], "system_prompt": system_prompt, "source": os.environ.get("HERMES_SESSION_SOURCE", "api_server")}
     if s["model"]:
         body["model"] = s["model"]
     res = _req("POST", "/api/sessions", json=body)

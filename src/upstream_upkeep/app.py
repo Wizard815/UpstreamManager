@@ -69,6 +69,32 @@ def _host_ok(host: str) -> bool:
     return name in (me, me.split(".")[0], me.split(".")[0] + ".local")
 
 
+_TRUSTED_PROXIES = [x.strip() for x in os.environ.get("UPSTREAM_TRUSTED_PROXIES", "").split(",") if x.strip()]
+
+
+def _via_trusted_proxy() -> bool:
+    """A request Hermes Studio's /upstream proxy forwarded: it carries X-Upstream-Base (a header a web
+    page can't add cross-site without a preflight this app never approves) and comes from this machine,
+    or from an address listed in UPSTREAM_TRUSTED_PROXIES (Studio in a container). Studio has already
+    checked that the person is its administrator; the browser's Origin is then Studio's own address."""
+    if not request.headers.get("X-Upstream-Base"):
+        return False
+    import ipaddress
+    try:
+        peer = ipaddress.ip_address(request.remote_addr or "")
+    except ValueError:
+        return False
+    if peer.is_loopback:
+        return True
+    for entry in _TRUSTED_PROXIES:
+        try:
+            if peer in ipaddress.ip_network(entry, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _from_agent() -> bool:
     """A request the MCP server made for a coding agent (it says so in a header)."""
     return request.headers.get("X-Upstream-Client") == "agent"
@@ -115,7 +141,7 @@ def _refuse_cross_site_writes():
     if request.mimetype != "application/json" and not upload:
         return jsonify({"ok": False, "error": "send requests as application/json"}), 415
     origin = request.headers.get("Origin")
-    if origin and origin != "null":
+    if origin and origin != "null" and not _via_trusted_proxy():
         allowed = {request.host, request.headers.get("X-Forwarded-Host", "")} | _ALLOWED_HOSTS
         if urlparse(origin).netloc not in allowed:
             return jsonify({"ok": False, "error": "cross-site request refused"}), 403
@@ -2158,7 +2184,7 @@ def api_integrations():
                                  "looked": [str(config.PROJECT_ROOT / ".env"), str(config.PROJECT_ROOT / "data" / ".env")]},
                     "suggest": (store.settings().get("work") or {}).get("suggest", "ask"),
                     "wiki": {"ok": bool(w.get("writer")) or bool(w.get("ok")), "writer": w.get("writer"), "reader": w.get("ok"),
-                             "error": w.get("error")}})
+                             "error": w.get("error") or (None if (w.get("writer") or w.get("ok")) else "not set up")}})
 
 
 @flask_app.route("/api/integrations/settings", methods=["POST"])

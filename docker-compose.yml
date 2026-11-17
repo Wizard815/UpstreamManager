@@ -1,0 +1,36 @@
+# Upstream Manager with Docker:
+#
+#   cp .env.example .env        # then set at least REPOS_DIR (see "Docker" at the end of that file)
+#   docker compose up -d --build
+#
+# It shares the host's network, so it finds Hermes Studio, the Hermes gateway and Pondering Orb on
+# 127.0.0.1 exactly as a normal install does, and Studio's Upstream tab finds it on 127.0.0.1:5001.
+# Folders are mounted at the SAME path they have on the host: a coding agent (herdr, Hermes, Studio)
+# is told where a task's branch folder is, and that path must mean the same thing for both.
+services:
+  upstream-manager:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.13-slim-bookworm}
+    image: upstream-manager:local
+    container_name: upstream-manager
+    network_mode: host
+    user: "${UPSTREAM_UID:-1000}:${UPSTREAM_GID:-1000}"
+    env_file: .env
+    environment:
+      HOME: ${UPSTREAM_DATA_DIR:-${HOME}/.local/share/upstream-manager}
+      UPSTREAM_STATE_FILE: ${UPSTREAM_DATA_DIR:-${HOME}/.local/share/upstream-manager}/state.json
+      # herdr on the host: its socket folder is mounted below, at its usual place
+      HERDR_SOCKET_PATH: ${HERDR_SOCKET_PATH:-${HOME}/.config/herdr/herdr.sock}
+    volumes:
+      # the app's own data: settings, memory, task branches, the reference library
+      - ${UPSTREAM_DATA_DIR:-${HOME}/.local/share/upstream-manager}:${UPSTREAM_DATA_DIR:-${HOME}/.local/share/upstream-manager}
+      # your repos, where they already are
+      - ${REPOS_DIR:?set REPOS_DIR in .env to the folder that holds your git repos}:${REPOS_DIR}
+      # herdr's socket (created empty if herdr isn't installed; harmless)
+      - ${HERDR_DIR:-${HOME}/.config/herdr}:${HERDR_DIR:-${HOME}/.config/herdr}
+      # Optional, uncomment what you have: your git identity, and SSH keys for git@ remotes (read-only)
+      # - ${HOME}/.gitconfig:${UPSTREAM_DATA_DIR:-${HOME}/.local/share/upstream-manager}/.gitconfig:ro
+      # - ${HOME}/.ssh:${UPSTREAM_DATA_DIR:-${HOME}/.local/share/upstream-manager}/.ssh:ro
+    restart: unless-stopped

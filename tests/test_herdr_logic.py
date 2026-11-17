@@ -10,6 +10,10 @@ import pytest
 from upstream_upkeep import config, herdr, registry, store, tasks
 
 
+class HerdrSays(Exception):
+    """An error the real herdr would answer with (its code)."""
+
+
 class FakeHerdr:
     """A herdr server that behaves like the real one where it matters: it refuses to prompt a blocked
     agent, starts some agents blocked (a trust dialog), and knows each agent's own session."""
@@ -17,6 +21,7 @@ class FakeHerdr:
     def __init__(self):
         self.path = os.path.join(tempfile.mkdtemp(prefix="hd"), "h.sock")
         self.calls, self.agents, self.workspaces, self.block_on_start = [], {}, {}, False
+        self.next_ws = 1          # ids are never reused, as in herdr
         self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.srv.bind(self.path)
         self.srv.listen(8)
@@ -30,28 +35,34 @@ class FakeHerdr:
         if m == "ping":
             return {"type": "pong", "version": "0.9", "protocol": 1}
         if m == "workspace.create":
-            wid = f"w{len(self.workspaces) + 1}"
+            while f"w{self.next_ws}" in self.workspaces:
+                self.next_ws += 1
+            wid = f"w{self.next_ws}"
+            self.next_ws += 1
             self.workspaces[wid] = p
             return {"type": "workspace_created", "workspace": {"workspace_id": wid}, "tab": {}, "root_pane": {"pane_id": f"{wid}:p1"}}
         if m == "workspace.close":
-            self.workspaces.pop(p["workspace_id"])
+            if self.workspaces.pop(p["workspace_id"], None) is None:
+                raise HerdrSays("workspace_not_found")
             return {"type": "ok"}
         if m == "agent.start":
+            if p["pane_id"].split(":")[0] not in self.workspaces:
+                raise HerdrSays("pane_not_found")
             cwd = self.workspaces[p["pane_id"].split(":")[0]]["cwd"]
             self.agents[p["name"]] = {"name": p["name"], "kind": p["kind"], "pane": p["pane_id"], "cwd": cwd, "prompts": [], "keys": [],
                                       "status": "blocked" if self.block_on_start else "idle",
                                       "session": "20261117_abc123" if p["kind"] == "hermes" else None}
             if self.block_on_start:
-                raise KeyError("agent_not_ready")
+                raise HerdrSays("agent_not_ready")
             return {"type": "agent_started", "agent": self.info(self.agents[p["name"]]), "argv": [p["kind"]]}
         if m == "agent.list":
             return {"type": "agent_list", "agents": [self.info(a) for a in self.agents.values()]}
         a = self.agents.get(p.get("target"))
         if a is None:
-            raise KeyError("agent_not_found")
+            raise HerdrSays("agent_not_found")
         if m == "agent.prompt":
             if a["status"] == "blocked":
-                raise KeyError("agent_blocked")
+                raise HerdrSays("agent_blocked")
             a["prompts"].append(p["text"])
             a["status"] = "working"
             return {"type": "agent_prompted", "agent": self.info(a)}
@@ -63,7 +74,7 @@ class FakeHerdr:
             return {"type": "agent_info", "agent": self.info(a)}
         if m == "agent.read":
             return {"type": "pane_read", "read": {"text": "Do you trust the files in this folder? (y/n)" if a["status"] == "blocked" else "working…"}}
-        raise KeyError("unknown_method")
+        raise HerdrSays("unknown_method")
 
     def serve(self):
         while True:
@@ -72,13 +83,19 @@ class FakeHerdr:
             except OSError:
                 return
             with c:
-                req = json.loads(c.makefile().readline())
-                self.calls.append(req)
                 try:
+                    req = json.loads(c.makefile().readline())
+                    self.calls.append(req)
                     out = {"id": req["id"], "result": self.handle(req["method"], req["params"])}
-                except KeyError as e:
+                except HerdrSays as e:
                     out = {"id": req["id"], "error": {"code": e.args[0], "message": e.args[0].replace("_", " ")}}
-                c.sendall((json.dumps(out) + "\n").encode())
+                except Exception as e:  # a bug in this fake, or a broken request: say exactly what, never pose as herdr
+                    import traceback
+                    out = {"id": "?", "error": {"code": "fake_bug", "message": f"{type(e).__name__}: {e} | {traceback.format_exc()[-400:]}"}}
+                try:
+                    c.sendall((json.dumps(out) + "\n").encode())
+                except OSError:
+                    pass
 
 
 @pytest.fixture
