@@ -2100,11 +2100,12 @@ function herdrPicker(ints, current) {
       ...places.map(m => el("optgroup", { label: `Start a new agent ${here(m)}`.trim() }, ...(h.kinds || [h.kind || "claude"]).map(k =>
         el("option", { value: `new:${m}:${k}` }, `new ${k}${m ? ` on ${m}` : ""}${k === h.kind && m === (h.machine || "") ? " (default)" : ""}`)))),
       live.length ? el("optgroup", { label: "Give it to a running agent" }, ...live.filter(a => a.name).map(a =>
-        el("option", { value: `agent:${a.machine || ""}:${a.name}` }, `${a.name} · ${a.kind || "agent"} · ${a.status}${a.machine ? ` · on ${a.machine}` : ""}${a.task ? ` · on “${a.task.title.slice(0, 30)}”` : ""}`))) : el("optgroup", { label: "No agents running in herdr yet" }))
+        el("option", { value: `agent:${a.machine || ""}:${a.name}` }, `${a.name} · ${a.kind || "agent"} · ${a.status}${a.machine ? ` · on ${a.machine}` : ""}${a.task ? ` · on “${a.task.title.slice(0, 30)}”` : ""}`))) : el("optgroup", { label: loaded ? "No other agents are running in herdr" : "Looking for running agents…" }))
     sel.value = [...sel.options].some(o => o.value === keep) ? keep : dflt
   }
+  let loaded = !h.ok
   fill([])
-  if (h.ok) api(apiUrl("/api/herdr/agents")).then(r => fill((r.items || []).filter(a => a.name !== current))).catch(() => {})
+  if (h.ok) api(apiUrl("/api/herdr/agents")).then(r => { loaded = true; fill((r.items || []).filter(a => a.name !== current)) }).catch(() => { loaded = true; fill([]) })
   const row = el("label", { class: "row small muted", style: "gap:6px;align-items:center", hidden: h.ok ? null : "" }, "herdr agent:", sel)
   return { row, value: () => { const [what, machine, ...rest] = sel.value.split(":"); const name = rest.join(":")
     return what === "agent" ? { agent: name, machine } : { agent_kind: name, machine } } }
