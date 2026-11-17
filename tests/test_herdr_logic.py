@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from upstream_upkeep import herdr, registry, store, tasks
+from upstream_upkeep import config, herdr, registry, store, tasks
 
 
 class FakeHerdr:
@@ -202,3 +202,124 @@ def test_a_failed_start_leaves_no_empty_workspace(client, hd):
     f, repo = hd
     t = new_task(client, repo, to="herdr", agent_kind="Bad Kind")
     assert not t["ok"] and f.workspaces == {}
+
+
+# ---------------------------------------------------------------- one box, or another machine
+def test_on_the_same_box_herdr_is_found_without_any_setting(client, repos, monkeypatch):
+    f = FakeHerdr()
+    monkeypatch.setenv("HERDR_SOCKET_PATH", f.path)
+    st = client.get("/api/integrations").get_json()["herdr"]
+    assert st["ok"] and st["auto"] and st["where"] == "on this machine"
+    monkeypatch.setenv("HERDR_SOCKET_PATH", "/nonexistent/herdr.sock")
+    st = client.get("/api/integrations").get_json()["herdr"]
+    assert st["ok"] is False and st["enabled"] is False and "isn't running here" in st["error"]
+    monkeypatch.setenv("UPSTREAM_HERDR", "off")
+    monkeypatch.setenv("HERDR_SOCKET_PATH", f.path)
+    assert client.get("/api/integrations").get_json()["herdr"]["enabled"] is False
+    f.srv.close()
+
+
+@pytest.fixture
+def remote(client, repos, tmp_path, monkeypatch):
+    """Another machine: a `herdr` command that forwards `--machine workbox ...` to a second herdr."""
+    far = FakeHerdr()
+    log = tmp_path / "cli.log"
+    exe = tmp_path / "herdr"
+    exe.write_text(f'''#!/usr/bin/env python3
+import json, socket, sys
+a = sys.argv[1:]
+open({str(log)!r}, "a").write(json.dumps(a) + "\\n")
+if a[:3] == ["machine", "list", "--json"]:
+    print(json.dumps([{{"id": "m1", "label": "workbox", "target": "ssh://workbox", "session": "default", "enabled": True, "selected": False}},
+                      {{"id": "m2", "label": "old", "target": "ssh://old", "session": "default", "enabled": False, "selected": False}}])); sys.exit(0)
+assert a[0] == "--machine" and a[1] == "workbox", a
+c = a[2:]
+def opt(name, default=None):
+    return c[c.index(name) + 1] if name in c else default
+if c[:2] == ["agent", "list"]: m, p = "agent.list", {{}}
+elif c[:2] == ["workspace", "create"]:
+    m, p = "workspace.create", {{"cwd": opt("--cwd"), "label": opt("--label"), "focus": False,
+                                "env": dict(x.split("=", 1) for i, x in enumerate(c) if i and c[i - 1] == "--env")}}
+elif c[:2] == ["workspace", "close"]: m, p = "workspace.close", {{"workspace_id": c[2]}}
+elif c[:2] == ["agent", "start"]: m, p = "agent.start", {{"name": c[2], "kind": opt("--kind"), "pane_id": opt("--pane")}}
+elif c[:2] == ["agent", "prompt"]: m, p = "agent.prompt", {{"target": c[2], "text": c[3]}}
+elif c[:2] == ["agent", "get"]: m, p = "agent.get", {{"target": c[2]}}
+elif c[:2] == ["agent", "read"]: m, p = "agent.read", {{"target": c[2]}}
+elif c[:2] == ["agent", "send-keys"]: m, p = "agent.send_keys", {{"target": c[2], "keys": c[3:]}}
+else: sys.exit(2)
+s = socket.socket(socket.AF_UNIX); s.connect({far.path!r}); s.sendall((json.dumps({{"id": "x", "method": m, "params": p}}) + "\\n").encode())
+r = json.loads(s.makefile().readline())
+if r.get("error"):
+    print(json.dumps(r), file=sys.stderr); sys.exit(1)
+print(r["result"]["read"]["text"] if m == "agent.read" else json.dumps(r), end="")
+''')
+    exe.chmod(0o755)
+    near = FakeHerdr()
+    up, mine = repos
+    repo = registry.add_repo(str(mine), None, "mine")
+    client.post("/api/integrations/settings", json={"herdr": {"enabled": True, "socket": near.path, "kind": "claude",
+                                                              "path_map": f"{config.CONFIG_PATH.parent}=/srv/far"}})
+    monkeypatch.setenv("UPSTREAM_HERDR_BIN", str(exe))
+    yield near, far, repo, tmp_path
+    near.srv.close()
+    far.srv.close()
+
+
+def test_another_machine_is_reached_through_herdr_itself(client, remote):
+    near, far, repo, tmp = remote
+    st = client.get("/api/integrations").get_json()["herdr"]
+    assert [m["label"] for m in st["machines"]] == ["workbox"]          # the disabled one is left out
+    far.workspaces["w9"] = {"cwd": "/x"}
+    far.agents["builder"] = {"name": "builder", "kind": "codex", "pane": "w9:p1", "cwd": "/x", "prompts": [], "keys": [], "status": "idle"}
+    roster = client.get("/api/herdr/agents").get_json()["items"]
+    assert [(a["machine"], a["name"]) for a in roster] == [("workbox", "builder")]
+    # a new agent over there: the folder is named as that machine sees it
+    t = new_task(client, repo, to="herdr", machine="workbox", agent_kind="hermes")
+    assert t["ok"], t
+    w = t["where"]
+    assert w["machine"] == "workbox" and near.workspaces == {} and len(far.workspaces) == 2
+    made = far.workspaces[w["workspace_id"]]
+    assert made["cwd"].startswith("/srv/far/") and made["env"]["UPSTREAM_TASK_ID"] == t["task"]["id"]
+    assert "/srv/far/" in far.agents[w["agent"]]["prompts"][0] and str(config.CONFIG_PATH.parent) not in far.agents[w["agent"]]["prompts"][0]
+    # following, answering and closing all go to that machine
+    a = client.get(f"/api/tasks/{t['task']['id']}/agent").get_json()
+    assert a["ok"] and a["machine"] == "workbox" and a["status"] == "working" and a["output"] == "working…"
+    assert client.post(f"/api/tasks/{t['task']['id']}/keys", json={"keys": ["esc"]}).get_json()["ok"]
+    assert far.agents[w["agent"]]["keys"] == ["esc"]
+    assert client.post(f"/api/tasks/{t['task']['id']}/herdr/close", json={}).get_json()["ok"] and w["workspace_id"] not in far.workspaces
+    # this machine still works beside it
+    t2 = new_task(client, repo, title="Local one", to="herdr", machine="")
+    assert t2["ok"] and t2["where"]["machine"] == "" and len(near.workspaces) == 1
+    # a running agent over there
+    t3 = new_task(client, repo, title="For builder", to="herdr", machine="workbox", agent="builder")
+    assert t3["ok"] and "/srv/far/" in far.agents["builder"]["prompts"][0]
+
+
+def test_a_remote_error_keeps_herdrs_reason(client, remote):
+    near, far, repo, tmp = remote
+    far.block_on_start = True
+    t = new_task(client, repo, to="herdr", machine="workbox")
+    assert t["ok"] and t["where"]["pending"]          # blocked over there too: the task waits
+    bad = new_task(client, repo, title="x", to="herdr", machine="workbox", agent="nobody")
+    assert not bad["ok"] and "agent not found" in bad["error"] and "workbox" in bad["error"]
+
+
+def test_the_env_file_sets_connections_and_real_env_wins(tmp_path, monkeypatch):
+    from upstream_upkeep import config, hermes, orb, studio
+    f = tmp_path / ".env"
+    f.write_text('# comment\nexport HERMES_STUDIO_URL="http://studio.box:8648"\nORB_URL=http://orb.box:8095  # inline note\n'
+                 "HERMES_API_KEY='k1'\nUPSTREAM_HERDR_KIND=codex\nBAD LINE\nORB_TASK_LIST=Upstream\nPATH=/nope\n")
+    for k in ("HERMES_STUDIO_URL", "ORB_URL", "HERMES_API_KEY", "UPSTREAM_HERDR_KIND", "ORB_TASK_LIST"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("ORB_TASK_LIST", "FromRealEnv")
+    keys = config.load_env_file(f)
+    try:
+        assert "PATH" not in keys and "ORB_TASK_LIST" not in keys and os.environ["PATH"] != "/nope"
+        assert studio.settings()["url"] == "http://studio.box:8648" and studio.settings()["enabled"] is True
+        assert orb.settings()["url"] == "http://orb.box:8095" and orb.settings()["list"] == "FromRealEnv"
+        assert hermes._key() == "k1" and herdr.settings()["kind"] == "codex"
+        store.save_settings({"studio": {"enabled": True, "url": "http://saved:1"}})   # what you save in Settings wins
+        assert studio.settings()["url"] == "http://saved:1"
+    finally:
+        for k in keys:
+            os.environ.pop(k, None)

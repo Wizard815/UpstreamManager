@@ -14,3 +14,6 @@ data/
 
 # Stray/duplicate scratch dir
 Uptium/
+
+# connections and keys (see .env.example)
+.env

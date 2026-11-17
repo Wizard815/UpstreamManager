@@ -14,6 +14,13 @@ from . import credentials, store
 TIMEOUT = 15
 
 
+def _why(e: Exception) -> str:
+    """A network error in a few words."""
+    t = str(e)
+    return ("nothing is listening there (is it running?)" if "Connection refused" in t else "timed out" if "timed out" in t.lower()
+            else "that name doesn't resolve" if "resolve" in t or "Name or service" in t else type(e).__name__)
+
+
 class OrbError(Exception):
     pass
 
@@ -21,7 +28,7 @@ class OrbError(Exception):
 def settings() -> dict:
     s = dict(store.settings().get("orb") or {})
     s.setdefault("url", os.environ.get("ORB_URL", "").strip())
-    s.setdefault("list", "Inbox")
+    s.setdefault("list", os.environ.get("ORB_TASK_LIST", "").strip() or "Inbox")
     return s
 
 
@@ -56,7 +63,7 @@ def add_task(title: str, notes: str, priority: int = 0, task_list: str | None = 
     try:
         r = requests.post(base + "/api/c/tasks", json=body, headers=_headers(), timeout=TIMEOUT)
     except requests.RequestException as e:
-        raise OrbError(f"can't reach Pondering Orb at {base}: {e}") from e
+        raise OrbError(f"can't reach Pondering Orb at {base} ({_why(e)})") from e
     if r.status_code in (401, 403):
         raise OrbError("Pondering Orb refused the request: save an Orb API token under Accounts")
     if r.status_code >= 400:
