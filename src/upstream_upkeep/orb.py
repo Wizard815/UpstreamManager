@@ -44,7 +44,7 @@ def status() -> dict:
         r.raise_for_status()
         return {**out, "ok": True}
     except requests.RequestException as e:
-        return {**out, "ok": False, "error": f"can't reach Orb: {e}"}
+        return {**out, "ok": False, "error": f"can't reach Pondering Orb at {s['url']} ({_why(e)})"}
 
 
 def _headers() -> dict:
