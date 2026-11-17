@@ -232,6 +232,8 @@ async function renderRepos() {
     for (const c of r.components || []) status.append(componentBadge(c))
     const tr = el("tr", { class: "click", onclick: (e) => { if (!e.target.closest("a")) route(`/repo/${r.id}`) } },
       el("td", {}, el("a", { href: `${BASE}/repo/${r.id}`, style: "font-weight:600;color:var(--text);text-decoration:none" }, r.name || r.id),
+        r.integration?.state && r.integration.state !== "none" ? el("a", { href: `${BASE}/integrations`, style: "margin-left:6px;text-decoration:none", title: r.integration.note || "" },
+          badge(MARK_CLS[r.integration.state], { integrated: "integrated", partial: "partly integrated", planned: "to integrate" }[r.integration.state])) : null,
         el("div", { class: "muted small" }, `${r.focus_branch || ""} · ${r.path}`)),
       el("td", { class: "muted" }, ups(r).map(u => `${u.name}/${u.branch}`).join(", ") || "-"),
       el("td", {}, status),
@@ -2752,6 +2754,99 @@ async function renderReferences() {
   await drawRight()
 }
 
+// ------------------------------------------------------------------ Integrations
+// What this setup is connected to and whether it works, your other containers, and how far each
+// repo is integrated. This app's own record: nothing is written to the wiki or GitHub. See services.py.
+const MARK_CLS = { integrated: "up", partial: "warn", planned: "info", none: "", "": "" }
+async function renderIntegrations() {
+  const main = $("#content")
+  main.replaceChildren(el("h1", { class: "page" }, "Integrations"), loading("Checking each connection…"))
+  const r = await api(apiUrl("/api/services")).catch(e => ({ ok: false, error: e.message }))
+  if (!r.ok) return main.replaceChildren(el("h1", { class: "page" }, "Integrations"), el("p", { class: "muted" }, r.error))
+  const works = (st) => !st ? el("span", { class: "muted" }, "-") : st.ok
+    ? badge("up", "works", st.ms != null ? `${st.ms} ms` : "") : badge(st.error === "off" ? "" : "bad", st.error === "off" ? "off" : "not working", st.error || "")
+  const repoLink = (id, name) => id ? el("a", { href: `${BASE}/repo/${encodeURIComponent(id)}` }, name || id) : el("span", { class: "muted" }, name ? `${name} (not tracked)` : "-")
+  // 1. connections and services
+  const svcBody = el("tbody")
+  for (const s of r.services) {
+    const st = s.status || {}
+    svcBody.append(el("tr", {},
+      el("td", {}, el("strong", {}, s.name), el("div", { class: "muted small" }, s.kind === "builtin" ? s.does : [s.container ? `container ${s.container}` : "", s.notes].filter(Boolean).join(" · "))),
+      el("td", {}, repoLink(s.repo, s.repo_name)),
+      el("td", {}, works(st), st.ok || !st.error || st.error === "off" ? null : el("div", { class: "muted small" }, st.error)),
+      el("td", { class: "small", style: "word-break:break-all" }, s.kind === "builtin" ? (s.address || "") : `${s.url}${s.health || ""}`),
+      el("td", {}, s.kind === "builtin" ? el("a", { class: "btn ghost small", href: `${BASE}/settings#connections` }, "Settings")
+        : el("div", { class: "row", style: "gap:4px" }, el("button", { class: "btn ghost small", onclick: () => serviceDialog(s, r.repos) }, "Edit"),
+            el("button", { class: "btn ghost small danger", onclick: async () => { if (!confirm(`Stop tracking ${s.name}? (The container itself is not touched.)`)) return
+              const x = await api(apiUrl("/api/services/delete"), { method: "POST", body: JSON.stringify({ id: s.id }) }).catch(e => ({ ok: false, error: e.message }))
+              if (!x.ok) return toast(x.error, "error"); renderIntegrations() } }, "Remove")))))
+  }
+  const addBtn = el("button", { class: "btn small", onclick: () => serviceDialog(null, r.repos) }, "+ Add a service")
+  const findBtn = el("button", { class: "btn ghost small" }, "Find running containers")
+  const found = el("div")
+  findBtn.onclick = () => busy(findBtn, "Looking…", async () => {
+    const c = await api(apiUrl("/api/services/containers")).catch(e => ({ available: false, why: e.message, items: [] }))
+    if (!c.available) return found.replaceChildren(el("p", { class: "muted small" }, `Can't list containers: ${c.why}. Add them by address instead.`))
+    found.replaceChildren(el("div", { class: "table-box" }, el("table", { class: "list" },
+      el("thead", {}, el("tr", {}, el("th", {}, "Container"), el("th", {}, "Image"), el("th", {}, "Ports"), el("th", {}, ""))),
+      el("tbody", {}, ...c.items.map(x => el("tr", {}, el("td", {}, x.name, el("div", { class: "muted small" }, x.status)), el("td", { class: "small" }, x.image),
+        el("td", { class: "small" }, x.ports.join(", ") || "none published"),
+        el("td", {}, x.added ? el("span", { class: "muted small" }, "added") : el("button", { class: "btn ghost small", onclick: () => serviceDialog({ name: x.name, url: x.url || "", container: x.name, repo: x.repo }, r.repos) }, "Add")))),
+        c.items.length ? null : el("tr", {}, el("td", { colspan: "4", class: "muted" }, "No containers are running."))))))
+  })
+  // 2. repos and their marks
+  const repoBody = el("tbody")
+  for (const x of r.repos) {
+    const sel = el("select", { "aria-label": `How far ${x.name} is integrated` }, el("option", { value: "" }, "Not marked"),
+      ...Object.entries(r.marks).map(([k, v]) => el("option", { value: k }, v)))
+    sel.value = x.auto ? "" : x.state
+    const note = el("input", { value: x.note || "", placeholder: "what works, what's missing…", style: "width:100%", "aria-label": `Note for ${x.name}` })
+    const saveMark = async () => {
+      const y = await api(apiUrl(`/api/repo/${encodeURIComponent(x.id)}/integration`), { method: "POST", body: JSON.stringify({ state: sel.value, note: note.value }) }).catch(e => ({ ok: false, error: e.message }))
+      toast(y.ok ? `${x.name}: ${r.marks[sel.value] || "not marked"}` : y.error, y.ok ? "ok" : "error")
+    }
+    sel.onchange = saveMark; note.onchange = () => { if (!sel.value) sel.value = "planned"; saveMark() }
+    repoBody.append(el("tr", {},
+      el("td", {}, repoLink(x.id, x.name), x.auto ? el("div", { class: "muted small" }, "integrated (it runs a connection below)") : null),
+      el("td", {}, sel),
+      el("td", {}, x.services.length ? el("div", { class: "row", style: "gap:4px;flex-wrap:wrap" }, ...x.services.map(s => badge(!s.set_up ? "" : s.ok ? "up" : "bad", s.set_up ? s.name : `${s.name} (off)`, !s.set_up ? "not set up here" : s.ok ? "works" : "not working"))) : el("span", { class: "muted small" }, "-")),
+      el("td", { style: "min-width:200px" }, note)))
+  }
+  const counts = Object.fromEntries(Object.keys(r.marks).map(k => [k, r.repos.filter(x => x.state === k).length]))
+  main.replaceChildren(
+    el("div", { class: "row", style: "gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px" }, el("h1", { class: "page", style: "margin:0" }, "Integrations"),
+      el("span", { class: "muted" }, "What this setup connects to, whether it works right now, and how far each repo is integrated. Agents can read this too."),
+      el("div", { class: "spacer" }), el("button", { class: "btn ghost small", onclick: () => renderIntegrations() }, "Check again")),
+    el("div", { class: "card" }, el("div", { class: "row", style: "gap:8px;align-items:center;flex-wrap:wrap" }, el("h3", { style: "margin:0" }, "Connections and services"),
+        el("div", { class: "spacer" }), findBtn, addBtn),
+      el("p", { class: "muted small" }, "Add your other containers (or any service) by address; each is checked when you open this page. A tcp:// address only checks the port answers."),
+      el("div", { class: "table-box" }, el("table", { class: "list" }, el("thead", {}, el("tr", {}, el("th", {}, "Name"), el("th", {}, "Repo"), el("th", {}, "Works"), el("th", {}, "Address"), el("th", {}, ""))), svcBody)), found),
+    el("div", { class: "card", style: "margin-top:14px" }, el("h3", { style: "margin-top:0" }, "Your repos"),
+      el("p", { class: "muted small" }, `${counts.integrated} integrated · ${counts.partial} partly · ${counts.planned} to integrate · ${counts.none} not needed. Mark each one; a note says what works or what is missing.`),
+      el("div", { class: "table-box" }, el("table", { class: "list" }, el("thead", {}, el("tr", {}, el("th", {}, "Repo"), el("th", {}, "Integration"), el("th", {}, "Runs"), el("th", {}, "Note"))), repoBody))))
+}
+
+function serviceDialog(s, repos) {
+  s = s || {}
+  const name = el("input", { value: s.name || "", placeholder: "e.g. firefly-iii", style: "width:100%", "aria-label": "Name" })
+  const url = el("input", { value: s.url || "", placeholder: "http://127.0.0.1:8080  or  tcp://127.0.0.1:5432", style: "width:100%", "aria-label": "Address" })
+  const health = el("input", { value: s.health || "", placeholder: "/health (optional; / otherwise)", style: "width:100%", "aria-label": "Health path" })
+  const repo = el("select", { "aria-label": "Built from repo" }, el("option", { value: "" }, "No repo"), ...repos.map(x => el("option", { value: x.id }, x.name)))
+  repo.value = s.repo || ""
+  const notes = el("input", { value: s.notes || "", placeholder: "notes (optional)", style: "width:100%", "aria-label": "Notes" })
+  const go = el("button", { class: "btn" }, s.id ? "Save" : "Add")
+  let close
+  go.onclick = () => busy(go, "Checking…", async () => {
+    const x = await api(apiUrl("/api/services"), { method: "POST", body: JSON.stringify({ id: s.id, name: name.value, url: url.value, health: health.value, repo: repo.value, container: s.container, notes: notes.value }) }).catch(e => ({ ok: false, error: e.message }))
+    if (!x.ok) return toast(x.error, "error")
+    close(); toast(x.status.ok ? `${x.item.name} works` : `${x.item.name} added, but it doesn't answer: ${x.status.error}`, x.status.ok ? "ok" : "info"); renderIntegrations()
+  })
+  close = openDialog(s.id ? `Edit ${s.name}` : "Add a service", el("div", { class: "col", style: "gap:8px;min-width:min(480px,80vw)" },
+    el("label", { class: "col", style: "gap:4px" }, "Name", name), el("label", { class: "col", style: "gap:4px" }, "Address", url),
+    el("label", { class: "col", style: "gap:4px" }, "Health path", health), el("label", { class: "col", style: "gap:4px" }, "Built from", repo), notes, el("div", {}, go)))
+  setTimeout(() => name.focus(), 0)
+}
+
 // Attach a reference to a chat: a general one, or one about a repo.
 async function useInChat(path, label) {
   const repos = await api(apiUrl("/api/repos")).catch(() => [])
@@ -2802,8 +2897,8 @@ async function integrationsSetup() {
   if (hd.machine && ![...hdMachine.options].some(o => o.value === hd.machine)) hdMachine.append(el("option", { value: hd.machine }, hd.machine))
   hdMachine.value = hd.machine || ""
   const hdMap = el("input", { value: hd.path_map || "", placeholder: "/home/me/repos=/srv/repos (only if folders differ over there)", style: "width:100%" })
-  const hdKind = el("select", { "aria-label": "Agent to start" }, ...["claude", "codex", "hermes", "opencode", "copilot", "cursor", "pi", "droid", "kimi", "qwen", "grok"].map(k => el("option", { value: k }, k)))
-  hdKind.value = hd.kind || "claude"
+  const hdKind = el("select", { "aria-label": "Agent to start" }, ...(hd.kinds || ["hermes", "claude", "codex", "opencode"]).map(k => el("option", { value: k }, `${k}${hd.installed && !hd.installed.includes(k) ? " (not found here)" : ""}`)))
+  hdKind.value = hd.kind || "hermes"
   const stOn = el("input", { type: "checkbox", style: "height:auto" }); stOn.checked = !!st.enabled
   const stUrl = el("input", { value: st.url || "", placeholder: "http://127.0.0.1:8648", style: "width:100%" })
   const stAgent = el("select", { "aria-label": "Studio agent" }, el("option", { value: "" }, "Hermes (Studio's own)"), ...["claude-code", "codex", "opencode", "pi", "grok"].map(k => el("option", { value: k }, k)))
@@ -3085,7 +3180,7 @@ function currentView() {
   if (BASE && path.startsWith(BASE)) path = path.slice(BASE.length)
   const parts = path.split('/').filter(Boolean)
   if (parts[0] === 'repo' && parts[1]) return ['repo', decodeURIComponent(parts[1])]
-  if (['requests', 'settings', 'chats', 'workflows', 'work', 'references'].includes(parts[0])) return [parts[0]]
+  if (['requests', 'settings', 'chats', 'workflows', 'work', 'references', 'integrations'].includes(parts[0])) return [parts[0]]
   if (!parts.length || parts[0] === 'repos') return ['repos']
   return ['notfound']
 }
@@ -3100,7 +3195,7 @@ async function router() {
     a.classList.toggle("on", on)
     if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current")
   }
-  document.title = ({ repos: "Repositories", repo: id, chats: "Chats", workflows: "Workflows", requests: "Requests", settings: "Settings" }[view] || "Not found") + " · Upstream Manager"
+  document.title = ({ repos: "Repositories", repo: id, chats: "Chats", workflows: "Workflows", requests: "Requests", settings: "Settings", work: "Work", references: "References", integrations: "Integrations" }[view] || "Not found") + " · Upstream Manager"
   try {
     if (view === "repos") await renderRepos()
     else if (view === "repo") await renderRepoPage(id)
@@ -3109,6 +3204,7 @@ async function router() {
     else if (view === "requests") await renderRequests()
     else if (view === "work") await renderWork()
     else if (view === "references") await renderReferences()
+    else if (view === "integrations") await renderIntegrations()
     else if (view === "settings") await renderSettings()
     else $("#content").replaceChildren(el("div", { class: "card", style: "max-width:520px;margin:40px auto;text-align:center" },
       el("h1", { class: "page" }, "Page not found"), el("p", { class: "muted" }, `There is no page at ${location.pathname}.`),

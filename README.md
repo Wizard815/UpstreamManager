@@ -212,6 +212,23 @@ and the **Hermes API server** (`HERMES_API_URL`, `HERMES_API_KEY`) can also take
 **Pondering Orb** (`ORB_URL`, `UPSTREAM_ORB_TOKEN`) and the **LLM wiki** (`LLMWIKI_MCP_URL`,
 `LLMWIKI_API_KEY`) are where a task is parked for later.
 
+## Integrations
+
+The Integrations page is this app's record of what your setup connects to (nothing is written
+to the wiki or GitHub):
+
+- **Connections and services.** The built-in ones (herdr, Hermes Studio, the Hermes gateway,
+  Pondering Orb, the LLM wiki) and any services you add, usually your other containers: a name,
+  an address (`http://127.0.0.1:8080`, or `tcp://127.0.0.1:5432` to only check the port), an
+  optional health path and the repo it is built from. Each is checked when you open the page.
+  **Find running containers** lists Docker containers with their ports to add in a click (it
+  needs the `docker` command where the app runs).
+- **Your repos**, each marked *integrated*, *partly integrated*, *to integrate* or *not needed*,
+  with a note on what works or is missing. A repo that runs a working connection counts as
+  integrated by itself. Marks show on the Repos list too.
+- Agents read it with `list_integrations` and can record progress with `mark_integration`; chats
+  about no particular repo see it as well. Adding or removing services stays with you.
+
 ## References
 
 The References page is a library of repos and files to look things up in (PDFs, zips, images,

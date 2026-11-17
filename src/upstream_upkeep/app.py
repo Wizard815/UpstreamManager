@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 from flask import Flask, jsonify, request, render_template_string, abort, send_file
 
 from . import (actions, agent_context, components, config, credentials, daily_check, edits, github, gitops, hermes,
-               herdr, memory, orb, pull_report, references, registry, stacks, storage, store, studio, tasks, upstream_check, wiki, workflows, workspaces)
+               herdr, memory, orb, pull_report, references, registry, services, stacks, storage, store, studio, tasks, upstream_check, wiki, workflows, workspaces)
 from .store import settings as get_settings, save_settings
 
 flask_app = Flask(__name__)
@@ -2238,6 +2238,50 @@ def api_refs_edited():
     return jsonify({"ok": True, "items": references.edited_repos()})
 
 
+@flask_app.route("/api/services")
+def api_services():
+    """What is integrated and whether it works: built-in connections, your services, and each repo's mark."""
+    return jsonify({"ok": True, **services.overview(live=request.args.get("live", "1") != "0")})
+
+
+@flask_app.route("/api/services", methods=["POST"])
+def api_services_save():
+    """Add or change a service (another container): {id?, name, url, health?, repo?, container?, notes?}."""
+    if (denied := _user_only("Adding or changing services")):
+        return denied
+    try:
+        item = services.save(request.get_json(silent=True) or {})
+        return jsonify({"ok": True, "item": item, "status": services.check(item)})
+    except services.ServiceError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@flask_app.route("/api/services/delete", methods=["POST"])
+def api_services_delete():
+    if (denied := _user_only("Removing services")):
+        return denied
+    try:
+        services.remove(str((request.get_json(silent=True) or {}).get("id") or ""))
+        return jsonify({"ok": True})
+    except services.ServiceError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@flask_app.route("/api/services/containers")
+def api_services_containers():
+    return jsonify({"ok": True, **services.containers()})
+
+
+@flask_app.route("/api/repo/<repo_id>/integration", methods=["POST"])
+def api_repo_integration(repo_id):
+    """Mark how far a repo is integrated: {state: integrated|partial|planned|none|"" (clear), note?}."""
+    d = request.get_json(silent=True) or {}
+    try:
+        return jsonify({"ok": True, "integration": services.mark(repo_id, str(d.get("state") or ""), d.get("note"))})
+    except services.ServiceError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400 if store.get_repo(repo_id) else 404
+
+
 @flask_app.route("/api/integrations")
 def api_integrations():
     """Where tasks can go: Hermes, Pondering Orb, the LLM wiki."""
@@ -2729,6 +2773,7 @@ pre.term{margin:0;font:12px/1.35 var(--mono);white-space:pre-wrap;color:#cfd6e4}
     <a href="{{ base_url }}/work" data-view="work">Work <span class="count" id="work-count"></span></a>
     <a href="{{ base_url }}/chats" data-view="chats">Chats</a>
     <a href="{{ base_url }}/references" data-view="references">References</a>
+    <a href="{{ base_url }}/integrations" data-view="integrations">Integrations</a>
     <a href="{{ base_url }}/workflows" data-view="workflows">Workflows</a>
     <a href="{{ base_url }}/requests" data-view="requests">Requests <span class="count" id="pending-count"></span></a>
     <a href="{{ base_url }}/settings" data-view="settings">Settings</a>
