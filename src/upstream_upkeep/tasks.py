@@ -227,7 +227,7 @@ def suggest(task: dict, available: dict | None = None) -> dict:
     return {"to": "here", "why": "work on it here, on its own branch"}
 
 
-def send_to(task_id: str, to: str, message: str | None = None) -> dict:
+def send_to(task_id: str, to: str, message: str | None = None, opts: dict | None = None) -> dict:
     """Send a task where it will be worked on or kept. Returns what the UI needs to follow it."""
     from . import hermes, orb, wiki  # integrations, loaded when used
     task = get(task_id)
@@ -285,16 +285,28 @@ def send_to(task_id: str, to: str, message: str | None = None) -> dict:
             except KeyError:
                 pass
         if to == "herdr":
-            alive = False
-            if prev.get("type") == "herdr" and prev.get("agent"):
+            opts = opts or {}
+            text = message or brief(task, repo)
+            first = agent_instructions(task, repo, workdir) + "\n\n" + text
+            env = {"UPSTREAM_TASK_ID": task_id, "UPSTREAM_REPO_ID": repo["id"]}
+            where = None
+            if opts.get("agent"):  # herdr to herdr: give it to an agent that is already running
+                herdr.prompt(opts["agent"], first)
+                kind = next((a["kind"] for a in herdr.agents() if a["name"] == opts["agent"]), None)
+                where = {"type": "herdr", "agent": opts["agent"], "kind": kind, "ours": False, "pending": None}
+            elif prev.get("type") == "herdr" and prev.get("agent") and not opts.get("kind"):
                 try:
-                    herdr.prompt(prev["agent"], message or brief(task, repo))
-                    alive, where = True, prev
-                except herdr.HerdrError:  # the agent's pane was closed: start a fresh one below
-                    alive = False
-            if not alive:
-                info = herdr.start(task_id, task["title"], workdir, agent_instructions(task, repo, workdir) + "\n\n" + (message or brief(task, repo)))
-                where = {"type": "herdr", **info, "workspace": ws and ws["name"], "workdir": workdir}
+                    herdr.prompt(prev["agent"], text)
+                    where = prev
+                except herdr.HerdrError as e:
+                    if e.code == "agent_blocked":  # it is asking something: keep the message until it is answered
+                        where = {**prev, "pending": ((prev.get("pending") or "") + "\n\n" + text).strip()}
+                    elif e.code != "agent_not_found":  # gone (its pane was closed): start a fresh one below
+                        raise
+            if where is None:  # a new agent (the first time, a different kind, or the old one is gone)
+                info = herdr.start(task_id, task["title"], workdir, first, kind=opts.get("kind"), env=env)
+                where = {"type": "herdr", **info}
+            where = {**where, "workspace": ws and ws["name"], "workdir": workdir}
         else:
             sid = prev.get("studio") if prev.get("type") == "studio" else None
             sid = studio.run(message or brief(task, repo), workdir, agent_instructions(task, repo, workdir), sid, on_done=done)
@@ -311,3 +323,31 @@ def send_to(task_id: str, to: str, message: str | None = None) -> dict:
     where = {"type": "orb", **res}
     update(task_id, status="parked", where=where, note=f"parked in Pondering Orb ({res['list']})")
     return {"where": where}
+
+
+def herdr_sync(task: dict, info: dict) -> dict:
+    """Keep a herdr task in step with its agent: send a held prompt once the agent is ready, and note
+    in the task's history when the agent starts waiting for the user or finishes. Returns the task."""
+    from . import herdr
+    where = dict(task.get("where") or {})
+    status, changed, note = info.get("status"), False, None
+    if where.get("pending") and status in ("idle", "done"):
+        try:
+            herdr.prompt(where["agent"], where["pending"])
+            where["pending"], changed, note = None, True, "the agent is ready: sent it the task"
+            status = "working"
+        except herdr.HerdrError as e:
+            if e.code != "agent_blocked":
+                raise
+    last = where.get("status")
+    if status != last:
+        where["status"], changed = status, True
+        if status == "blocked":
+            note = note or "the agent is asking you something"
+        elif status in ("done", "idle") and last == "working":
+            note = note or "the agent finished: review its changes"
+    if info.get("session") and info.get("session") != where.get("session"):
+        where["session"], where["session_agent"], changed = info["session"], info.get("session_agent"), True
+    if changed:
+        return update(task["id"], where=where, note=note)
+    return task

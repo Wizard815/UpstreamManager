@@ -2087,6 +2087,24 @@ const DEST = {
   wiki: { label: "Park in LLM wiki", busy: "Parking…", why: "A note in the wiki's inbox for later" },
   orb: { label: "Park in Pondering Orb", busy: "Parking…", why: "A to-do in Orb" },
 }
+// Which herdr agent gets the task: a new one of some kind, or one that is already running.
+function herdrPicker(ints, current) {
+  const h = ints.herdr || {}
+  const sel = el("select", { "aria-label": "Which herdr agent" })
+  const fill = (live) => {
+    const keep = sel.value
+    sel.replaceChildren(
+      el("optgroup", { label: "Start a new agent" }, ...(h.kinds || [h.kind || "claude"]).map(k => el("option", { value: `new:${k}` }, `new ${k}${k === h.kind ? " (default)" : ""}`))),
+      live.length ? el("optgroup", { label: "Give it to a running agent" }, ...live.filter(a => a.name).map(a =>
+        el("option", { value: `agent:${a.name}` }, `${a.name} · ${a.kind || "agent"} · ${a.status}${a.task ? ` · on “${a.task.title.slice(0, 30)}”` : ""}`))) : el("optgroup", { label: "No agents running in herdr yet" }))
+    sel.value = [...sel.options].some(o => o.value === keep) ? keep : `new:${h.kind || "claude"}`
+  }
+  fill([])
+  if (h.ok) api(apiUrl("/api/herdr/agents")).then(r => fill((r.items || []).filter(a => a.name !== current))).catch(() => {})
+  const row = el("label", { class: "row small muted", style: "gap:6px;align-items:center", hidden: h.ok ? null : "" }, "herdr agent:", sel)
+  return { row, value: () => sel.value.startsWith("agent:") ? { agent: sel.value.slice(6) } : { agent_kind: sel.value.slice(4) } }
+}
+
 let drawDests = null
 async function taskDialog(pre = {}) {
   const ints = await loadIntegrations()
@@ -2121,13 +2139,14 @@ async function taskDialog(pre = {}) {
   const send = (btn, to) => busy(btn, DEST[to]?.busy || "Saving…", async () => {
     if (!title.value.trim()) { title.focus(); return toast("Give the task a title", "error") }
     const res = await api(apiUrl("/api/tasks"), { method: "POST", body: JSON.stringify({ repo: repoSel.value, title: title.value, body: body.value, kind: kind.value, about,
-      upstream: pre.upstream, onto: ontoSel.value || undefined, to: to || undefined }) })
+      upstream: pre.upstream, onto: ontoSel.value || undefined, to: to || undefined, ...(to === "herdr" ? herdrPick.value() : {}) }) })
     if (!res.ok && !res.task) return toast(res.error, "error")
     close(); refreshWorkCount()
     if (!res.ok) { toast(`Saved the task, but: ${res.error}`, "error"); return route(`/work?task=${res.task.id}`) }
     afterSend(res, to)
   })
   const dests = el("div", { class: "dest-grid" })
+  const herdrPick = herdrPicker(ints)
   const suggestLine = el("div", { class: "suggest" })
   let suggested = null
   drawDests = () => {
@@ -2157,7 +2176,7 @@ async function taskDialog(pre = {}) {
       el("label", { class: "col", style: "gap:4px" }, "Title", title),
       el("label", { class: "col", style: "gap:4px" }, "Details", body),
       el("div", { class: "col", style: "gap:4px" }, el("span", {}, "About"), chips),
-      suggestLine, dests,
+      suggestLine, dests, herdrPick.row,
       el("div", { class: "row", style: "gap:8px;align-items:center" }, (() => { const b = el("button", { class: "btn ghost small" }, "Just save it"); b.onclick = () => send(b, null); return b })(),
         el("span", { class: "muted small" }, "Code work happens on the task's own branch; nothing reaches the branch you picked until you approve it."))))
   setTimeout(() => title.focus(), 0)
@@ -2187,9 +2206,10 @@ async function refreshWorkCount() {
 function taskRow(t, onPick, selected) {
   const where = t.where?.type
   const running = t.hermes_run?.running
+  const ag = { blocked: ["warn", "needs you"], working: ["info", "agent working"], done: ["ok", "agent done"], idle: ["", "agent idle"], gone: ["bad", "agent gone"] }[t.agent_status]
   return el("button", { class: `task-row${selected ? " sel" : ""}`, onclick: () => onPick(t), "aria-current": selected ? "true" : null },
     el("div", { class: "row", style: "gap:6px;align-items:center;min-width:0" },
-      badge(STATUS_CLS[t.status] || "", t.status), el("span", { class: "muted small" }, KIND_LABEL[t.kind] || t.kind),
+      badge(STATUS_CLS[t.status] || "", t.status), ag ? badge(ag[0], ag[1]) : null, el("span", { class: "muted small" }, KIND_LABEL[t.kind] || t.kind),
       el("strong", { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0" }, t.title)),
     el("div", { class: "muted small", style: "text-align:left" }, `${t.repo_name}${t.onto ? ` → ${t.onto}` : ""} · ${where ? WHERE_LABEL[where] : "not started"}${running ? " · working…" : ""} · ${t.updated_at.slice(0, 16).replace("T", " ")}`))
 }
@@ -2217,13 +2237,28 @@ async function renderWork() {
     if (cur) await taskDetail(detail, cur, draw); else detail.replaceChildren(el("p", { class: "muted", style: "padding:16px" }, "Pick a task to see it, work on it, or hand it on."))
   }
   const pick = (t) => { picked = t.id; history.replaceState({}, "", `${BASE}/work?task=${t.id}${repoF ? `&repo=${repoF}` : ""}`); draw() }
+  // herdr's live agents: what each is doing and which task it has
+  const roster = el("div", { class: "panel", style: "padding:8px 10px", hidden: "" })
+  const drawRoster = async () => {
+    if (!roster.isConnected) return
+    const r = await api(apiUrl("/api/herdr/agents")).catch(() => ({ items: [] }))
+    const live = (r.items || []).filter(a => a.name)
+    roster.hidden = !(await loadIntegrations()).herdr?.ok
+    const cls = { working: "info", blocked: "warn", done: "ok", idle: "", unknown: "" }
+    roster.replaceChildren(el("div", { class: "row", style: "gap:6px;align-items:center;margin-bottom:4px" }, el("strong", { class: "small" }, "Agents in herdr"), el("span", { class: "muted small" }, r.error || `${live.length} running`)),
+      ...live.map(a => el("button", { class: "file-row", title: a.cwd || "", onclick: () => a.task ? pick({ id: a.task.id }) : toast(`${a.name} isn't on a task from here. Pick it in “herdr agent” when you send one.`, "info") },
+        badge(cls[a.status] ?? "", a.status === "blocked" ? "needs you" : a.status), el("span", { class: "nm", style: "flex:0 1 auto;min-width:90px", title: a.name }, a.name), el("span", { class: "muted small", style: "flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, ` ${a.kind || ""}${a.task ? ` · ${a.task.title.slice(0, 40)}` : " · free"}`))),
+      ...(live.length ? [] : [el("div", { class: "muted small" }, "None yet. Send a task to herdr and its agent shows here.")]))
+    setTimeout(drawRoster, 8000)
+  }
   repoSel.onchange = () => { repoF = repoSel.value; draw() }
   const newBtn = el("button", { class: "btn", onclick: () => taskDialog({ repo: repoF || undefined }) }, "+ New task")
   main.replaceChildren(
     el("div", { class: "row", style: "margin-bottom:12px;gap:10px;flex-wrap:wrap;align-items:center" }, el("h1", { class: "page", style: "margin:0" }, "Work"),
       el("span", { class: "muted" }, "Fixes, bugs and changes for your coding agents: work on them here, send them to herdr or Studio, or park them."), el("div", { class: "spacer" }), repoSel, newBtn),
-    el("div", { class: "work-grid" }, el("div", { class: "panel", style: "min-width:0" }, fbar, listBox), detail))
+    el("div", { class: "work-grid" }, el("div", { class: "col", style: "gap:12px;min-width:0" }, el("div", { class: "panel", style: "min-width:0" }, fbar, listBox), roster), detail))
   await draw()
+  drawRoster()
 }
 
 async function taskDetail(box, t, redraw) {
@@ -2255,8 +2290,23 @@ async function taskDetail(box, t, redraw) {
       el("div", {}, el("span", {}, `${t.by === "agent" ? "An agent wrote this down. " : ""}Suggested: `), el("strong", {}, DEST[sg.to].label), el("span", { class: "muted" }, ` — ${sg.why}`)),
       el("div", { class: "row", style: "gap:6px;margin-top:6px" }, act("Agree", send(sg.to), ""), el("span", { class: "muted small" }, "or pick another below")))
   }
-  const destBtns = ["here", "herdr", "studio", "hermes", "wiki", "orb"].filter(k => !(where.type === k && k !== "here"))
-    .map(k => k === "here" && where.type === "here" ? act("Open its chat", async () => route(`/repo/${t.repo_id}?session=${where.session}`), "") : act(DEST[k].label, send(k)))
+  const pickHerdr = async () => {
+    if (!ints.herdr?.ok) return toast(`herdr: ${ints.herdr?.error || "not set up"}. Set it up in Settings.`, "error")
+    const hp = herdrPicker(ints, where.type === "herdr" ? where.agent : null)
+    const go = el("button", { class: "btn" }, "Send")
+    let close
+    go.onclick = () => busy(go, "Starting the agent…", async () => {
+      const res = await api(apiUrl(`/api/tasks/${t.id}/send`), { method: "POST", body: JSON.stringify({ to: "herdr", ...hp.value() }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!res.ok) return toast(res.error, "error")
+      close(); refreshWorkCount(); await redraw()
+    })
+    hp.row.hidden = false
+    close = openDialog(where.type === "herdr" ? "Give this task to another herdr agent" : "Send this task to herdr", el("div", { class: "col", style: "gap:10px;min-width:min(440px,80vw)" },
+      el("p", { class: "muted", style: "margin:0" }, "A new agent opens in its own herdr workspace, in the task's branch folder. A running agent is told where that folder is."), hp.row, el("div", {}, go)))
+  }
+  const destBtns = ["here", "herdr", "studio", "hermes", "wiki", "orb"].filter(k => !(where.type === k && !["here", "herdr"].includes(k)))
+    .map(k => k === "here" && where.type === "here" ? act("Open its chat", async () => route(`/repo/${t.repo_id}?session=${where.session}`), "")
+      : k === "herdr" ? act(where.type === "herdr" ? "Another herdr agent…" : DEST.herdr.label, pickHerdr) : act(DEST[k].label, send(k)))
   const actions = el("div", { class: "row", style: "gap:6px;flex-wrap:wrap" }, ...destBtns,
     el("div", { class: "spacer" }),
     t.status === "done" ? act("Reopen", setStatus("open")) : act("Mark done", setStatus("done")),
@@ -2295,10 +2345,17 @@ function agentPanel(t) {
     if (!wrap.isConnected) return stopAgentPoll()
     const r = await api(apiUrl(`/api/tasks/${t.id}/agent`)).catch(e => ({ ok: false, error: e.message, messages: [] }))
     const running = r.run?.running
-    state.textContent = !r.ok ? `Can't reach it: ${r.error}` : r.type === "herdr" ? `Agent ${r.agent}: ${r.status}${r.cwd ? ` in ${r.cwd}` : ""}`
+    const says = { working: "working…", blocked: "is asking you something: answer it below", done: "finished: review its changes", idle: "is idle, waiting for you", unknown: "is running (herdr can't tell what it's doing)" }
+    state.textContent = !r.ok ? (r.gone ? r.error : `Can't reach it: ${r.error}`) : r.type === "herdr" ? `${r.agent} (${r.kind || "agent"}) ${says[r.status] || r.status}${r.pending ? " — your task is held until it's ready" : ""}`
       : running ? "Working on it… (big jobs take a while; you can leave this page)" : r.run?.error ? `Last message failed: ${r.run.error}` : "Waiting for you"
-    state.style.color = !r.ok || r.run?.error ? "var(--bad)" : running ? "var(--info)" : ""
+    state.style.color = !r.ok || r.run?.error ? "var(--bad)" : r.status === "blocked" ? "#e0a060" : running ? "var(--info)" : r.status === "done" ? "var(--good)" : ""
     sendBtn.disabled = !!running && r.type !== "herdr"
+    if (r.type === "herdr" || w.type === "herdr") {
+      keysRow.hidden = !r.ok
+      keysRow.classList.toggle("asking", r.status === "blocked")
+      studioLink.hidden = !r.studio_url; if (r.studio_url) studioLink.href = r.studio_url
+      closeBtn.hidden = !(r.ok && r.ours) || !!w.closed
+    }
     const sig = JSON.stringify([r.messages?.length, r.output?.length, r.status])
     if (sig !== shown) {
       shown = sig
@@ -2313,7 +2370,7 @@ function agentPanel(t) {
       }
       log.scrollTop = log.scrollHeight
     }
-    agentTimer = setTimeout(poll, running ? 3000 : 12000)
+    agentTimer = setTimeout(poll, running || r.status === "blocked" || r.pending ? 3000 : 12000)
   }
   sendBtn.onclick = () => {
     const text = msgIn.value.trim(); if (!text) return
@@ -2324,8 +2381,25 @@ function agentPanel(t) {
     })
   }
   msgIn.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendBtn.click() } })
-  wrap.append(el("div", { class: "row", style: "gap:8px;align-items:center" }, el("h4", { style: "margin:0" }, name),
-      w.type === "studio" && w.url ? el("a", { href: w.url, target: "_blank", rel: "noopener", class: "small" }, "open in Studio ↗") : null), state, log,
+  // herdr: answer its dialog or interrupt it with keys (only you answer an agent); its Hermes session opens in Studio
+  const key = (label, keys, title) => { const b = el("button", { class: "btn ghost small", title }, label)
+    b.onclick = () => busy(b, null, async () => {
+      const res = await api(apiUrl(`/api/tasks/${t.id}/keys`), { method: "POST", body: JSON.stringify({ keys }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!res.ok) return toast(res.error, "error")
+      stopAgentPoll(); setTimeout(poll, 600) }); return b }
+  const keysRow = el("div", { class: "keys-row", hidden: "" }, el("span", { class: "muted small" }, "Answer or steer:"),
+    key("Enter", ["enter"]), key("y", ["y"], "yes"), key("n", ["n"], "no"), key("1", ["1"]), key("2", ["2"]), key("3", ["3"]), key("↑", ["up"]), key("↓", ["down"]),
+    key("Esc", ["esc"], "Interrupt or dismiss"), key("Ctrl+C", ["ctrl+c"], "Stop what it is doing"))
+  const studioLink = el("a", { target: "_blank", rel: "noopener", class: "small", hidden: "" }, "its Hermes session in Studio ↗")
+  const closeBtn = el("button", { class: "btn ghost small", hidden: "", title: "Close the herdr workspace this task opened (its branch and changes stay)" }, "Close its herdr workspace")
+  closeBtn.onclick = () => busy(closeBtn, null, async () => {
+    if (!confirm("Close this task's herdr workspace? The agent in it stops; the task's branch and changes stay.")) return
+    const res = await api(apiUrl(`/api/tasks/${t.id}/herdr/close`), { method: "POST", body: "{}" }).catch(e => ({ ok: false, error: e.message }))
+    if (!res.ok) return toast(res.error, "error")
+    toast("Closed", "ok"); closeBtn.hidden = true; stopAgentPoll(); poll() })
+  wrap.append(el("div", { class: "row", style: "gap:8px;align-items:center;flex-wrap:wrap" }, el("h4", { style: "margin:0" }, name),
+      w.type === "studio" && w.url ? el("a", { href: w.url, target: "_blank", rel: "noopener", class: "small" }, "open in Studio ↗") : null,
+      studioLink, el("div", { class: "spacer" }), closeBtn), state, log, keysRow,
     el("div", { class: "composer" }, msgIn, el("div", { class: "row" }, el("div", { class: "spacer" }), sendBtn)))
   setTimeout(poll, 0)
   return wrap
@@ -2699,7 +2773,13 @@ async function integrationsSetup() {
     el("div", { class: "muted" }, "Start a coding agent (Claude Code, Codex, Hermes…) in herdr, on the task's branch. herdr is reached over its local socket, so it must run as you on this machine; it can hand work on to other machines itself (herdr --machine)."),
     el("div", { class: "col", style: "margin-top:8px" }, el("label", { class: "row" }, hdOn, "Use herdr"),
       el("div", { class: "row", style: "gap:8px" }, el("label", { class: "col", style: "gap:4px;flex:1" }, "Socket (empty for the default)", hdSock), el("label", { class: "col", style: "gap:4px" }, "Agent to start", hdKind)),
-      line(hd, `Connected to herdr ${hd.version || ""} at ${hd.socket}.`)),
+      line(hd, `Connected to herdr ${hd.version || ""} at ${hd.socket}.`),
+      el("details", {}, el("summary", { class: "muted small" }, "Give herdr's agents Upstream Manager's tools (once per agent kind)"),
+        el("pre", { class: "code-pre", style: "white-space:pre-wrap" }, [
+          `# Claude Code\nclaude mcp add upstream -e UPSTREAM_APP_URL=${location.origin}${BASE} -- upstream-mcp`,
+          `# Codex\ncodex mcp add upstream --env UPSTREAM_APP_URL=${location.origin}${BASE} -- upstream-mcp`,
+          `# Hermes (the same Hermes that Studio shows)\nhermes mcp add upstream --command upstream-mcp --env UPSTREAM_APP_URL=${location.origin}${BASE}\nherdr integration install hermes   # lets herdr see Hermes' state and session`].join("\n\n")),
+        el("div", { class: "muted small" }, "Each task's workspace also carries UPSTREAM_TASK_ID and UPSTREAM_REPO_ID, so an agent knows which task it is on."))),
     el("h4", { style: "margin-top:20px" }, "Hermes Studio"),
     el("div", { class: "muted" }, "Hand a task to a Studio run in the task's folder; follow it here or in Studio's own chat."),
     el("div", { class: "col", style: "margin-top:8px" }, el("label", { class: "row" }, stOn, "Use Hermes Studio"),

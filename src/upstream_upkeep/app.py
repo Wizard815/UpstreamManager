@@ -1654,7 +1654,18 @@ def _task_out(t: dict) -> dict:
 def api_tasks():
     """Tasks, newest first: ?repo= and ?status= narrow them."""
     items = tasks.list_tasks(request.args.get("repo") or None, request.args.get("status") or None)
-    return jsonify({"ok": True, "items": [_task_out(t) for t in items]})
+    out = [_task_out(t) for t in items]
+    if any((t.get("where") or {}).get("type") == "herdr" and t["status"] == "working" for t in items):
+        try:  # one cheap local call: what each herdr agent is doing right now
+            live = {a["name"]: a for a in herdr.agents()}
+            for o in out:
+                w = o.get("where") or {}
+                if w.get("type") == "herdr" and o["status"] == "working":
+                    a = live.get(w.get("agent"))
+                    o["agent_status"] = a["status"] if a else "gone"
+        except herdr.HerdrError:
+            pass
+    return jsonify({"ok": True, "items": out})
 
 
 @flask_app.route("/api/tasks", methods=["POST"])
@@ -1669,9 +1680,15 @@ def api_task_create():
         return jsonify({"ok": False, "error": str(e)}), 400
     out = {"ok": True, "task": t}
     if data.get("to"):
-        out.update(_send_task(t["id"], data["to"], data.get("message")))
+        out.update(_send_task(t["id"], data["to"], data.get("message"), _herdr_opts(data)))
         out["task"] = tasks.get(t["id"])
     return jsonify(_task_json(out))
+
+
+def _herdr_opts(data: dict) -> dict:
+    """For herdr: {agent_kind} starts that kind of agent, {agent} gives the task to one that is already running."""
+    return {opt: str(data[k]).strip()[:64] for k, opt in (("agent_kind", "kind"), ("agent", "agent"))
+            if isinstance(data.get(k), str) and data[k].strip()}
 
 
 def _task_json(out: dict) -> dict:
@@ -1680,11 +1697,11 @@ def _task_json(out: dict) -> dict:
     return out
 
 
-def _send_task(task_id: str, to: str, message=None) -> dict:
+def _send_task(task_id: str, to: str, message=None, opts: dict | None = None) -> dict:
     if to in ("hermes", "herdr", "studio") and (denied := _user_only("Handing work to a coding agent")):
         return {"ok": False, "error": denied[0].get_json()["error"]}
     try:
-        return {"ok": True, **tasks.send_to(task_id, to, message if isinstance(message, str) else None)}
+        return {"ok": True, **tasks.send_to(task_id, to, message if isinstance(message, str) else None, opts)}
     except (tasks.TaskError, workspaces.WorkspaceError) as e:
         return {"ok": False, "error": str(e)}
     except (hermes.HermesError, herdr.HerdrError, studio.StudioError, orb.OrbError, wiki.WikiError) as e:
@@ -1726,7 +1743,7 @@ def api_task_send(task_id):
     if not tasks.get(task_id):
         abort(404)
     data = request.get_json(silent=True) or {}
-    out = _send_task(task_id, data.get("to"), data.get("message"))
+    out = _send_task(task_id, data.get("to"), data.get("message"), _herdr_opts(data))
     out["task"] = tasks.get(task_id)
     return jsonify(_task_json(out)), (200 if out["ok"] else 400)
 
@@ -1889,11 +1906,67 @@ def api_task_agent(task_id):
             return jsonify({"ok": True, "type": "studio", "url": w.get("url"), "messages": studio.messages(w["studio"]), "run": studio.run_state(w["studio"])})
         if w.get("type") == "herdr":
             a = herdr.agent(w["agent"])
-            return jsonify({"ok": True, "type": "herdr", "agent": w["agent"], "kind": w.get("kind"), **a,
+            t = tasks.herdr_sync(t, a)
+            w = t["where"]
+            hermes_session = a.get("session") if (a.get("session_agent") or a.get("kind") or "").startswith("hermes") else None
+            return jsonify({"ok": True, "type": "herdr", "agent": w["agent"], **a, "kind": a.get("kind") or w.get("kind"),
+                            "pending": bool(w.get("pending")), "ours": bool(w.get("ours")),
+                            "studio_url": studio.link(hermes_session) if hermes_session and studio.settings()["enabled"] else None,
                             "run": {"running": a["status"] == "working", "error": None}})
     except (hermes.HermesError, studio.StudioError, herdr.HerdrError) as e:
-        return jsonify({"ok": False, "type": w.get("type"), "error": str(e), "messages": [], "run": {"running": False}})
+        gone = getattr(e, "code", None) == "agent_not_found"
+        return jsonify({"ok": False, "type": w.get("type"), "gone": gone, "messages": [], "run": {"running": False},
+                        "error": "this agent is no longer running in herdr (its pane was closed). Send the task to herdr again to start a new one."
+                        if gone else str(e)})
     return jsonify({"ok": False, "error": "not with an agent", "messages": []})
+
+
+@flask_app.route("/api/tasks/<task_id>/keys", methods=["POST"])
+def api_task_keys(task_id):
+    """Answer the herdr agent's dialog, or interrupt it: {keys: ["y", "enter"]}. Only you answer an agent."""
+    if (denied := _user_only("Answering an agent")):
+        return denied
+    t = tasks.get(task_id) or abort(404)
+    w = t.get("where") or {}
+    if w.get("type") != "herdr":
+        return jsonify({"ok": False, "error": "this task is not with a herdr agent"}), 400
+    try:
+        herdr.send_keys(w["agent"], (request.get_json(silent=True) or {}).get("keys"))
+    except herdr.HerdrError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/tasks/<task_id>/herdr/close", methods=["POST"])
+def api_task_herdr_close(task_id):
+    """Close the herdr workspace this task opened (never one it merely borrowed an agent from)."""
+    if (denied := _user_only("Closing a herdr workspace")):
+        return denied
+    t = tasks.get(task_id) or abort(404)
+    w = t.get("where") or {}
+    if w.get("type") != "herdr" or not w.get("ours") or not w.get("workspace_id"):
+        return jsonify({"ok": False, "error": "this task didn't open a herdr workspace of its own"}), 400
+    try:
+        herdr.close_workspace(w["workspace_id"])
+    except herdr.HerdrError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    tasks.update(task_id, where={**w, "closed": True}, note="closed its herdr workspace")
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/herdr/agents")
+def api_herdr_agents():
+    """The agents herdr is running now, each with the task it works on (if it came from here)."""
+    try:
+        live = herdr.agents() if herdr.settings()["enabled"] else []
+    except herdr.HerdrError as e:
+        return jsonify({"ok": False, "error": str(e), "items": []})
+    by_agent = {(t.get("where") or {}).get("agent"): t for t in tasks.list_tasks() if (t.get("where") or {}).get("type") == "herdr"
+                and t["status"] not in ("done", "dropped")}
+    for a in live:
+        t = by_agent.get(a["name"])
+        a["task"] = {"id": t["id"], "title": t["title"]} if t else None
+    return jsonify({"ok": True, "items": live})
 
 
 @flask_app.route("/api/tasks/<task_id>/suggest")
@@ -2511,7 +2584,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     .btn { height: 40px; } .btn.small { height: 34px; } .tab { height: 38px; }
     .path { max-width: 100%; }
   }
-.task-body{max-height:180px;overflow:auto;border-left:2px solid var(--line);padding-left:10px}.dest-grid{display:flex;flex-wrap:wrap;gap:6px}.suggest{font-size:13px}.suggest strong{color:var(--info)}
+.keys-row{display:flex;flex-wrap:wrap;gap:4px;align-items:center;padding:6px 0}.keys-row.asking{background:rgba(224,160,96,.12);border:1px solid #e0a060;border-radius:8px;padding:6px 8px}.task-body{max-height:180px;overflow:auto;border-left:2px solid var(--line);padding-left:10px}.dest-grid{display:flex;flex-wrap:wrap;gap:6px}.suggest{font-size:13px}.suggest strong{color:var(--info)}
 .agent-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:12px;align-items:start}
 .agent-box,.branch-box{padding:10px;min-width:0}.branch-box h5{margin:10px 0 4px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
 .file-row{display:flex;gap:8px;align-items:center;background:none;border:0;color:inherit;font:inherit;text-align:left;padding:3px 6px;border-radius:6px;cursor:pointer;width:100%}
