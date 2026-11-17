@@ -2142,8 +2142,7 @@ def api_refs_upload():
 
 @flask_app.route("/api/refs/move", methods=["POST"])
 def api_refs_move():
-    if (denied := _user_only("Moving or renaming references")):
-        return denied
+    """Move or rename an item (agents may sort the library too; links to it follow)."""
     d = request.get_json(silent=True) or {}
     return _ref_call(references.move, d.get("path") or "", d.get("to") or "", d.get("name") or None)
 
@@ -2159,7 +2158,7 @@ def api_refs_delete():
     if (denied := _user_only("Deleting references")):
         return denied
     d = request.get_json(silent=True) or {}
-    return _ref_call(lambda: references.delete(d.get("path") or "") or {})
+    return _ref_call(lambda: {"removed_links": references.delete(d.get("path") or "")})
 
 
 @flask_app.route("/api/refs/dismiss", methods=["POST"])
@@ -2198,6 +2197,47 @@ def api_refs_update():
     return _ref_call(references.update, d.get("path") or "")
 
 
+@flask_app.route("/api/refs/link", methods=["POST"])
+def api_refs_link():
+    """Put a reference in another folder too, as a link to the one copy: {target, into, name?}."""
+    d = request.get_json(silent=True) or {}
+    return _ref_call(references.link, d.get("target") or "", d.get("into") or "", d.get("name") or None)
+
+
+@flask_app.route("/api/refs/links")
+def api_refs_links():
+    return _ref_call(lambda: {"items": references.links_to(request.args.get("path", ""))})
+
+
+@flask_app.route("/api/refs/update-all", methods=["GET", "POST"])
+def api_refs_update_all():
+    """One command for the whole library: POST starts it (in the background), GET shows how it went."""
+    if request.method == "POST":
+        references.update_all()
+    return jsonify({"ok": True, **references.update_all_status(), "every_hours": references.auto_update_hours()})
+
+
+@flask_app.route("/api/refs/auto-update", methods=["POST"])
+def api_refs_auto_update():
+    """How often reference repos update themselves: {hours} (0 turns it off)."""
+    if (denied := _user_only("Changing how often references update")):
+        return denied
+    try:
+        hours = float((request.get_json(silent=True) or {}).get("hours"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "give a number of hours (0 turns it off)"}), 400
+    if not 0 <= hours <= 24 * 30:
+        return jsonify({"ok": False, "error": "between 0 and 720 hours"}), 400
+    store.save_settings({"references": {**(store.settings().get("references") or {}), "auto_update_hours": hours}})
+    return jsonify({"ok": True, "every_hours": hours})
+
+
+@flask_app.route("/api/refs/edited")
+def api_refs_edited():
+    """Reference repos you have changed. They join your chats like the repos you work on."""
+    return jsonify({"ok": True, "items": references.edited_repos()})
+
+
 @flask_app.route("/api/integrations")
 def api_integrations():
     """Where tasks can go: Hermes, Pondering Orb, the LLM wiki."""
@@ -2230,7 +2270,7 @@ def api_integrations_settings():
                            "model": str(h.get("model") or "").strip()[:100]}
     if isinstance(data.get("herdr"), dict):
         h = data["herdr"]
-        kind = str(h.get("kind") or "claude").strip()
+        kind = str(h.get("kind") or "hermes").strip()
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", kind):
             return jsonify({"ok": False, "error": "the agent kind is a name like claude, codex or hermes"}), 400
         patch["herdr"] = {"enabled": bool(h.get("enabled")), "socket": str(h.get("socket") or "").strip()[:500],

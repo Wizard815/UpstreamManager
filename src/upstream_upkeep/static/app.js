@@ -279,6 +279,37 @@ function addTag(repoId, tag) {
   toast(`Tagged ${tag.label} for the chat`, "ok")
 }
 
+// Reference repos you changed join every chat, the way extra folders join a coding agent's conversation.
+// Remove one from a chat and it stays out of that chat until it changes again.
+let _editedCache = { at: 0, items: [] }
+async function editedRefs() {
+  if (Date.now() - _editedCache.at < 30000) return _editedCache.items
+  const r = await api(apiUrl("/api/refs/edited")).catch(() => null)
+  _editedCache = { at: Date.now(), items: r?.ok ? r.items : [] }
+  return _editedCache.items
+}
+const _editedOff = (key) => { try { return JSON.parse(localStorage.getItem(`edited-off:${key}`) || "{}") } catch { return {} } }
+function dismissEdited(key, path, sig) { const m = _editedOff(key); m[path] = sig; try { localStorage.setItem(`edited-off:${key}`, JSON.stringify(m)) } catch {} }
+async function joinEditedRefs(key) {
+  const items = await editedRefs(), off = _editedOff(key)
+  let tags = loadTags(key), added = 0, full = 0
+  for (const e of items) {
+    const sig = `${e.head}:${e.files_count}:${e.commits}`
+    const at = tags.findIndex(t => t.type === "ref" && t.id === e.path)
+    if (at >= 0) { if (tags[at].edited && tags[at].edited !== sig) { tags[at].edited = sig; added++ } continue }
+    if (off[e.path] === sig) continue
+    if (tags.length >= MAX_TAGS) { full++; continue }
+    tags.push({ type: "ref", id: e.path, label: `✎ ${e.name} (your edited reference)`, edited: sig }); added++
+  }
+  // ones that are no longer edited leave again
+  const still = new Set(items.map(e => e.path))
+  const kept = tags.filter(t => !t.edited || still.has(t.id))
+  if (kept.length !== tags.length) { tags = kept; added++ }
+  if (added) saveTags(key, tags)
+  if (full) toast(`${full} edited reference repo${full > 1 ? "s" : ""} couldn't join this chat: it already has ${MAX_TAGS} attachments`, "info")
+  return added
+}
+
 // Ask the chat about something: attach it and start the question in the composer.
 function askAbout(repoId, tag, prompt) {
   const t = loadTags(repoId)
@@ -763,11 +794,14 @@ function chatPanel(repoId, opts = {}) {
       if (!items.length) { tray.append(el("span", { class: "muted small" }, repoId === GENERAL ? "" : "Tip: “Tag” a commit or file to attach it to your next messages.")); return }
       tray.append(el("span", { class: "muted small" }, `Attached (${items.length}/${MAX_TAGS}):`))
       for (const t of items) {
-        const x = el("button", { class: "chip-x", "aria-label": `Remove ${t.label}`, onclick: () => { saveTags(trayKey, loadTags(trayKey).filter(y => !(y.type === t.type && y.id === t.id))); refreshTray() } }, "×")
+        const x = el("button", { class: "chip-x", "aria-label": `Remove ${t.label}`, onclick: () => {
+          if (t.edited) dismissEdited(trayKey, t.id, t.edited)   // it comes back only if it changes again
+          saveTags(trayKey, loadTags(trayKey).filter(y => !(y.type === t.type && y.id === t.id))); refreshTray() } }, "×")
         tray.append(el("span", { class: "chip" }, t.type === "ref" ? t.label : `${t.type === "commit" ? "◆" : "▤"} ${t.label}`, x))
       }
     }
     refreshTray()
+    joinEditedRefs(trayKey).then(n => { if (n && tray.isConnected) refreshTray() })
     sendBtn.onclick = async () => {
       const text = msgIn.value.trim()
       if (!text || sendBtn.disabled) return
@@ -2093,12 +2127,12 @@ function herdrPicker(ints, current) {
   const sel = el("select", { "aria-label": "Which herdr agent" })
   const places = ["", ...(h.machines || []).map(m => m.label)]   // "" is this machine
   const here = (m) => m ? `on ${m}` : places.length > 1 ? "on this machine" : ""
-  const dflt = `new:${h.machine || ""}:${h.kind || "claude"}`
+  const dflt = `new:${h.machine || ""}:${h.kind || "hermes"}`
   const fill = (live) => {
     const keep = sel.value
     sel.replaceChildren(
-      ...places.map(m => el("optgroup", { label: `Start a new agent ${here(m)}`.trim() }, ...(h.kinds || [h.kind || "claude"]).map(k =>
-        el("option", { value: `new:${m}:${k}` }, `new ${k}${m ? ` on ${m}` : ""}${k === h.kind && m === (h.machine || "") ? " (default)" : ""}`)))),
+      ...places.map(m => el("optgroup", { label: `Start a new agent ${here(m)}`.trim() }, ...(h.kinds || [h.kind || "hermes"]).map(k =>
+        el("option", { value: `new:${m}:${k}` }, `new ${k}${m ? ` on ${m}` : ""}${k === h.kind && m === (h.machine || "") ? " (default)" : ""}${!m && h.installed && !h.installed.includes(k) ? " · not found here" : ""}`)))),
       live.length ? el("optgroup", { label: "Give it to a running agent" }, ...live.filter(a => a.name).map(a =>
         el("option", { value: `agent:${a.machine || ""}:${a.name}` }, `${a.name} · ${a.kind || "agent"} · ${a.status}${a.machine ? ` · on ${a.machine}` : ""}${a.task ? ` · on “${a.task.title.slice(0, 30)}”` : ""}`))) : el("optgroup", { label: loaded ? "No other agents are running in herdr" : "Looking for running agents…" }))
     sel.value = [...sel.options].some(o => o.value === keep) ? keep : dflt
@@ -2563,7 +2597,10 @@ async function renderReferences() {
     go2.onclick = () => busy(go2, "Starting…", async () => {
       const r = await api(apiUrl("/api/refs/clone"), { method: "POST", body: JSON.stringify({ url: url.value, folder: current, name: name.value, branch: br.value }) }).catch(e => ({ ok: false, error: e.message }))
       if (!r.ok) return toast(r.error, "error")
-      close(); toast("Cloning in the background (history only; files download when opened)", "ok"); await refreshTree(); drawRight(); pollClones()
+      close()
+      if (r.linked) toast(`Already in the library at ${r.link_to}: linked it here instead of cloning it twice`, "ok")
+      else toast("Cloning in the background (history only; files download when opened)", "ok")
+      await refreshTree(); drawRight(); pollClones()
     })
     close = openDialog(`Clone a reference repo into ${current || "the library"}`, el("div", { class: "col", style: "gap:8px;min-width:min(520px,80vw)" }, url, name, br, el("div", {}, go2)))
     setTimeout(() => url.focus(), 0)
@@ -2574,6 +2611,17 @@ async function renderReferences() {
     await refreshTree(); await drawRight()
     if (right.querySelector("[data-cloning]") || tree.textContent.includes("cloning…")) pollClones()
   }, 2000) }
+  const updAll = el("button", { class: "btn ghost small", title: "Bring every reference repo up to date with where it came from. Ones you edited are only fetched." }, "Update all")
+  const updState = (r) => r.state === "running" ? `Updating ${r.total ?? "…"} repos…`
+    : r.state === "finished" ? `${r.done.length} updated${r.edited.length ? `, ${r.edited.length} edited (fetched only)` : ""}${r.failed.length ? `, ${r.failed.length} failed: ${r.failed.map(f => `${f.path} (${f.error})`).join("; ")}` : ""}` : ""
+  updAll.onclick = () => busy(updAll, "Updating…", async () => {
+    let r = await api(apiUrl("/api/refs/update-all"), { method: "POST", body: "{}" }).catch(e => ({ ok: false, error: e.message }))
+    if (r.ok === false) return toast(r.error, "error")
+    for (let n = 0; r.state === "running" && n < 900 && updAll.isConnected; n++) { await new Promise(res => setTimeout(res, 2000)); r = await api(apiUrl("/api/refs/update-all")).catch(() => ({ state: "running" })) }
+    if (r.state === "finished") toast(updState(r), r.failed?.length ? "error" : "ok")
+    await refreshTree(); drawRight()
+  })
+  api(apiUrl("/api/refs/update-all")).then(r => { updAll.title += r.every_hours ? ` Runs on its own every ${r.every_hours} h${r.last ? `; last ${r.last.slice(0, 16).replace("T", " ")}` : ""}.` : " Automatic updates are off." }).catch(() => {})
   const sortSel = el("select", { "aria-label": "Sort by" }, ...[["name", "Name"], ["added", "Newest"], ["kind", "Type"], ["size", "Size"]].map(([v, l]) => el("option", { value: v }, `Sort: ${l}`)))
   sortSel.value = sortBy
   sortSel.onchange = () => { sortBy = sortSel.value; store_.set("refSort", sortBy); drawRight() }
@@ -2600,7 +2648,8 @@ async function renderReferences() {
     const rows = items.map(i => {
       const row = el("div", { class: "ref-row", draggable: "true", tabindex: "0", ...(i.job?.state === "cloning" ? { "data-cloning": "1" } : {}) },
         el("span", { "aria-hidden": "true" }, REF_ICON[i.kind] || "📎"),
-        el("span", { class: "nm" }, i.name),
+        el("span", { class: "nm" }, i.name, i.link_to ? el("span", { class: "muted small", title: `A link: the one copy is at ${i.link_to}` }, ` 🔗 ${i.link_to}`) : null,
+          i.edited ? el("span", { class: "badge warn", style: "margin-left:6px", title: `${i.edited.files_count} changed file(s), ${i.edited.commits} commit(s) of yours: it joins your chats and updates only fetch` }, "✎ edited") : null),
         el("span", { class: "muted small", style: i.incomplete ? "color:var(--bad)" : null }, i.job ? (i.job.state === "failed" ? `clone failed: ${i.job.error}` : "cloning…")
           : i.incomplete ? "incomplete clone: delete it and clone again" : i.kind === "repo" ? `${i.branch} · ${i.url || i.source || ""}` : i.kind === "folder" ? "" : i.kind),
         el("span", { class: "muted small", style: "text-align:right" }, fmtSize(i.size)),
@@ -2630,7 +2679,13 @@ async function renderReferences() {
     { label: "Rename…", run: async () => { const n = prompt("New name:", i.name); if (!n || n === i.name) return
       const r = await api(apiUrl("/api/refs/move"), { method: "POST", body: JSON.stringify({ path: i.path, to: i.path.split("/").slice(0, -1).join("/"), name: n }) }).catch(e => ({ ok: false, error: e.message }))
       if (!r.ok) return toast(r.error, "error"); await refreshTree(); go(r.path.split("/").slice(0, -1).join("/"), i.kind === "folder" ? null : r.path) } },
-    { label: "Delete", danger: true, run: async () => { if (!confirm(`Delete ${i.path} from the reference library? This removes it from disk.`)) return
+    { label: "Also put it in another folder (link)…", run: async () => {
+      const to = prompt(`Folder to also show ${i.name} in (a library path like projects/allglance; one copy stays on disk):`, ""); if (to === null) return
+      const r = await api(apiUrl("/api/refs/link"), { method: "POST", body: JSON.stringify({ target: i.path, into: to.trim() }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!r.ok) return toast(r.error, "error"); toast(`Linked into ${to.trim() || "the library"}`, "ok"); await refreshTree(); drawRight() } },
+    { label: "Delete", danger: true, run: async () => {
+      const links = (await api(apiUrl(`/api/refs/links?path=${encodeURIComponent(i.path)}`)).catch(() => ({ items: [] }))).items || []
+      if (!confirm(`Delete ${i.path} from the reference library? This removes it from disk.` + (links.length ? `\n\nIt is also linked from ${links.length} place(s) (${links.slice(0, 3).join(", ")}${links.length > 3 ? "…" : ""}); those links go too.` : ""))) return
       const r = await api(apiUrl("/api/refs/delete"), { method: "POST", body: JSON.stringify({ path: i.path }) }).catch(e => ({ ok: false, error: e.message }))
       if (!r.ok) return toast(r.error, "error"); await refreshTree(); go(i.path.split("/").slice(0, -1).join("/")) } },
   ])
@@ -2682,7 +2737,7 @@ async function renderReferences() {
     const upd = el("button", { class: "btn ghost small" }, "Update")
     upd.onclick = () => busy(upd, "Pulling…", async () => {
       const r = await api(apiUrl("/api/refs/update"), { method: "POST", body: JSON.stringify({ path }) }).catch(e => ({ ok: false, error: e.message }))
-      toast(r.ok ? "Up to date" : r.error, r.ok ? "ok" : "error")
+      toast(!r.ok ? r.error : r.skipped ? `Fetched only: ${r.skipped}` : "Up to date", r.ok ? "ok" : "error")
     })
     return el("div", { class: "row", style: "gap:8px;flex-wrap:wrap;align-items:center" }, el("span", { class: "muted small" }, "Branch"), sel, more, mk, upd,
       el("span", { class: "muted small" }, info.url || ""))
@@ -2690,7 +2745,7 @@ async function renderReferences() {
   main.replaceChildren(
     el("div", { class: "row", style: "margin-bottom:12px;gap:10px;flex-wrap:wrap;align-items:center" }, el("h1", { class: "page", style: "margin:0" }, "References"),
       el("span", { class: "muted" }, "Repos and files to look things up in. Any chat or agent can read them."), el("div", { class: "spacer" }),
-      searchIn, sortSel, newFolder, el("button", { class: "btn ghost small", onclick: () => fileIn.click() }, "Upload files"), cloneBtn, fileIn),
+      searchIn, sortSel, updAll, newFolder, el("button", { class: "btn ghost small", onclick: () => fileIn.click() }, "Upload files"), cloneBtn, fileIn),
     el("div", { class: "ref-grid" }, el("div", { class: "panel", style: "min-width:0;padding:6px 0" }, tree, el("div", { style: "padding:6px 10px" }, rootInfo)), right))
   await refreshTree()
   const sel0 = params.get("item"); if (sel0) selected = sel0

@@ -31,7 +31,7 @@ from pathlib import Path
 from . import store
 
 TIMEOUT = 20
-KINDS = ("claude", "codex", "hermes", "opencode", "copilot", "cursor", "pi", "droid", "kimi", "qwen", "grok")
+KINDS = ("hermes", "claude", "codex", "opencode", "copilot", "cursor", "pi", "droid", "kimi", "qwen", "grok")
 
 
 class HerdrError(Exception):
@@ -47,7 +47,7 @@ def settings() -> dict:
     env = os.environ.get
     s.setdefault("socket", "")
     s.setdefault("session", env("HERDR_SESSION", ""))
-    s.setdefault("kind", env("UPSTREAM_HERDR_KIND", "claude"))   # which agent to start for a task
+    s.setdefault("kind", env("UPSTREAM_HERDR_KIND", "hermes"))   # which agent to start for a task
     s.setdefault("args", env("UPSTREAM_HERDR_ARGS", ""))
     s.setdefault("machine", env("UPSTREAM_HERDR_MACHINE", ""))   # "" = this machine; else a saved herdr machine
     s.setdefault("bin", env("UPSTREAM_HERDR_BIN", ""))
@@ -205,9 +205,22 @@ def machines() -> list[dict]:
             for m in rows if isinstance(m, dict) and m.get("label")]
 
 
+# The command each agent kind runs, to see which are installed here (as Hermes Studio lists coding agents).
+_COMMAND = {"cursor": "cursor-agent"}
+
+
+def installed_kinds() -> list[str]:
+    import shutil
+    return [k for k in KINDS if shutil.which(_COMMAND.get(k, k))]
+
+
 def status() -> dict:
     s = settings()
-    out = {"enabled": s["enabled"], "auto": bool(s.get("auto")), "socket": socket_path(), "kind": s["kind"], "kinds": list(KINDS),
+    here = installed_kinds()
+    # installed ones first (the default always first), then the rest herdr knows
+    kinds = list(dict.fromkeys([s["kind"], *here, *KINDS]))
+    out = {"enabled": s["enabled"], "auto": bool(s.get("auto")), "socket": socket_path(), "kind": s["kind"], "kinds": kinds,
+           "installed": here,
            "machine": s["machine"], "path_map": s["path_map"], "cli": bool(binary())}
     if not s["enabled"]:
         return {**out, "ok": False, "error": "off" if not s.get("auto") else f"herdr isn't running here (no socket at {out['socket']})"}
@@ -263,7 +276,7 @@ def start(task_id: str, title: str, workdir: str, prompt: str, kind: str | None 
     s = settings()
     if not s["enabled"]:
         raise HerdrError("herdr isn't set up: turn it on in Settings → herdr")
-    kind = (kind or s["kind"] or "claude").strip()
+    kind = (kind or s["kind"] or "hermes").strip()
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", kind):
         raise HerdrError("the agent kind is a name like claude, codex or hermes")
     if machine is None:

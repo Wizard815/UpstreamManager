@@ -1,6 +1,6 @@
 # Upstream Manager with Docker:
 #
-#   cp .env.example .env        # then set at least REPOS_DIR (see "Docker" at the end of that file)
+#   cp .env.example .env        # then set UPSTREAM_HOME (your ManagerFiles folder, holding Repos/ and References/)
 #   docker compose up -d --build
 #
 # It shares the host's network, so it finds Hermes Studio, the Hermes gateway and Pondering Orb on
@@ -26,8 +26,10 @@ services:
     volumes:
       # the app's own data: settings, memory, task branches, the reference library
       - ${UPSTREAM_DATA_DIR:-${HOME}/.local/share/upstream-manager}:${UPSTREAM_DATA_DIR:-${HOME}/.local/share/upstream-manager}
-      # your repos, where they already are
-      - ${REPOS_DIR:?set REPOS_DIR in .env to the folder that holds your git repos}:${REPOS_DIR}
+      # your files: <UPSTREAM_HOME>/Repos and <UPSTREAM_HOME>/References, at the same path as on the host
+      - ${UPSTREAM_HOME:?set UPSTREAM_HOME in .env to your ManagerFiles folder}:${UPSTREAM_HOME}
+      # repos kept somewhere else: uncomment and set REPOS_DIR in .env
+      # - ${REPOS_DIR}:${REPOS_DIR}
       # herdr's socket (created empty if herdr isn't installed; harmless)
       - ${HERDR_DIR:-${HOME}/.config/herdr}:${HERDR_DIR:-${HOME}/.config/herdr}
       # Optional, uncomment what you have: your git identity, and SSH keys for git@ remotes (read-only)

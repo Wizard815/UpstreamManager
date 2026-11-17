@@ -54,6 +54,37 @@ ENV_MISSING = os.environ["UPSTREAM_ENV_FILE"] if os.environ.get("UPSTREAM_ENV_FI
 ENV_KEYS = load_env_file(ENV_FILE) if ENV_FILE else []
 CONFIG_PATH = Path(os.environ.get("UPSTREAM_STATE_FILE", PROJECT_ROOT / "data" / "state.json"))
 
+
+# Where your files live. One folder (UPSTREAM_HOME, e.g. ~/ManagerFiles) holds Repos/ and References/;
+# either can be pointed elsewhere on its own. Read when used, so tests and Settings can change them.
+def manager_home() -> Path | None:
+    h = os.environ.get("UPSTREAM_HOME", "").strip()
+    return Path(h).expanduser() if h else None
+
+
+def repos_dir() -> Path | None:
+    """The folder new repos are cloned into and scanned for (UPSTREAM_REPOS_DIR, else REPOS_DIR, else <home>/Repos)."""
+    d = os.environ.get("UPSTREAM_REPOS_DIR", "").strip() or os.environ.get("REPOS_DIR", "").strip()
+    if d:
+        return Path(d).expanduser()
+    h = manager_home()
+    return h / "Repos" if h else None
+
+
+def references_dir() -> Path:
+    """The reference library unless Settings names another (UPSTREAM_REFERENCES_DIR, else <home>/References,
+    else next to the repos folder, else the data folder)."""
+    d = os.environ.get("UPSTREAM_REFERENCES_DIR", "").strip()
+    if d:
+        return Path(d).expanduser()
+    h = manager_home()
+    if h:
+        return h / "References"
+    r = repos_dir()
+    if r:
+        return r.parent / "References"
+    return CONFIG_PATH.parent / "references"
+
 _lock = threading.RLock()
 
 
