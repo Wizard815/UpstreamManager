@@ -109,6 +109,33 @@ The agent gets:
 It has no tool that approves, merges into your branch or pushes: those stay
 with you on the Requests page.
 
+## Connections: herdr, Hermes Studio, Hermes, Pondering Orb, the wiki
+
+Tasks (the **Work** page) go to a coding agent or are parked. Each connection is an address and a
+key, set in **Settings** or in an env file: copy `.env.example` to `.env` (beside the project, or
+in `data/`; or name one with `UPSTREAM_ENV_FILE`) and restart. Real environment variables win over
+the file, and what you save in Settings wins over both.
+
+**herdr** runs the agents (Claude Code, Codex, Hermes, ...), and Upstream Manager follows its rules:
+
+- **Same machine**: nothing to set up. As soon as herdr runs as the same user, its socket
+  (`~/.config/herdr/herdr.sock`) is found and used. `UPSTREAM_HERDR=off` turns that off.
+- **Another machine**: add it to herdr once (`herdr machine add <ssh-host>`). It then shows in
+  Settings and in the "herdr agent" choice of every task; calls go through herdr's own connection
+  (`herdr --machine <label> ...`). The task's branch folder must exist over there too: the same
+  path on a shared mount, or a folder map (`UPSTREAM_HERDR_PATH_MAP=/home/me/repos=/srv/repos`).
+- A task goes to a **new agent** of the kind you pick, or to an agent that is **already running**
+  on any of those machines. An agent that is asking something (a trust dialog, an approval) keeps
+  the task until you answer it on the task's page; only you answer agents.
+- A **Hermes** agent started through herdr links to its own session in **Hermes Studio** when
+  Studio's address is set (`HERMES_STUDIO_URL`); run `herdr integration install hermes` once so
+  herdr knows Hermes' sessions.
+
+**Hermes Studio** (`HERMES_STUDIO_URL`, plus a token or `HERMES_STUDIO_USER`/`HERMES_STUDIO_PASSWORD`)
+and the **Hermes API server** (`HERMES_API_URL`, `HERMES_API_KEY`) can also take a task directly.
+**Pondering Orb** (`ORB_URL`, `UPSTREAM_ORB_TOKEN`) and the **LLM wiki** (`LLMWIKI_MCP_URL`,
+`LLMWIKI_API_KEY`) are where a task is parked for later.
+
 ## Memory and day logs
 
 Memory is one local SQLite file (`memory.db`, next to the state file); no

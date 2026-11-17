@@ -288,15 +288,20 @@ def send_to(task_id: str, to: str, message: str | None = None, opts: dict | None
             opts = opts or {}
             text = message or brief(task, repo)
             first = agent_instructions(task, repo, workdir) + "\n\n" + text
-            env = {"UPSTREAM_TASK_ID": task_id, "UPSTREAM_REPO_ID": repo["id"]}
+            env = {"UPSTREAM_TASK_ID": task_id, "UPSTREAM_REPO_ID": repo["id"],
+                   **({"UPSTREAM_APP_URL": __import__("os").environ["UPSTREAM_APP_URL"]} if __import__("os").environ.get("UPSTREAM_APP_URL") else {})}
             where = None
+            machine = opts.get("machine")  # None: wherever Settings says; "": this machine; else a saved herdr machine
             if opts.get("agent"):  # herdr to herdr: give it to an agent that is already running
-                herdr.prompt(opts["agent"], first)
-                kind = next((a["kind"] for a in herdr.agents() if a["name"] == opts["agent"]), None)
-                where = {"type": "herdr", "agent": opts["agent"], "kind": kind, "ours": False, "pending": None}
-            elif prev.get("type") == "herdr" and prev.get("agent") and not opts.get("kind"):
+                m = machine if machine is not None else herdr.settings()["machine"]
+                if m:  # it works where it lives: tell it the folder as that machine sees it
+                    first = first.replace(workdir, herdr.remote_path(workdir, m))
+                herdr.prompt(opts["agent"], first, m)
+                kind = next((a["kind"] for a in herdr.agents(m or None) if a["name"] == opts["agent"]), None)
+                where = {"type": "herdr", "agent": opts["agent"], "kind": kind, "ours": False, "pending": None, "machine": m or ""}
+            elif prev.get("type") == "herdr" and prev.get("agent") and not opts.get("kind") and machine in (None, prev.get("machine", "")):
                 try:
-                    herdr.prompt(prev["agent"], text)
+                    herdr.prompt(prev["agent"], text, prev.get("machine"))
                     where = prev
                 except herdr.HerdrError as e:
                     if e.code == "agent_blocked":  # it is asking something: keep the message until it is answered
@@ -304,7 +309,10 @@ def send_to(task_id: str, to: str, message: str | None = None, opts: dict | None
                     elif e.code != "agent_not_found":  # gone (its pane was closed): start a fresh one below
                         raise
             if where is None:  # a new agent (the first time, a different kind, or the old one is gone)
-                info = herdr.start(task_id, task["title"], workdir, first, kind=opts.get("kind"), env=env)
+                m = machine if machine is not None else herdr.settings()["machine"]
+                if m:
+                    first = first.replace(workdir, herdr.remote_path(workdir, m))
+                info = herdr.start(task_id, task["title"], workdir, first, kind=opts.get("kind"), env=env, machine=m)
                 where = {"type": "herdr", **info}
             where = {**where, "workspace": ws and ws["name"], "workdir": workdir}
         else:
@@ -333,7 +341,7 @@ def herdr_sync(task: dict, info: dict) -> dict:
     status, changed, note = info.get("status"), False, None
     if where.get("pending") and status in ("idle", "done"):
         try:
-            herdr.prompt(where["agent"], where["pending"])
+            herdr.prompt(where["agent"], where["pending"], where.get("machine"))
             where["pending"], changed, note = None, True, "the agent is ready: sent it the task"
             status = "working"
         except herdr.HerdrError as e:

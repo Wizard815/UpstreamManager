@@ -2091,18 +2091,23 @@ const DEST = {
 function herdrPicker(ints, current) {
   const h = ints.herdr || {}
   const sel = el("select", { "aria-label": "Which herdr agent" })
+  const places = ["", ...(h.machines || []).map(m => m.label)]   // "" is this machine
+  const here = (m) => m ? `on ${m}` : places.length > 1 ? "on this machine" : ""
+  const dflt = `new:${h.machine || ""}:${h.kind || "claude"}`
   const fill = (live) => {
     const keep = sel.value
     sel.replaceChildren(
-      el("optgroup", { label: "Start a new agent" }, ...(h.kinds || [h.kind || "claude"]).map(k => el("option", { value: `new:${k}` }, `new ${k}${k === h.kind ? " (default)" : ""}`))),
+      ...places.map(m => el("optgroup", { label: `Start a new agent ${here(m)}`.trim() }, ...(h.kinds || [h.kind || "claude"]).map(k =>
+        el("option", { value: `new:${m}:${k}` }, `new ${k}${m ? ` on ${m}` : ""}${k === h.kind && m === (h.machine || "") ? " (default)" : ""}`)))),
       live.length ? el("optgroup", { label: "Give it to a running agent" }, ...live.filter(a => a.name).map(a =>
-        el("option", { value: `agent:${a.name}` }, `${a.name} · ${a.kind || "agent"} · ${a.status}${a.task ? ` · on “${a.task.title.slice(0, 30)}”` : ""}`))) : el("optgroup", { label: "No agents running in herdr yet" }))
-    sel.value = [...sel.options].some(o => o.value === keep) ? keep : `new:${h.kind || "claude"}`
+        el("option", { value: `agent:${a.machine || ""}:${a.name}` }, `${a.name} · ${a.kind || "agent"} · ${a.status}${a.machine ? ` · on ${a.machine}` : ""}${a.task ? ` · on “${a.task.title.slice(0, 30)}”` : ""}`))) : el("optgroup", { label: "No agents running in herdr yet" }))
+    sel.value = [...sel.options].some(o => o.value === keep) ? keep : dflt
   }
   fill([])
   if (h.ok) api(apiUrl("/api/herdr/agents")).then(r => fill((r.items || []).filter(a => a.name !== current))).catch(() => {})
   const row = el("label", { class: "row small muted", style: "gap:6px;align-items:center", hidden: h.ok ? null : "" }, "herdr agent:", sel)
-  return { row, value: () => sel.value.startsWith("agent:") ? { agent: sel.value.slice(6) } : { agent_kind: sel.value.slice(4) } }
+  return { row, value: () => { const [what, machine, ...rest] = sel.value.split(":"); const name = rest.join(":")
+    return what === "agent" ? { agent: name, machine } : { agent_kind: name, machine } } }
 }
 
 let drawDests = null
@@ -2247,7 +2252,7 @@ async function renderWork() {
     const cls = { working: "info", blocked: "warn", done: "ok", idle: "", unknown: "" }
     roster.replaceChildren(el("div", { class: "row", style: "gap:6px;align-items:center;margin-bottom:4px" }, el("strong", { class: "small" }, "Agents in herdr"), el("span", { class: "muted small" }, r.error || `${live.length} running`)),
       ...live.map(a => el("button", { class: "file-row", title: a.cwd || "", onclick: () => a.task ? pick({ id: a.task.id }) : toast(`${a.name} isn't on a task from here. Pick it in “herdr agent” when you send one.`, "info") },
-        badge(cls[a.status] ?? "", a.status === "blocked" ? "needs you" : a.status), el("span", { class: "nm", style: "flex:0 1 auto;min-width:90px", title: a.name }, a.name), el("span", { class: "muted small", style: "flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, ` ${a.kind || ""}${a.task ? ` · ${a.task.title.slice(0, 40)}` : " · free"}`))),
+        badge(cls[a.status] ?? "", a.status === "blocked" ? "needs you" : a.status), el("span", { class: "nm", style: "flex:0 1 auto;min-width:90px", title: a.name }, a.name), a.machine ? badge("", a.machine, "runs on this herdr machine") : null, el("span", { class: "muted small", style: "flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, ` ${a.kind || ""}${a.task ? ` · ${a.task.title.slice(0, 40)}` : " · free"}`))),
       ...(live.length ? [] : [el("div", { class: "muted small" }, "None yet. Send a task to herdr and its agent shows here.")]))
     setTimeout(drawRoster, 8000)
   }
@@ -2346,7 +2351,7 @@ function agentPanel(t) {
     const r = await api(apiUrl(`/api/tasks/${t.id}/agent`)).catch(e => ({ ok: false, error: e.message, messages: [] }))
     const running = r.run?.running
     const says = { working: "working…", blocked: "is asking you something: answer it below", done: "finished: review its changes", idle: "is idle, waiting for you", unknown: "is running (herdr can't tell what it's doing)" }
-    state.textContent = !r.ok ? (r.gone ? r.error : `Can't reach it: ${r.error}`) : r.type === "herdr" ? `${r.agent} (${r.kind || "agent"}) ${says[r.status] || r.status}${r.pending ? " — your task is held until it's ready" : ""}`
+    state.textContent = !r.ok ? (r.gone ? r.error : `Can't reach it: ${r.error}`) : r.type === "herdr" ? `${r.agent} (${r.kind || "agent"}${r.machine ? ` on ${r.machine}` : ""}) ${says[r.status] || r.status}${r.pending ? " — your task is held until it's ready" : ""}`
       : running ? "Working on it… (big jobs take a while; you can leave this page)" : r.run?.error ? `Last message failed: ${r.run.error}` : "Waiting for you"
     state.style.color = !r.ok || r.run?.error ? "var(--bad)" : r.status === "blocked" ? "#e0a060" : running ? "var(--info)" : r.status === "done" ? "var(--good)" : ""
     sendBtn.disabled = !!running && r.type !== "herdr"
@@ -2735,6 +2740,10 @@ async function integrationsSetup() {
   const hd = ints.herdr || {}, st = ints.studio || {}
   const hdOn = el("input", { type: "checkbox", style: "height:auto" }); hdOn.checked = !!hd.enabled
   const hdSock = el("input", { value: (hd.socket || "").startsWith("/") && hd.enabled ? hd.socket : "", placeholder: hd.socket || "~/.config/herdr/herdr.sock", style: "width:100%" })
+  const hdMachine = el("select", { "aria-label": "Where agents start" }, el("option", { value: "" }, "this machine"), ...(hd.machines || []).map(m => el("option", { value: m.label }, m.label)))
+  if (hd.machine && ![...hdMachine.options].some(o => o.value === hd.machine)) hdMachine.append(el("option", { value: hd.machine }, hd.machine))
+  hdMachine.value = hd.machine || ""
+  const hdMap = el("input", { value: hd.path_map || "", placeholder: "/home/me/repos=/srv/repos (only if folders differ over there)", style: "width:100%" })
   const hdKind = el("select", { "aria-label": "Agent to start" }, ...["claude", "codex", "hermes", "opencode", "copilot", "cursor", "pi", "droid", "kimi", "qwen", "grok"].map(k => el("option", { value: k }, k)))
   hdKind.value = hd.kind || "claude"
   const stOn = el("input", { type: "checkbox", style: "height:auto" }); stOn.checked = !!st.enabled
@@ -2754,14 +2763,18 @@ async function integrationsSetup() {
     if (oKey.value.trim()) keys.orb_token = oKey.value.trim()
     if (Object.keys(keys).length) await api(apiUrl("/api/credentials"), { method: "POST", body: JSON.stringify(keys) })
     const r = await api(apiUrl("/api/integrations/settings"), { method: "POST", body: JSON.stringify({ hermes: { enabled: hOn.checked, url: hUrl.value, profile: hProfile.value, model: hModel.value },
-      herdr: { enabled: hdOn.checked, socket: hdSock.value, kind: hdKind.value }, studio: { enabled: stOn.checked, url: stUrl.value, agent: stAgent.value },
+      herdr: { enabled: hdOn.checked, socket: hdSock.value, kind: hdKind.value, machine: hdMachine.value, path_map: hdMap.value }, studio: { enabled: stOn.checked, url: stUrl.value, agent: stAgent.value },
       ...(stUser.value.trim() ? { studio_login: { username: stUser.value.trim(), password: stPass.value } } : {}),
       orb: { url: oUrl.value, list: oList.value } }) }).catch(e => ({ ok: false, error: e.message }))
     if (r.ok === false) return toast(r.error, "error")
     toast("Saved", "ok"); box.replaceWith(await integrationsSetup())
   })
   const mcpCmd = `hermes mcp add upstream --command upstream-mcp --env UPSTREAM_APP_URL=${location.origin}${BASE}`
-  box.append(el("h4", { style: "margin-top:20px" }, "Hermes"),
+  const ef = ints.env_file || {}
+  box.append(el("h4", { style: "margin-top:20px" }, "Connections"),
+    el("div", { class: "muted" }, ef.path ? `Reading ${ef.keys.length} setting${ef.keys.length === 1 ? "" : "s"} from ${ef.path}${ef.keys.length ? ` (${ef.keys.join(", ")})` : ""}. What you save below wins over the file.`
+      : `Every connection below can also be set in an env file: copy .env.example to .env (${(ef.looked || []).join(" or ")}) and restart. What you save here wins over the file.`),
+    el("h4", { style: "margin-top:20px" }, "Hermes"),
     el("div", { class: "muted" }, "Hand bigger or longer tasks to a Hermes agent. Turn on Hermes' API server (API_SERVER_ENABLED=true and an API_SERVER_KEY), then point this at it. Each task gets its own branch; Hermes works there and you approve the result here."),
     el("div", { class: "col", style: "margin-top:8px" }, el("label", { class: "row" }, hOn, "Use Hermes"),
       el("label", { class: "col", style: "gap:4px" }, "API server address", hUrl),
@@ -2773,7 +2786,10 @@ async function integrationsSetup() {
     el("div", { class: "muted" }, "Start a coding agent (Claude Code, Codex, Hermes…) in herdr, on the task's branch. herdr is reached over its local socket, so it must run as you on this machine; it can hand work on to other machines itself (herdr --machine)."),
     el("div", { class: "col", style: "margin-top:8px" }, el("label", { class: "row" }, hdOn, "Use herdr"),
       el("div", { class: "row", style: "gap:8px" }, el("label", { class: "col", style: "gap:4px;flex:1" }, "Socket (empty for the default)", hdSock), el("label", { class: "col", style: "gap:4px" }, "Agent to start", hdKind)),
-      line(hd, `Connected to herdr ${hd.version || ""} at ${hd.socket}.`),
+      el("div", { class: "row", style: "gap:8px" }, el("label", { class: "col", style: "gap:4px" }, "Start agents on", hdMachine),
+        el("label", { class: "col", style: "gap:4px;flex:1" }, "Folder map for other machines", hdMap)),
+      line(hd, hd.machine ? `Connected to herdr on ${hd.machine}, through this machine's herdr.` : `Connected to herdr ${hd.version || ""} on this machine${hd.auto ? " (found automatically)" : ""}${(hd.machines || []).length ? `; it also reaches ${hd.machines.map(m => m.label).join(", ")}` : ""}.`),
+      el("div", { class: "muted small" }, "Same machine: nothing to set up, herdr is used as soon as it runs. Another machine: add it to herdr once (herdr machine add <ssh-host>) and it shows here; tasks then go through herdr's own connection."),
       el("details", {}, el("summary", { class: "muted small" }, "Give herdr's agents Upstream Manager's tools (once per agent kind)"),
         el("pre", { class: "code-pre", style: "white-space:pre-wrap" }, [
           `# Claude Code\nclaude mcp add upstream -e UPSTREAM_APP_URL=${location.origin}${BASE} -- upstream-mcp`,

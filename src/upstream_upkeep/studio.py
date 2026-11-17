@@ -23,21 +23,45 @@ _RUNS: dict[str, dict] = {}
 _LOCK = threading.Lock()
 
 
+def _why(e: Exception) -> str:
+    """A network error in a few words."""
+    t = str(e)
+    return ("nothing is listening there (is it running?)" if "Connection refused" in t else "timed out" if "timed out" in t.lower()
+            else "that name doesn't resolve" if "resolve" in t or "Name or service" in t else type(e).__name__)
+
+
 class StudioError(Exception):
     pass
 
 
 def settings() -> dict:
     s = dict(store.settings().get("studio") or {})
-    s.setdefault("enabled", False)
+    s.setdefault("enabled", bool(os.environ.get("HERMES_STUDIO_URL", "").strip()))  # an address in the env file turns it on
     s.setdefault("url", os.environ.get("HERMES_STUDIO_URL", "").strip() or "http://127.0.0.1:8648")
-    s.setdefault("profile", "")
-    s.setdefault("agent", "")   # "" = Hermes itself; or claude-code, codex, opencode, pi, grok
+    s.setdefault("profile", os.environ.get("HERMES_STUDIO_PROFILE", "").strip())
+    s.setdefault("agent", os.environ.get("HERMES_STUDIO_AGENT", "").strip())   # "" = Hermes itself; or claude-code, codex, opencode, pi, grok
     return s
 
 
-def _headers() -> dict:
+def _token() -> str:
+    """The saved or env token; else sign in once with HERMES_STUDIO_USER / HERMES_STUDIO_PASSWORD from the env file."""
     tok = credentials.get("studio_token")
+    user, pw = os.environ.get("HERMES_STUDIO_USER", "").strip(), os.environ.get("HERMES_STUDIO_PASSWORD", "")
+    if not tok and user and pw and not _LOGIN.get("tried"):
+        _LOGIN["tried"] = True
+        try:
+            login(user, pw)
+            tok = credentials.get("studio_token")
+        except StudioError:
+            pass
+    return tok
+
+
+_LOGIN: dict = {}
+
+
+def _headers() -> dict:
+    tok = _token()
     h = {"Content-Type": "application/json"}
     if tok:
         h["Authorization"] = f"Bearer {tok}"
@@ -53,7 +77,7 @@ def _req(method: str, path: str, timeout: float = TIMEOUT, **kw) -> dict:
     try:
         r = requests.request(method, s["url"].rstrip("/") + path, headers=_headers(), timeout=timeout, **kw)
     except requests.RequestException as e:
-        raise StudioError(f"can't reach Hermes Studio at {s['url']}: {e}") from e
+        raise StudioError(f"can't reach Hermes Studio at {s['url']} ({_why(e)})") from e
     if r.status_code == 401:
         raise StudioError("Studio wants a sign-in: save a Studio token (or sign in) under Settings → Hermes Studio")
     if r.status_code >= 400:
@@ -73,7 +97,7 @@ def login(username: str, password: str) -> None:
     try:
         r = requests.post(s["url"].rstrip("/") + "/api/auth/login", json={"username": username, "password": password}, timeout=TIMEOUT)
     except requests.RequestException as e:
-        raise StudioError(f"can't reach Hermes Studio at {s['url']}: {e}") from e
+        raise StudioError(f"can't reach Hermes Studio at {s['url']} ({_why(e)})") from e
     try:
         token = (r.json() or {}).get("token") if r.status_code < 400 else None
     except ValueError:
@@ -85,7 +109,7 @@ def login(username: str, password: str) -> None:
 
 def status() -> dict:
     s = settings()
-    out = {"enabled": s["enabled"], "url": s["url"], "agent": s["agent"], "profile": s["profile"], "token_set": bool(credentials.get("studio_token"))}
+    out = {"enabled": s["enabled"], "url": s["url"], "agent": s["agent"], "profile": s["profile"], "token_set": bool(_token())}
     if not s["enabled"]:
         return {**out, "ok": False, "error": "off"}
     try:

@@ -1657,12 +1657,14 @@ def api_tasks():
     out = [_task_out(t) for t in items]
     if any((t.get("where") or {}).get("type") == "herdr" and t["status"] == "working" for t in items):
         try:  # one cheap local call: what each herdr agent is doing right now
-            live = {a["name"]: a for a in herdr.agents()}
+            agents_now, unreachable = herdr.all_agents()
+            live = {(a.get("machine") or "", a["name"]): a for a in agents_now}
             for o in out:
                 w = o.get("where") or {}
                 if w.get("type") == "herdr" and o["status"] == "working":
-                    a = live.get(w.get("agent"))
-                    o["agent_status"] = a["status"] if a else "gone"
+                    a = live.get((w.get("machine") or "", w.get("agent")))
+                    if a or (w.get("machine") or "this machine") not in unreachable:
+                        o["agent_status"] = a["status"] if a else "gone"
         except herdr.HerdrError:
             pass
     return jsonify({"ok": True, "items": out})
@@ -1687,8 +1689,11 @@ def api_task_create():
 
 def _herdr_opts(data: dict) -> dict:
     """For herdr: {agent_kind} starts that kind of agent, {agent} gives the task to one that is already running."""
-    return {opt: str(data[k]).strip()[:64] for k, opt in (("agent_kind", "kind"), ("agent", "agent"))
-            if isinstance(data.get(k), str) and data[k].strip()}
+    out = {opt: str(data[k]).strip()[:64] for k, opt in (("agent_kind", "kind"), ("agent", "agent"))
+           if isinstance(data.get(k), str) and data[k].strip()}
+    if isinstance(data.get("machine"), str):  # "" is this machine; a label is one of herdr's saved machines
+        out["machine"] = data["machine"].strip()[:100]
+    return out
 
 
 def _task_json(out: dict) -> dict:
@@ -1905,12 +1910,12 @@ def api_task_agent(task_id):
         if w.get("type") == "studio":
             return jsonify({"ok": True, "type": "studio", "url": w.get("url"), "messages": studio.messages(w["studio"]), "run": studio.run_state(w["studio"])})
         if w.get("type") == "herdr":
-            a = herdr.agent(w["agent"])
+            a = herdr.agent(w["agent"], w.get("machine"))
             t = tasks.herdr_sync(t, a)
             w = t["where"]
             hermes_session = a.get("session") if (a.get("session_agent") or a.get("kind") or "").startswith("hermes") else None
             return jsonify({"ok": True, "type": "herdr", "agent": w["agent"], **a, "kind": a.get("kind") or w.get("kind"),
-                            "pending": bool(w.get("pending")), "ours": bool(w.get("ours")),
+                            "pending": bool(w.get("pending")), "ours": bool(w.get("ours")), "machine": w.get("machine") or "",
                             "studio_url": studio.link(hermes_session) if hermes_session and studio.settings()["enabled"] else None,
                             "run": {"running": a["status"] == "working", "error": None}})
     except (hermes.HermesError, studio.StudioError, herdr.HerdrError) as e:
@@ -1931,7 +1936,7 @@ def api_task_keys(task_id):
     if w.get("type") != "herdr":
         return jsonify({"ok": False, "error": "this task is not with a herdr agent"}), 400
     try:
-        herdr.send_keys(w["agent"], (request.get_json(silent=True) or {}).get("keys"))
+        herdr.send_keys(w["agent"], (request.get_json(silent=True) or {}).get("keys"), w.get("machine"))
     except herdr.HerdrError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     return jsonify({"ok": True})
@@ -1947,7 +1952,7 @@ def api_task_herdr_close(task_id):
     if w.get("type") != "herdr" or not w.get("ours") or not w.get("workspace_id"):
         return jsonify({"ok": False, "error": "this task didn't open a herdr workspace of its own"}), 400
     try:
-        herdr.close_workspace(w["workspace_id"])
+        herdr.close_workspace(w["workspace_id"], w.get("machine"))
     except herdr.HerdrError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     tasks.update(task_id, where={**w, "closed": True}, note="closed its herdr workspace")
@@ -1957,16 +1962,14 @@ def api_task_herdr_close(task_id):
 @flask_app.route("/api/herdr/agents")
 def api_herdr_agents():
     """The agents herdr is running now, each with the task it works on (if it came from here)."""
-    try:
-        live = herdr.agents() if herdr.settings()["enabled"] else []
-    except herdr.HerdrError as e:
-        return jsonify({"ok": False, "error": str(e), "items": []})
-    by_agent = {(t.get("where") or {}).get("agent"): t for t in tasks.list_tasks() if (t.get("where") or {}).get("type") == "herdr"
-                and t["status"] not in ("done", "dropped")}
+    live, errors = herdr.all_agents() if herdr.settings()["enabled"] else ([], {})
+    by_agent = {((t["where"].get("machine") or ""), t["where"].get("agent")): t for t in tasks.list_tasks()
+                if (t.get("where") or {}).get("type") == "herdr" and t["status"] not in ("done", "dropped")}
     for a in live:
-        t = by_agent.get(a["name"])
+        t = by_agent.get((a.get("machine") or "", a["name"]))
         a["task"] = {"id": t["id"], "title": t["title"]} if t else None
-    return jsonify({"ok": True, "items": live})
+    return jsonify({"ok": not errors or bool(live), "items": live, "errors": errors,
+                    "error": "; ".join(f"{k}: {v}" for k, v in errors.items()) or None})
 
 
 @flask_app.route("/api/tasks/<task_id>/suggest")
@@ -2147,6 +2150,8 @@ def api_integrations():
     w = wiki.status()
     _AVAIL["at"] = 0.0
     return jsonify({"ok": True, "hermes": hermes.status(), "herdr": herdr.status(), "studio": studio.status(), "orb": orb.status(),
+                    "env_file": {"path": str(config.ENV_FILE) if config.ENV_FILE else None, "keys": config.ENV_KEYS,
+                                 "looked": [str(config.PROJECT_ROOT / ".env"), str(config.PROJECT_ROOT / "data" / ".env")]},
                     "suggest": (store.settings().get("work") or {}).get("suggest", "ask"),
                     "wiki": {"ok": bool(w.get("writer")) or bool(w.get("ok")), "writer": w.get("writer"), "reader": w.get("ok"),
                              "error": w.get("error")}})
@@ -2174,7 +2179,8 @@ def api_integrations_settings():
             return jsonify({"ok": False, "error": "the agent kind is a name like claude, codex or hermes"}), 400
         patch["herdr"] = {"enabled": bool(h.get("enabled")), "socket": str(h.get("socket") or "").strip()[:500],
                           "session": re.sub(r"[^A-Za-z0-9_.-]", "", str(h.get("session") or "")), "kind": kind,
-                          "args": str(h.get("args") or "").strip()[:300]}
+                          "args": str(h.get("args") or "").strip()[:300], "machine": str(h.get("machine") or "").strip()[:100],
+                          "path_map": str(h.get("path_map") or "").strip()[:1000]}
     if isinstance(data.get("studio"), dict):
         st = data["studio"]
         url = str(st.get("url") or "").strip()

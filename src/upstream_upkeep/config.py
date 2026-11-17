@@ -16,6 +16,39 @@ from typing import Any
 
 # Project root is three levels up from this file (src/upstream_upkeep/config.py).
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def load_env_file(path: Path) -> list[str]:
+    """Read KEY=VALUE lines into the environment (real environment variables win). Returns the keys set.
+
+    The format is the usual .env one: blank lines and # comments are skipped, "export " is allowed,
+    values may be quoted. Nothing is expanded or executed."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    done = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.removeprefix("export ").partition("=")
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        elif " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
+        if key.replace("_", "").isalnum() and key not in os.environ:
+            os.environ[key] = value
+            done.append(key)
+    return done
+
+
+# Connections (herdr, Hermes, Studio, Orb, the wiki, the model) can be set in an env file: the one
+# named by UPSTREAM_ENV_FILE, else .env beside the project, else .env in the data folder.
+ENV_FILE = next((p for p in [Path(os.environ["UPSTREAM_ENV_FILE"])] if p.is_file()), None) if os.environ.get("UPSTREAM_ENV_FILE") else \
+    next((p for p in (PROJECT_ROOT / ".env", PROJECT_ROOT / "data" / ".env") if p.is_file()), None)
+ENV_KEYS = load_env_file(ENV_FILE) if ENV_FILE else []
 CONFIG_PATH = Path(os.environ.get("UPSTREAM_STATE_FILE", PROJECT_ROOT / "data" / "state.json"))
 
 _lock = threading.RLock()

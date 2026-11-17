@@ -24,6 +24,13 @@ _RUNS: dict[str, dict] = {}   # session id -> {"since", "error", "running"}
 _LOCK = threading.Lock()
 
 
+def _why(e: Exception) -> str:
+    """A network error in a few words."""
+    t = str(e)
+    return ("nothing is listening there (is it running?)" if "Connection refused" in t else "timed out" if "timed out" in t.lower()
+            else "that name doesn't resolve" if "resolve" in t or "Name or service" in t else type(e).__name__)
+
+
 class HermesError(Exception):
     pass
 
@@ -31,14 +38,14 @@ class HermesError(Exception):
 def settings() -> dict:
     s = dict(store.settings().get("hermes") or {})
     s.setdefault("url", os.environ.get("HERMES_API_URL", "").strip() or "http://127.0.0.1:8642")
-    s.setdefault("profile", "")
-    s.setdefault("model", "")
+    s.setdefault("profile", os.environ.get("HERMES_API_PROFILE", "").strip())
+    s.setdefault("model", os.environ.get("HERMES_API_MODEL", "").strip())
     s.setdefault("enabled", bool(os.environ.get("HERMES_API_URL")))
     return s
 
 
 def _key() -> str:
-    return credentials.get("hermes_api_key") or os.environ.get("HERMES_API_KEY", "").strip()
+    return credentials.get("hermes_api_key") or os.environ.get("HERMES_API_KEY", "").strip() or os.environ.get("API_SERVER_KEY", "").strip()
 
 
 def _base() -> str:
@@ -57,7 +64,7 @@ def _req(method: str, path: str, timeout: float = TIMEOUT, **kw) -> dict:
     try:
         r = requests.request(method, _base() + path, headers=headers, timeout=timeout, **kw)
     except requests.RequestException as e:
-        raise HermesError(f"can't reach Hermes at {s['url']}: {e}") from e
+        raise HermesError(f"can't reach Hermes at {s['url']} ({_why(e)})") from e
     if r.status_code in (401, 403):
         raise HermesError("Hermes refused the key: save its API_SERVER_KEY under Settings → Hermes")
     if r.status_code >= 400:
