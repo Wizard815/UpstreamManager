@@ -313,6 +313,19 @@ def send_to(task_id: str, to: str, message: str | None = None, opts: dict | None
                 m = machine if machine is not None else herdr.settings()["machine"]
                 if m:
                     first = first.replace(workdir, herdr.remote_path(workdir, m))
+                kind = (opts.get("kind") or herdr.settings()["kind"] or "hermes").strip()
+                if not m and studio.herdr_via_studio():
+                    # This machine, with Studio: the agent becomes a Studio chat in its herdr space,
+                    # and Studio reports back how it is doing. Upstream's own herdr is the fallback.
+                    try:
+                        info = studio.herdr_launch(kind, workdir, task["title"], first, task_id, repo.get("name") or repo["id"])
+                        where = {"type": "herdr", "via": "studio", "agent": info["pane_id"], "kind": kind, "ours": False,
+                                 "pending": None, "machine": "", "workspace_id": info.get("workspace_id"),
+                                 "attempt": int(prev.get("attempt") or 0) + 1 if prev.get("type") == "herdr" else 1}
+                    except studio.StudioError as e:
+                        where = None
+                        update(task_id, note=f"Studio couldn't start the agent ({e}); started it in herdr directly")
+            if where is None:
                 info = herdr.start(task_id, task["title"], workdir, first, kind=opts.get("kind"), env=env, machine=m,
                                    attempt=int(prev.get("attempt") or 0) + 1 if prev.get("type") == "herdr" else 1)
                 where = {"type": "herdr", **info}

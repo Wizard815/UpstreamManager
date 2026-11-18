@@ -133,6 +133,9 @@ def _refuse_cross_site_writes():
     """
     if not _host_ok(request.host) and not _host_ok(request.headers.get("X-Forwarded-Host", "")):
         return jsonify({"ok": False, "error": f"unknown host {request.host}: add it to UPSTREAM_ALLOWED_HOSTS"}), 403
+    # Studio's Upstream tab hands over its address and a login, so Upstream can call Studio back.
+    if request.headers.get("X-Studio-Token") and _via_trusted_proxy():
+        studio.adopt(request.headers.get("X-Studio-Url", ""), request.headers.get("X-Studio-Token", ""))
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
     # File uploads are multipart; a custom header forces the same preflight a JSON body does.
@@ -1684,7 +1687,8 @@ def api_tasks():
     if any((t.get("where") or {}).get("type") == "herdr" and t["status"] == "working" for t in items):
         try:  # one cheap local call: what each herdr agent is doing right now
             agents_now, unreachable = herdr.all_agents()
-            live = {(a.get("machine") or "", a["name"]): a for a in agents_now}
+            live = {(a.get("machine") or "", a["name"]): a for a in agents_now if a.get("name")}
+            live.update({(a.get("machine") or "", a["pane_id"]): a for a in agents_now if a.get("pane_id")})  # started through Studio
             for o in out:
                 w = o.get("where") or {}
                 if w.get("type") == "herdr" and o["status"] == "working":
@@ -1968,9 +1972,17 @@ def api_task_agent(task_id):
             t = tasks.herdr_sync(t, a)
             w = t["where"]
             hermes_session = a.get("session") if (a.get("session_agent") or a.get("kind") or "").startswith("hermes") else None
+            chat = None
+            if w.get("via") == "studio":   # started as a Studio chat: link to that chat
+                chat = w.get("studio_session") or studio.session_for_pane(w["agent"])
+                if chat and chat != w.get("studio_session"):
+                    t = tasks.update(task_id, where={**w, "studio_session": chat})
+                    w = t["where"]
+            chat = chat or hermes_session
             return jsonify({"ok": True, "type": "herdr", "agent": w["agent"], **a, "kind": a.get("kind") or w.get("kind"),
                             "pending": bool(w.get("pending")), "ours": bool(w.get("ours")), "machine": w.get("machine") or "",
-                            "studio_url": studio.link(hermes_session) if hermes_session and studio.settings()["enabled"] else None,
+                            "via": w.get("via") or "herdr", "studio_session": chat,
+                            "studio_url": studio.link(chat) if chat and studio.settings()["enabled"] else None,
                             "run": {"running": a["status"] == "working", "error": None}})
     except (hermes.HermesError, studio.StudioError, herdr.HerdrError) as e:
         gone = getattr(e, "code", None) == "agent_not_found"
@@ -1978,6 +1990,27 @@ def api_task_agent(task_id):
                         "error": "this agent is no longer running in herdr (its pane was closed). Send the task to herdr again to start a new one."
                         if gone else str(e)})
     return jsonify({"ok": False, "error": "not with an agent", "messages": []})
+
+
+@flask_app.route("/api/tasks/<task_id>/agent-status", methods=["POST"])
+def api_task_agent_status(task_id):
+    """Studio says how the herdr agent it started for this task is doing: {status, pane, agent?}.
+    Only Studio itself (its server, on this machine or a trusted proxy address) may say so."""
+    if not _via_trusted_proxy() or _from_agent():
+        return jsonify({"ok": False, "error": "only Hermes Studio reports agent status"}), 403
+    t = tasks.get(task_id) or abort(404)
+    d = request.get_json(silent=True) or {}
+    w = t.get("where") or {}
+    status = str(d.get("status") or "")
+    if status not in ("idle", "working", "blocked", "done", "gone"):
+        return jsonify({"ok": False, "error": "status is idle, working, blocked, done or gone"}), 400
+    if w.get("type") != "herdr" or (d.get("pane") and w.get("agent") != d.get("pane")):
+        return jsonify({"ok": True, "ignored": "the task has moved on to another agent"})
+    if status == "gone":
+        tasks.update(task_id, where={**w, "agent": None}, note="its agent's herdr pane was closed")
+    else:
+        tasks.herdr_sync(t, {"status": status})
+    return jsonify({"ok": True})
 
 
 @flask_app.route("/api/tasks/<task_id>/keys", methods=["POST"])
@@ -2020,7 +2053,7 @@ def api_herdr_agents():
     by_agent = {((t["where"].get("machine") or ""), t["where"].get("agent")): t for t in tasks.list_tasks()
                 if (t.get("where") or {}).get("type") == "herdr" and t["status"] not in ("done", "dropped")}
     for a in live:
-        t = by_agent.get((a.get("machine") or "", a["name"]))
+        t = by_agent.get((a.get("machine") or "", a["name"])) or by_agent.get((a.get("machine") or "", a.get("pane_id")))
         a["task"] = {"id": t["id"], "title": t["title"]} if t else None
     return jsonify({"ok": not errors or bool(live), "items": live, "errors": errors,
                     "error": "; ".join(f"{k}: {v}" for k, v in errors.items()) or None})
@@ -2551,6 +2584,9 @@ TEMPLATE = r"""<!DOCTYPE html>
   a { color: var(--accent2); } a:hover { color: #c7d4ff; }
   code, pre, .mono { font-family: var(--mono); }
   header.top { position: sticky; top: 0; z-index: 50; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; padding: 0 20px; min-height: 54px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  /* inside Hermes Studio's Upstream tab: Studio's own header names the page, so ours is just the tabs */
+  html.embedded header.top { min-height: 42px; }
+  html.embedded header.top .brand { display: none; }
   .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 15px; color: var(--text); text-decoration: none; }
   nav.main { display: flex; gap: 2px; flex-wrap: wrap; }
   nav.main a { display: flex; align-items: center; gap: 7px; padding: 7px 11px; border-radius: 8px; color: var(--soft); text-decoration: none; }

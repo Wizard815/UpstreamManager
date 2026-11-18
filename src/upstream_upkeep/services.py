@@ -58,8 +58,47 @@ def _builtin_status(key: str) -> dict:
 
 
 # ------------------------------------------------------------------ your own services (other containers)
+def from_env() -> list[dict]:
+    """Services named in the env file, so the whole setup can live in .env:
+
+        UPSTREAM_SERVICES=firefly=http://127.0.0.1:8080/health@firefly-iii, db=tcp://127.0.0.1:5432
+
+    name=address, an optional path on the address is the health path, and @repo links the repo it is
+    built from (its id or name). These show on the Integrations page and can only be changed in the file."""
+    raw = __import__("os").environ.get("UPSTREAM_SERVICES", "")
+    out, by_name = [], {_norm(r.get("name") or r["id"]): r["id"] for r in store.all_repos()}
+    for part in re.split(r"[,\n]", raw):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, rest = part.partition("=")
+        repo = None
+        m = re.match(r"^(.*?)@([A-Za-z0-9._-]+)$", rest.strip())
+        if m and "://" in m.group(1):
+            rest, repo = m.group(1), m.group(2)
+        u = urlparse(rest.strip())
+        if u.scheme not in ("http", "https", "tcp") or not u.netloc:
+            continue
+        rid = (repo if store.get_repo(repo) else by_name.get(_norm(repo))) if repo else None
+        out.append({"id": "env-" + _norm(name)[:30], "name": name.strip()[:80], "url": f"{u.scheme}://{u.netloc}",
+                    "health": u.path if u.path not in ("", "/") else "", "repo": rid, "container": None,
+                    "notes": "" if rid or not repo else f"repo {repo} isn't tracked here", "from_env": True})
+    return out
+
+
 def custom() -> list[dict]:
     return list((store.settings().get("services") or {}).get("items") or [])
+
+
+def env_marks() -> dict:
+    """UPSTREAM_MARKS=coinpile:planned, firefly-iii:integrated (a repo's id or name: its mark).
+    A mark set on the Integrations page wins over the file."""
+    out = {}
+    for part in re.split(r"[,\n]", __import__("os").environ.get("UPSTREAM_MARKS", "")):
+        name, _, state = part.strip().partition(":")
+        if name and state.strip() in MARKS:
+            out[_norm(name)] = state.strip()
+    return out
 
 
 def _save(items: list[dict]) -> None:
@@ -94,7 +133,7 @@ def save(d: dict) -> dict:
                 _save(items)
                 return items[i]
         raise ServiceError("no such service")
-    if any(it["name"].casefold() == clean["name"].casefold() for it in items):
+    if any(it["name"].casefold() == clean["name"].casefold() for it in items + from_env()):
         raise ServiceError(f"there is already a service called {clean['name']}")
     item = {"id": uuid.uuid4().hex[:10], "added": config.now_iso(), **clean}
     _save(items + [item])
@@ -102,6 +141,8 @@ def save(d: dict) -> dict:
 
 
 def remove(service_id: str) -> None:
+    if service_id.startswith("env-"):
+        raise ServiceError("that one comes from UPSTREAM_SERVICES in the env file: change it there")
     items = custom()
     if not any(it["id"] == service_id for it in items):
         raise ServiceError("no such service")
@@ -200,7 +241,7 @@ def overview(live: bool = True) -> dict:
         repo = next((by_name[_norm(n)] for n in b["repos"] if _norm(n) in by_name), None)
         rows.append({"id": b["id"], "kind": "builtin", "name": b["name"], "does": b["does"], "repo": repo["id"] if repo else None,
                      "repo_name": repo.get("name") if repo else b["repos"][0]})
-    for it in custom():
+    for it in from_env() + custom():
         repo = store.get_repo(it["repo"]) if it.get("repo") else None
         rows.append({**it, "kind": "service", "repo_name": repo.get("name") if repo else None})
     if live:
@@ -216,15 +257,17 @@ def overview(live: bool = True) -> dict:
         set_up = r["kind"] == "service" or not live or st.get("ok") or st.get("error") not in ("off", "not set up")
         if r.get("repo"):
             powered.setdefault(r["repo"], []).append({"name": r["name"], "ok": st.get("ok"), "set_up": bool(set_up)})
-    repo_rows = []
+    repo_rows, marks_env = [], env_marks()
     for r in repos:
         m = r.get("integration") or {}
+        if not m.get("state") and (env_state := marks_env.get(_norm(r["id"])) or marks_env.get(_norm(r.get("name") or ""))):
+            m = {"state": env_state, "note": "", "from_env": True}
         runs = powered.get(r["id"], [])
         active = [x for x in runs if x["set_up"]]          # a connection switched off doesn't count
         state = m.get("state") or ("integrated" if active else "")
         works = None if not active or not live else all(x["ok"] for x in active)
         repo_rows.append({"id": r["id"], "name": r.get("name") or r["id"], "state": state, "auto": bool(active and not m.get("state")),
-                          "note": m.get("note", ""), "services": runs, "works": works})
+                          "note": m.get("note", ""), "services": runs, "works": works, "from_env": bool(m.get("from_env"))})
     order = {"integrated": 0, "partial": 1, "planned": 2, "": 3, "none": 4}
     repo_rows.sort(key=lambda x: (order.get(x["state"], 3), x["name"].lower()))
     return {"services": rows, "repos": repo_rows, "marks": MARKS}
