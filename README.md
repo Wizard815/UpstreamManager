@@ -53,6 +53,15 @@ command, which the image does not carry. If Docker Hub rate-limits the build, se
 
 ### Inside Hermes Studio
 
+**On one machine, opening Studio's Upstream tab once connects the two**: Studio hands Upstream its
+address and a login (renewed on its own), so there is nothing to put in `.env` for Studio. From then
+on, on that machine, a task sent to herdr starts its agent **through Studio's herdr**: the agent is a
+Studio chat in its own herdr space (Studio's models and folders), its header links back to the
+task, and Studio tells Upstream when the agent works, waits for you or finishes. Agents on other
+machines still go through Upstream's own herdr connection, and so does everything if Studio can't
+start one (`UPSTREAM_HERDR_VIA_STUDIO=off` makes that the rule). Inside Studio, links to Studio
+chats open in Studio, and Studio's address follows the Upstream page you are on.
+
 Studio has an **Upstream** tab that shows this app. It looks for it at `http://127.0.0.1:5001`,
 which is where both installs put it, so on one machine there is nothing to set. Otherwise start
 Studio with `UPSTREAM_UPKEEP_TARGET=http://host:port`; if Studio runs in a container, also list
@@ -226,6 +235,10 @@ to the wiki or GitHub):
 - **Your repos**, each marked *integrated*, *partly integrated*, *to integrate* or *not needed*,
   with a note on what works or is missing. A repo that runs a working connection counts as
   integrated by itself. Marks show on the Repos list too.
+- Everything can also come from `.env`: `UPSTREAM_SERVICES=firefly=http://127.0.0.1:8080/health@firefly-iii, db=tcp://127.0.0.1:5432`
+  (name=address, a path is the health check, `@repo` the repo it is built from) and
+  `UPSTREAM_MARKS=coinpile:planned, firefly-iii:integrated`. Those show as "from .env"; a mark set
+  on the page wins.
 - Agents read it with `list_integrations` and can record progress with `mark_integration`; chats
   about no particular repo see it as well. Adding or removing services stays with you.
 

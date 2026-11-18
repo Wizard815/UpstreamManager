@@ -28,8 +28,9 @@ FIELDS = {
     "orb_token": "UPSTREAM_ORB_TOKEN",        # a Pondering Orb API token (ORB_API_TOKENS on the Orb side)
     "hermes_api_key": "UPSTREAM_HERMES_API_KEY",  # the Hermes API server's key
     "studio_token": "UPSTREAM_STUDIO_TOKEN",      # a Hermes Studio sign-in token (JWT)
+    "studio_proxy_token": "UPSTREAM_STUDIO_PROXY_TOKEN",  # the login Studio hands over when Upstream opens in its tab
 }
-SECRET_FIELDS = {"github_token", "dockerhub_token", "wiki_api_key", "orb_token", "hermes_api_key", "studio_token"}  # usernames are not secret
+SECRET_FIELDS = {"github_token", "dockerhub_token", "wiki_api_key", "orb_token", "hermes_api_key", "studio_token", "studio_proxy_token"}  # usernames are not secret
 
 
 def _file() -> Path:

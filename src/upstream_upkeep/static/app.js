@@ -2776,6 +2776,7 @@ async function renderIntegrations() {
       el("td", {}, works(st), st.ok || !st.error || st.error === "off" ? null : el("div", { class: "muted small" }, st.error)),
       el("td", { class: "small", style: "word-break:break-all" }, s.kind === "builtin" ? (s.address || "") : `${s.url}${s.health || ""}`),
       el("td", {}, s.kind === "builtin" ? el("a", { class: "btn ghost small", href: `${BASE}/settings#connections` }, "Settings")
+        : s.from_env ? el("span", { class: "muted small", title: "Set by UPSTREAM_SERVICES in the env file" }, "from .env")
         : el("div", { class: "row", style: "gap:4px" }, el("button", { class: "btn ghost small", onclick: () => serviceDialog(s, r.repos) }, "Edit"),
             el("button", { class: "btn ghost small danger", onclick: async () => { if (!confirm(`Stop tracking ${s.name}? (The container itself is not touched.)`)) return
               const x = await api(apiUrl("/api/services/delete"), { method: "POST", body: JSON.stringify({ id: s.id }) }).catch(e => ({ ok: false, error: e.message }))
@@ -2799,7 +2800,7 @@ async function renderIntegrations() {
   for (const x of r.repos) {
     const sel = el("select", { "aria-label": `How far ${x.name} is integrated` }, el("option", { value: "" }, "Not marked"),
       ...Object.entries(r.marks).map(([k, v]) => el("option", { value: k }, v)))
-    sel.value = x.auto ? "" : x.state
+    sel.value = x.auto || x.from_env ? "" : x.state
     const note = el("input", { value: x.note || "", placeholder: "what works, what's missing…", style: "width:100%", "aria-label": `Note for ${x.name}` })
     const saveMark = async () => {
       const y = await api(apiUrl(`/api/repo/${encodeURIComponent(x.id)}/integration`), { method: "POST", body: JSON.stringify({ state: sel.value, note: note.value }) }).catch(e => ({ ok: false, error: e.message }))
@@ -2807,7 +2808,8 @@ async function renderIntegrations() {
     }
     sel.onchange = saveMark; note.onchange = () => { if (!sel.value) sel.value = "planned"; saveMark() }
     repoBody.append(el("tr", {},
-      el("td", {}, repoLink(x.id, x.name), x.auto ? el("div", { class: "muted small" }, "integrated (it runs a connection below)") : null),
+      el("td", {}, repoLink(x.id, x.name), x.auto ? el("div", { class: "muted small" }, "integrated (it runs a connection below)")
+        : x.from_env ? el("div", { class: "muted small" }, "marked in the env file (UPSTREAM_MARKS); a mark here wins") : null),
       el("td", {}, sel),
       el("td", {}, x.services.length ? el("div", { class: "row", style: "gap:4px;flex-wrap:wrap" }, ...x.services.map(s => badge(!s.set_up ? "" : s.ok ? "up" : "bad", s.set_up ? s.name : `${s.name} (off)`, !s.set_up ? "not set up here" : s.ok ? "works" : "not working"))) : el("span", { class: "muted small" }, "-")),
       el("td", { style: "min-width:200px" }, note)))
@@ -3185,6 +3187,32 @@ function currentView() {
   return ['notfound']
 }
 
+// Inside Hermes Studio's Upstream tab (same origin, under BASE): a link to a Studio chat opens in
+// Studio itself, not inside this frame; and Studio is told which page is shown, so its address bar,
+// back button and reloads keep your place.
+const EMBEDDED = (() => { try { return window.top !== window && !!BASE && window.top.location.origin === location.origin } catch { return false } })()
+if (EMBEDDED) {
+  document.documentElement.classList.add("embedded")
+  document.addEventListener("click", (e) => {
+    const a = e.target.closest?.("a[href]")
+    if (!a) return
+    let u
+    try { u = new URL(a.href, location.href) } catch { return }
+    if (u.hash.startsWith("#/hermes/")) { e.preventDefault(); window.top.location.hash = u.hash }   // a Studio page
+  }, true)
+  const replace = history.replaceState.bind(history)
+  history.replaceState = (...args) => { replace(...args); tellStudio() }
+  addEventListener("popstate", () => tellStudio())
+  window.addEventListener("message", (e) => {   // Studio asks for a page (a deep link, its back button)
+    if (e.origin !== location.origin || e.data?.type !== "upstream:open" || typeof e.data.path !== "string") return
+    const p = e.data.path.startsWith("/") ? e.data.path : "/" + e.data.path
+    if (p !== location.pathname.slice(BASE.length) + location.search) route(p)
+  })
+}
+function tellStudio() {
+  if (EMBEDDED) window.parent.postMessage({ type: "upstream:route", path: location.pathname.slice(BASE.length) + location.search, title: document.title }, location.origin)
+}
+
 setTimeout(() => refreshWorkCount(), 500)
 async function router() {
   const [view, id] = currentView()
@@ -3211,6 +3239,7 @@ async function router() {
       el("a", { href: `${BASE}/repos`, class: "btn" }, "Go to your repos")))
   } catch (e) { $("#content").replaceChildren(el("p", { class: "muted" }, `Could not load this page: ${e.message}`)) }
   refreshPendingCount()
+  tellStudio()
 }
 
 // SPA nav: intercept in-page link clicks so the shell is not reloaded.
