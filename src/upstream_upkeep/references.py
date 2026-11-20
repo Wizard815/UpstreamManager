@@ -30,6 +30,11 @@ from . import config, gitops, registry, store
 META = ".refs.json"
 MAX_UPLOAD = 512 * 1024 * 1024
 TEXT_LIMIT = 60_000
+CODE_BUDGET = 24_000   # how much of a folder or repo's own code goes with it into a chat
+SMALL_FILE = 8_000     # files up to this size (bytes) are shown whole
+CODE_EXT = {".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".vue", ".svelte", ".go", ".rs", ".rb", ".java", ".kt",
+            ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".php", ".swift", ".sh", ".lua", ".sql", ".toml", ".yaml", ".yml",
+            ".json", ".cfg", ".ini", ".md", ".txt", ".css", ".scss", ".html"}
 TREE_LIMIT = 400
 LIST_LIMIT = 2000
 IMAGE_LIMIT = 8 * 1024 * 1024
@@ -752,7 +757,7 @@ def read(rel: str, limit: int = TEXT_LIMIT) -> dict:
 
 def folder_overview(rel: str, limit: int = TEXT_LIMIT) -> str:
     base = _p(rel)
-    lines, readmes, count = [], [], 0
+    lines, readmes, small, count = [], [], [], 0
     for dirpath, dirnames, filenames in __import__("os").walk(base):
         dirnames[:] = sorted(d for d in dirnames if d not in (".git", "node_modules", "__pycache__", ".venv"))
         depth = Path(dirpath).relative_to(base).parts
@@ -765,8 +770,16 @@ def folder_overview(rel: str, limit: int = TEXT_LIMIT) -> str:
             if count < TREE_LIMIT:
                 lines.append(rp)
             count += 1
-            if f.lower().startswith("readme") and len(depth) <= 1 and len(readmes) < 6 and not (Path(dirpath) / f).is_symlink():
-                readmes.append(Path(dirpath) / f)
+            fp = Path(dirpath) / f
+            if f.lower().startswith("readme") and len(depth) <= 1 and len(readmes) < 6 and not fp.is_symlink():
+                readmes.append(fp)
+            elif len(depth) <= 2 and len(small) < 200 and fp.suffix.lower() in CODE_EXT and not fp.is_symlink():
+                try:
+                    size = fp.stat().st_size
+                except OSError:
+                    continue
+                if 0 < size <= SMALL_FILE:
+                    small.append((len(depth), size, fp))
     head = f"[Reference folder {rel or '(library root)'}: {count} files]\n" + "\n".join(lines)
     if count > TREE_LIMIT:
         head += f"\n...and {count - TREE_LIMIT} more files"
@@ -775,6 +788,21 @@ def folder_overview(rel: str, limit: int = TEXT_LIMIT) -> str:
             head += f"\n\n[{_rel(r)}]\n" + r.read_text(encoding="utf-8", errors="replace")[:6000]
         except OSError:
             pass
+    # Then the small code files, shallowest and smallest first, while the budget lasts: with only names
+    # and READMEs a model can't say what a reference actually exports or how to use it.
+    budget = min(limit, CODE_BUDGET) - len(head)
+    shown = 0
+    for _, _, fp in sorted(small, key=lambda t: (t[0], t[1])):
+        try:
+            text = fp.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        block = f"\n\n[{_rel(fp)}]\n{text}"
+        if len(block) > budget:
+            continue
+        head += block; budget -= len(block); shown += 1
+    if small and shown < len(small):
+        head += f"\n\n({len(small) - shown} more small files not shown here; attach a file to read it in full)"
     return head[:limit]
 
 

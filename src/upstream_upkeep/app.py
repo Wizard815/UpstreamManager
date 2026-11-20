@@ -169,6 +169,7 @@ def index(repo_id: str | None = None, anything: str | None = None):
 
 @flask_app.route("/api/repos")
 def api_repos():
+    registry.adopt_watch_folders(force=request.args.get("rescan") == "1")   # clones dropped into ManagerFiles/Repos
     repos = registry.repo_summary()
     return jsonify(repos)
 
@@ -203,6 +204,7 @@ def api_remove_repo(repo_id):
             pass
     shutil.rmtree(config.CONFIG_PATH.parent / "workspaces" / repo_id, ignore_errors=True)
     shutil.rmtree(config.CONFIG_PATH.parent / "stacks" / repo_id, ignore_errors=True)
+    registry.ignore_path(repo.get("path"))   # so the watch folder doesn't bring it back
     with store.lock:
         store.remove_repo(repo_id)
     store.save_state()
@@ -2436,7 +2438,19 @@ def _public_settings() -> dict:
     llm = s.get("llm") or {}
     if llm.get("api_key"):
         llm["api_key"] = KEY_MASK + (llm["api_key"][-4:] if len(llm["api_key"]) > 8 else "")
+    # What .env sets wins over the page, so the page shows it (and says so) instead of its own fields.
+    env = {k: os.environ.get(v) for k, v in _LLM_ENV.items() if os.environ.get(v)}
+    if env:
+        if env.get("api_key"):
+            env["api_key"] = KEY_MASK + (env["api_key"][-4:] if len(env["api_key"]) > 8 else "")
+        if env.get("fallback_urls"):
+            env["fallback_urls"] = [u.strip() for u in env["fallback_urls"].replace(",", "\n").splitlines() if u.strip()]
+        s["llm_env"] = {"values": env, "names": {k: _LLM_ENV[k] for k in env}}
     return s
+
+
+_LLM_ENV = {"base_url": "UPSTREAM_LLM_BASE_URL", "model": "UPSTREAM_LLM_MODEL", "api_key": "UPSTREAM_LLM_API_KEY",
+            "fallback_urls": "UPSTREAM_LLM_FALLBACK_URLS"}
 
 
 @flask_app.route("/api/settings")
@@ -2558,7 +2572,11 @@ def api_models():
         # The saved key only ever goes to the saved server: any page can make the
         # browser load this URL, so a masked key aimed elsewhere is dropped.
         saved = (store.load_llm_config().get("base_url") or "").rstrip("/")
-        key = _saved_key() if base_url is None or (base_url or "").rstrip("/") == saved else ""
+        env_url = (os.environ.get("UPSTREAM_LLM_BASE_URL") or "").rstrip("/")
+        if env_url and os.environ.get("UPSTREAM_LLM_API_KEY") and (base_url or "").rstrip("/") == env_url:
+            key = os.environ["UPSTREAM_LLM_API_KEY"]   # the key .env gives, for the server .env names
+        else:
+            key = _saved_key() if base_url is None or (base_url or "").rstrip("/") == saved else ""
     models, error = llm.list_models(base_url, key)
     return jsonify({"data": [{"id": m} for m in models], "error": error})
 
@@ -2780,12 +2798,12 @@ TEMPLATE = r"""<!DOCTYPE html>
 .commit-line{display:flex;gap:6px;align-items:baseline;font-size:13px}.linkish{background:none;border:0;color:var(--accent2,#9fb4ff);cursor:pointer;font:inherit;padding:0}
 pre.term{margin:0;font:12px/1.35 var(--mono);white-space:pre-wrap;color:#cfd6e4}
 .ref-grid{display:grid;grid-template-columns:minmax(220px,300px) minmax(0,1fr);gap:14px;align-items:start}.ref-grid>*{min-width:0;overflow-wrap:anywhere}
-@media (max-width:900px){.ref-grid,.work-grid{grid-template-columns:minmax(0,1fr)}.ref-row,.ref-head{grid-template-columns:22px minmax(0,1fr) minmax(0,.8fr)}.ref-row>span:nth-child(n+4),.ref-head>span:nth-child(n+4){display:none}}
+@media (max-width:900px){.ref-grid,.work-grid{grid-template-columns:minmax(0,1fr)}.ref-row,.ref-head{grid-template-columns:22px minmax(0,1fr) minmax(0,.8fr) 34px}.ref-row>span:nth-child(n+4),.ref-head>span:nth-child(n+4){display:none}}
 .repo-card,.task-detail,.agent-box,.branch-box{overflow-wrap:anywhere}.repo-card pre,.repo-card code{white-space:pre-wrap}
 .ref-tree .trow{display:flex;gap:6px;align-items:center;padding:4px 8px;cursor:pointer;border-radius:6px}.ref-tree .trow:hover{background:var(--raise)}
 .ref-tree .trow.sel{background:var(--raise);box-shadow:inset 3px 0 0 var(--accent,#4c7dff)}.ref-tree .tw{width:12px;color:var(--muted)}
 .trow.drop,.ref-drop.drop{outline:2px dashed var(--accent,#4c7dff);outline-offset:-2px}
-.ref-row,.ref-head{display:grid;grid-template-columns:22px minmax(140px,1.4fr) minmax(0,2fr) 70px 86px;gap:8px;align-items:center;padding:6px 8px;border-bottom:1px solid var(--line)}
+.ref-row,.ref-head{display:grid;grid-template-columns:22px minmax(140px,1.4fr) minmax(0,2fr) 70px 86px 34px;gap:8px;align-items:center;padding:6px 8px;border-bottom:1px solid var(--line)}
 .ref-row{cursor:pointer}.ref-row:hover{background:var(--raise)}.ref-row .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ref-row>span:nth-child(3){overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ref-drop{min-height:120px;border-radius:8px}
 .work-grid{display:grid;grid-template-columns:minmax(280px,380px) 1fr;gap:14px;align-items:start}

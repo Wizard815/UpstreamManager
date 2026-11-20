@@ -99,22 +99,23 @@ class AppError(ToolError):
     """A refusal or failure from the app; its message reaches the agent as the tool's error."""
 
 
-def _call(method: str, path: str, body: dict | None = None, **params) -> Any:
-    """One request to the app. The JSON body type is what its cross-site guard expects."""
+def _call(method: str, endpoint: str, body: dict | None = None, /, **params) -> Any:
+    """One request to the app. The JSON body type is what its cross-site guard expects.
+    Its own arguments are positional-only, so a query parameter may be called `path` (list_references)."""
     try:
-        resp = requests.request(method, APP + path, params={k: v for k, v in params.items() if v not in (None, "")},
+        resp = requests.request(method, APP + endpoint, params={k: v for k, v in params.items() if v not in (None, "")},
                                 json=(body or {}) if method != "GET" else None, timeout=TIMEOUT,
                                 headers={"X-Upstream-Client": "agent"})  # the app keeps some things for the user
     except requests.ConnectionError:
         raise AppError(f"Upstream Manager is not running at {APP} (start it, or set UPSTREAM_APP_URL)")
     if resp.status_code == 404:
-        raise AppError(f"not found: {path} (check the repo id with list_repos, or the name with workspace_status)")
+        raise AppError(f"not found: {endpoint} (check the repo id with list_repos, or the name with workspace_status)")
     try:
         data = resp.json()
     except ValueError:
-        raise AppError(f"{method} {path}: HTTP {resp.status_code}")
+        raise AppError(f"{method} {endpoint}: HTTP {resp.status_code}")
     if resp.status_code >= 400 or (isinstance(data, dict) and data.get("ok") is False):
-        raise AppError((data.get("error") if isinstance(data, dict) else None) or f"{method} {path}: HTTP {resp.status_code}")
+        raise AppError((data.get("error") if isinstance(data, dict) else None) or f"{method} {endpoint}: HTTP {resp.status_code}")
     return data
 
 
