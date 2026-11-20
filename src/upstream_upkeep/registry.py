@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
@@ -137,6 +139,60 @@ def discover_from_watch_folders() -> list[dict]:
     return found
 
 
+_adopt_lock = threading.Lock()
+_last_adopt = 0.0
+
+
+def adopt_watch_folders(force: bool = False) -> list[str]:
+    """Start tracking git repos that were put into a watch folder by hand (ManagerFiles/Repos and the
+    like): drop a clone in and it shows up. A repo the user removed from the list stays removed.
+    Looks at most every 30 seconds unless forced; returns the ids it added."""
+    global _last_adopt
+    with _adopt_lock:
+        if not force and time.time() - _last_adopt < 30:
+            return []
+        _last_adopt = time.time()
+        tracked = {os.path.realpath(r["path"]) for r in store.all_repos() if r.get("path")}
+        ignored = {os.path.realpath(p) for p in store.settings().get("ignored_repo_paths", [])}
+        added = []
+        for wf in WATCH_FOLDERS:
+            try:
+                entries = sorted(Path(wf).iterdir()) if Path(wf).is_dir() else []
+            except OSError:
+                continue
+            for entry in entries:
+                real = os.path.realpath(entry)
+                if entry.name.startswith(".") or real in tracked or real in ignored or not entry.is_dir():
+                    continue
+                if not gitops.is_git_repo(str(entry)):
+                    continue
+                try:
+                    added.append(add_repo(str(entry), None, None)["id"])
+                    tracked.add(real)
+                except Exception:
+                    continue
+        return added
+
+
+def ignore_path(path: str | None) -> None:
+    """Remember a repo the user removed, so the watch folder doesn't bring it back."""
+    if not path:
+        return
+    with store.lock:
+        paths = list(store.settings().get("ignored_repo_paths", []))
+        if os.path.realpath(path) not in paths:
+            paths.append(os.path.realpath(path))
+        store.save_settings({"ignored_repo_paths": paths})
+
+
+def unignore_path(path: str) -> None:
+    real = os.path.realpath(path)
+    with store.lock:
+        paths = [p for p in store.settings().get("ignored_repo_paths", []) if p != real]
+        if len(paths) != len(store.settings().get("ignored_repo_paths", [])):
+            store.save_settings({"ignored_repo_paths": paths})
+
+
 def add_repo(path: str | None, url: str | None, name: str | None,
              focus_branch: str | None = None, watch_dir: str | None = None) -> dict:
     """Add a repo by local path OR by git URL. Clones URL repos into a watch folder."""
@@ -144,6 +200,7 @@ def add_repo(path: str | None, url: str | None, name: str | None,
         if not gitops.is_git_repo(path):
             raise ValueError(f"not a git repo: {path}")
         p = Path(os.path.abspath(path)).resolve()
+        unignore_path(str(p))
         remotes = gitops.remotes(str(p))
         if focus_branch and not gitops.ref_exists(str(p), f"refs/heads/{focus_branch}"):
             raise ValueError(f"{focus_branch!r} is not a branch in this repo")
@@ -173,6 +230,7 @@ def add_repo(path: str | None, url: str | None, name: str | None,
         dest = repo_dir_for_url(wd, norm)
         if not (os.path.exists(dest) and gitops.is_git_repo(dest)):
             gitops.clone_into(dest, norm)
+        unignore_path(dest)
         remotes = gitops.remotes(dest)
         fb = _focus(dest, focus_branch)
         rid = _free_id(slugify(name or Path(dest).name), dest)

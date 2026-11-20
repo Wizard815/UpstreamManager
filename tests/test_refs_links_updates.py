@@ -193,3 +193,52 @@ def test_herdr_starts_hermes_by_default_and_lists_installed_first(monkeypatch, t
     st = herdr.status()
     assert st["installed"] == ["codex", "cursor"]
     assert st["kinds"][:3] == ["hermes", "codex", "cursor"] and len(st["kinds"]) == len(set(st["kinds"]))
+
+
+# ------------------------------------------------------------ agents (MCP) on the library
+def test_agent_tools_list_read_and_link_references(client, lib, repos, monkeypatch):
+    """list_references and read_reference take a `path`: it once clashed with the helper's own argument,
+    so every call failed before reaching the app."""
+    from test_agents import _route_to, _run
+    clone_ref(lib, repos[0], "shared/upr")
+    (lib / "a").mkdir()
+    _route_to(client, monkeypatch)
+
+    async def steps(c):
+        return (await c.call_tool("list_references", {"path": "shared"}),
+                await c.call_tool("read_reference", {"path": "shared/upr"}),
+                await c.call_tool("organize_references", {"action": "link", "path": "shared/upr", "to": "a"}))
+    listed, read, linked = _run(steps)
+    assert not listed.is_error and "shared/upr" in listed.content[0].text, listed.content[0].text
+    assert not read.is_error and "a.txt" in read.content[0].text, read.content[0].text
+    assert not linked.is_error and (lib / "a" / "upr").is_symlink(), linked.content[0].text
+
+
+def test_an_attached_repo_brings_its_small_code_files(lib, repos):
+    ref = clone_ref(lib, repos[0], "r")
+    (ref / "lib.js").write_text("export const Button = () => '<button/>'\n")
+    text, _ = references.for_model("r")
+    assert "export const Button" in text and "[r/lib.js]" in text
+
+
+def test_a_clone_dropped_into_the_repos_folder_shows_up_and_a_removed_one_stays_away(client, monkeypatch, tmp_path, repos):
+    from upstream_upkeep import registry
+    home = tmp_path / "drop"; home.mkdir()
+    monkeypatch.setattr(registry, "WATCH_FOLDERS", [home])
+    git(tmp_path, "clone", "-q", str(repos[0]), str(home / "dropped"))
+    ids = [r["id"] for r in client.get("/api/repos?rescan=1").get_json()]
+    assert "dropped" in ids
+    assert client.delete("/api/repo/dropped", json={}).get_json()["ok"]
+    assert "dropped" not in [r["id"] for r in client.get("/api/repos?rescan=1").get_json()]
+    # adding it again by hand brings it back for good
+    assert client.post("/api/add", json={"path": str(home / "dropped")}).get_json()["ok"]
+    assert "dropped" in [r["id"] for r in client.get("/api/repos?rescan=1").get_json()]
+
+
+def test_settings_show_the_model_set_in_env(client, monkeypatch):
+    monkeypatch.setenv("UPSTREAM_LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("UPSTREAM_LLM_MODEL", "tencent/hy4-flash")
+    monkeypatch.setenv("UPSTREAM_LLM_API_KEY", "sk-or-secret-1234")
+    s = client.get("/api/settings").get_json()["llm_env"]
+    assert s["values"]["model"] == "tencent/hy4-flash" and s["names"]["base_url"] == "UPSTREAM_LLM_BASE_URL"
+    assert "secret" not in s["values"]["api_key"] and s["values"]["api_key"].endswith("1234")

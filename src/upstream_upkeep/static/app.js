@@ -169,7 +169,7 @@ async function renderRepos() {
 
   if (!repos.length) {
     addBox.hidden = false
-    wrap.append(el("p", { class: "muted" }, "No repos yet. Add one above, or drop a clone into the watch folder."))
+    wrap.append(el("p", { class: "muted" }, "No repos yet. Add one above, or put a clone in your Repos folder (ManagerFiles/Repos); it shows up here by itself."))
     return
   }
 
@@ -1977,10 +1977,17 @@ async function renderSettings() {
   try {
     const local = await api(apiUrl('/api/settings'))
     card.innerHTML = ""
-    const llm = local.llm || {}
-    const urlIn = el("input", { value: llm.base_url || "http://127.0.0.1:8080/v1", placeholder: "http://host:8080/v1", style: "width:420px" })
+    // What .env sets (UPSTREAM_LLM_*) wins over this page: show it, locked, and say where to change it.
+    const envSet = local.llm_env || { values: {}, names: {} }
+    const llm = { ...(local.llm || {}), ...envSet.values }
+    const fromEnv = (k, input) => {
+      if (!envSet.names[k]) return input
+      input.disabled = true; input.title = `Set in .env (${envSet.names[k]}); change it there`
+      return el("span", { class: "col", style: "gap:2px" }, input, el("span", { class: "muted small" }, `from .env: ${envSet.names[k]}`))
+    }
+    const urlIn = el("input", { value: llm.base_url || "http://127.0.0.1:8080/v1", placeholder: "http://host:8080/v1", style: "width:420px", "aria-label": "Server URL" })
     // The server only ever sends a masked key ("••••1234"); sending it back unchanged keeps the saved key.
-    const keyIn = el("input", { value: llm.api_key || "", type: "password", autocomplete: "off", placeholder: "optional", style: "width:320px" })
+    const keyIn = el("input", { value: llm.api_key || "", type: "password", autocomplete: "off", placeholder: "optional", style: "width:320px", "aria-label": "API key" })
     const fallIn = el("textarea", { rows: "3", style: "width:420px;max-width:100%;font:12px var(--mono)", placeholder: "http://host:8001/v1\nhttp://host:8002/v1",
       "aria-label": "Fallback server URLs" }, (llm.fallback_urls || []).join("\n"))
     const visionIn = el("input", { type: "checkbox", style: "height:auto" }); visionIn.checked = !!llm.vision
@@ -2012,7 +2019,9 @@ async function renderSettings() {
     const saveBtn = el("button", { class: "btn" }, "Save")
     saveBtn.onclick = () => busy(saveBtn, "Saving…", async () => {
       const fallback_urls = fallIn.value.split("\n").map(u => u.trim()).filter(Boolean)
-      const res = await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ llm: { model: modelSel.value, base_url: urlIn.value.trim(), api_key: keyIn.value, fallback_urls, vision: visionIn.checked } }) })
+      const saved = local.llm || {}, mine = (k, v) => envSet.names[k] ? (saved[k] ?? (k === "fallback_urls" ? [] : "")) : v
+      const res = await api(apiUrl('/api/settings'), { method: "POST", body: JSON.stringify({ llm: { model: mine("model", modelSel.value), base_url: mine("base_url", urlIn.value.trim()),
+        api_key: mine("api_key", keyIn.value), fallback_urls: mine("fallback_urls", fallback_urls), vision: visionIn.checked } }) })
       keyIn.value = res.settings?.llm?.api_key || ""
       toast("Model connection saved", "ok")
       await showLive(true); refreshModelStatus()
@@ -2020,11 +2029,12 @@ async function renderSettings() {
     card.append(
       el("div", { style: "display:flex;flex-direction:column;gap:12px" },
         el("div", { class: "muted" }, "Any OpenAI-compatible server (llama-swap, llama-server, Argos). Independent of hermes-agent."),
-        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Server URL", urlIn),
-        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "API key", keyIn),
-        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Fallback URLs (one per line; used when the server above is down, e.g. on-demand llama.cpp ports)", fallIn),
+        Object.keys(envSet.names).length ? el("div", { class: "muted small" }, "Locked fields come from the .env file, which wins over this page. Edit .env and restart to change them; the rest is saved here.") : null,
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Server URL", fromEnv("base_url", urlIn)),
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "API key", fromEnv("api_key", keyIn)),
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Fallback URLs (one per line; used when the server above is down, e.g. on-demand llama.cpp ports)", fromEnv("fallback_urls", fallIn)),
         liveEl,
-        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Model", modelSel),
+        el("label", { style: "display:flex;flex-direction:column;gap:4px" }, "Model", fromEnv("model", modelSel)),
         modelStatus,
         el("label", { class: "row", style: "gap:6px" }, visionIn, "This model can see images (send attached pictures, e.g. from References, as images)"),
         el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, refreshBtn, saveBtn)
@@ -2655,7 +2665,8 @@ async function renderReferences() {
         el("span", { class: "muted small", style: i.incomplete ? "color:var(--bad)" : null }, i.job ? (i.job.state === "failed" ? `clone failed: ${i.job.error}` : "cloning…")
           : i.incomplete ? "incomplete clone: delete it and clone again" : i.kind === "repo" ? `${i.branch} · ${i.url || i.source || ""}` : i.kind === "folder" ? "" : i.kind),
         el("span", { class: "muted small", style: "text-align:right" }, fmtSize(i.size)),
-        el("span", { class: "muted small" }, (i.added || i.modified || "").slice(0, 10)))
+        el("span", { class: "muted small" }, (i.added || i.modified || "").slice(0, 10)),
+        i.job ? el("span") : (() => { const m = itemMenu(i); m.classList.add("row-menu"); m.addEventListener("click", (e) => e.stopPropagation()); return m })())
       row.ondragstart = (e) => e.dataTransfer.setData("text/x-ref-path", i.path)
       row.onclick = () => i.job?.state === "failed" ? api(apiUrl("/api/refs/dismiss"), { method: "POST", body: JSON.stringify({ path: i.path }) }).then(() => drawRight())
         : i.kind === "folder" ? go(i.path) : go(current, i.path)
@@ -2671,7 +2682,7 @@ async function renderReferences() {
       el("div", { class: "row", style: "gap:8px;align-items:center;flex-wrap:wrap" }, crumbs, el("div", { class: "spacer" }),
         current ? el("button", { class: "btn ghost small", onclick: () => useInChat(current, current.split("/").pop()) }, "Use this folder in a chat") : null,
         current ? itemMenu({ path: current, name: current.split("/").pop(), kind: "folder" }) : null),
-      el("div", { class: "ref-head muted small" }, el("span", {}), el("span", {}, "Name"), el("span", {}, ""), el("span", { style: "text-align:right" }, "Size"), el("span", {}, "Added")),
+      el("div", { class: "ref-head muted small" }, el("span", {}), el("span", {}, "Name"), el("span", {}, ""), el("span", { style: "text-align:right" }, "Size"), el("span", {}, "Added"), el("span", {})),
       r.more ? el("div", { class: "muted small" }, `…and ${r.more} more items not listed here (use Search to find them).`) : null,
       drop, el("div", { class: "muted small" }, "Drag files from your computer onto this list to upload them here; drag an item onto a folder on the left to move it.")))
     if (rows.some(r => r.dataset.cloning)) pollClones()
@@ -2681,10 +2692,8 @@ async function renderReferences() {
     { label: "Rename…", run: async () => { const n = prompt("New name:", i.name); if (!n || n === i.name) return
       const r = await api(apiUrl("/api/refs/move"), { method: "POST", body: JSON.stringify({ path: i.path, to: i.path.split("/").slice(0, -1).join("/"), name: n }) }).catch(e => ({ ok: false, error: e.message }))
       if (!r.ok) return toast(r.error, "error"); await refreshTree(); go(r.path.split("/").slice(0, -1).join("/"), i.kind === "folder" ? null : r.path) } },
-    { label: "Also put it in another folder (link)…", run: async () => {
-      const to = prompt(`Folder to also show ${i.name} in (a library path like projects/allglance; one copy stays on disk):`, ""); if (to === null) return
-      const r = await api(apiUrl("/api/refs/link"), { method: "POST", body: JSON.stringify({ target: i.path, into: to.trim() }) }).catch(e => ({ ok: false, error: e.message }))
-      if (!r.ok) return toast(r.error, "error"); toast(`Linked into ${to.trim() || "the library"}`, "ok"); await refreshTree(); drawRight() } },
+    i.kind === "folder" ? null : { label: "Use in a chat…", run: () => useInChat(i.path, i.name) },
+    { label: "Also put it in another folder (link)…", run: () => linkDialog(i, async () => { await refreshTree(); drawRight() }) },
     { label: "Delete", danger: true, run: async () => {
       const links = (await api(apiUrl(`/api/refs/links?path=${encodeURIComponent(i.path)}`)).catch(() => ({ items: [] }))).items || []
       if (!confirm(`Delete ${i.path} from the reference library? This removes it from disk.` + (links.length ? `\n\nIt is also linked from ${links.length} place(s) (${links.slice(0, 3).join(", ")}${links.length > 3 ? "…" : ""}); those links go too.` : ""))) return
@@ -2850,6 +2859,55 @@ function serviceDialog(s, repos) {
 }
 
 // Attach a reference to a chat: a general one, or one about a repo.
+// Every folder of the reference library (not inside cloned repos), for picking where to link something.
+async function refFolders(path = "", depth = 0, out = []) {
+  if (depth > 5 || out.length > 400) return out
+  const r = await api(apiUrl(`/api/refs?path=${encodeURIComponent(path)}`)).catch(() => ({ items: [] }))
+  for (const i of r.items || []) {
+    if (i.kind !== "folder" || i.link_to) continue
+    out.push(i.path); await refFolders(i.path, depth + 1, out)
+  }
+  return out
+}
+
+// "Also put it in another folder": one copy on disk, shown in as many folders as want it (a symlink).
+// Your repos are offered as folders too, so a reference several repos use is one click per repo.
+async function linkDialog(item, done) {
+  const [folders, repos, links] = await Promise.all([refFolders(),
+    api(apiUrl("/api/repos")).then(r => Array.isArray(r) ? r : r.repos || []).catch(() => []),
+    api(apiUrl(`/api/refs/links?path=${encodeURIComponent(item.link_to || item.path)}`)).then(r => r.items || []).catch(() => [])])
+  const parent = item.path.split("/").slice(0, -1).join("/")
+  const already = new Set([parent, ...links.map(l => l.split("/").slice(0, -1).join("/")), (item.link_to || "").split("/").slice(0, -1).join("/")])
+  const own = item.kind === "folder" ? (f) => f === item.path || f.startsWith(item.path + "/") : () => false
+  const free = folders.filter(f => !already.has(f) && !own(f))
+  const repoFolders = repos.map(r => r.name || r.id).filter(n => !folders.includes(n) && n !== item.name)
+  const sel = el("select", { "aria-label": "Folder", style: "width:100%" },
+    el("option", { value: "" }, "Choose a folder…"),
+    free.length ? el("optgroup", { label: "Folders" }, ...free.map(f => el("option", { value: f }, f))) : null,
+    repoFolders.length ? el("optgroup", { label: "A new folder for one of your repos" }, ...repoFolders.map(n => el("option", { value: `new:${n}` }, `${n} (new folder)`))) : null,
+    el("option", { value: "new:" }, "Another new folder…"))
+  const go = el("button", { class: "btn" }, "Link it")
+  let close
+  go.onclick = () => busy(go, "Linking…", async () => {
+    let into = sel.value
+    if (!into) return toast("Choose a folder", "error")
+    if (into.startsWith("new:")) {
+      const name = into.slice(4) || prompt("New folder (in the library):") || ""
+      if (!name.trim()) return
+      const f = await api(apiUrl("/api/refs/folder"), { method: "POST", body: JSON.stringify({ parent: "", name: name.trim() }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!f.ok && !/exists/i.test(f.error || "")) return toast(f.error, "error")
+      into = f.path || name.trim()
+    }
+    const r = await api(apiUrl("/api/refs/link"), { method: "POST", body: JSON.stringify({ target: item.path, into }) }).catch(e => ({ ok: false, error: e.message }))
+    if (!r.ok) return toast(r.error, "error")
+    close(); toast(`${item.name} now also shows in ${into}`, "ok"); await done?.()
+  })
+  close = openDialog(`Also show “${item.name}” in…`, el("div", { class: "col", style: "gap:10px;min-width:min(420px,80vw)" },
+    el("p", { class: "muted", style: "margin:0" }, "It stays one copy on disk (updated once); the folder gets a link to it." +
+      (links.length ? ` Already shown in: ${links.join(", ")}.` : "")),
+    sel, el("div", {}, go)))
+}
+
 async function useInChat(path, label) {
   const repos = await api(apiUrl("/api/repos")).catch(() => [])
   const list = Array.isArray(repos) ? repos : repos.repos || []
