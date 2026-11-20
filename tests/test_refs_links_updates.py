@@ -242,3 +242,22 @@ def test_settings_show_the_model_set_in_env(client, monkeypatch):
     s = client.get("/api/settings").get_json()["llm_env"]
     assert s["values"]["model"] == "tencent/hy4-flash" and s["names"]["base_url"] == "UPSTREAM_LLM_BASE_URL"
     assert "secret" not in s["values"]["api_key"] and s["values"]["api_key"].endswith("1234")
+
+
+# ------------------------------------------------------------ stacks in a workspace of a hub repo
+def test_a_workspace_stack_checks_out_submodules_it_builds_from(tmp_path, monkeypatch):
+    """A workspace starts with empty submodule folders; compose `build: ./api` would build nothing."""
+    from upstream_upkeep import stacks
+    for k, v in {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow", "GIT_CONFIG_VALUE_0": "always"}.items():
+        monkeypatch.setenv(k, v)   # the test's submodule is a local path
+    sub = tmp_path / "api"; sub.mkdir()
+    git(sub, "init", "-q", "-b", "main"); commit_file(sub, "server.js", "x", "api")
+    hub = tmp_path / "hub"; hub.mkdir()
+    git(hub, "init", "-q", "-b", "main"); git(hub, "submodule", "add", "-q", str(sub), "api")
+    git(hub, "-c", "user.email=t@t.t", "-c", "user.name=T", "commit", "-qm", "hub")
+    ws = tmp_path / "ws"
+    git(hub, "worktree", "add", "-q", str(ws))
+    assert not any((ws / "api").iterdir())
+    stacks._init_submodules(ws)
+    assert (ws / "api" / "server.js").is_file()
+    stacks._init_submodules(ws)   # nothing left to do: no error

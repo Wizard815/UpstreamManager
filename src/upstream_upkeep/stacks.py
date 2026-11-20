@@ -133,12 +133,30 @@ def _demo_value(name: str) -> str:
     return "demo-" + secrets.token_hex(12)
 
 
+def _init_submodules(root: Path) -> None:
+    """A workspace is a fresh checkout whose submodule folders start empty, so a compose file that builds
+    from one (build: ./api) would build nothing. Check out the ones never set up there, at the pins the
+    workspace has; a pin an agent already moved and checked out is left as it is."""
+    if not (root / ".gitmodules").is_file():
+        return
+    st = subprocess.run(["git", "submodule", "status"], cwd=root, capture_output=True, text=True, timeout=60)
+    missing = [line[1:].split()[1] for line in st.stdout.splitlines() if line.startswith("-") and len(line[1:].split()) > 1]
+    if not missing:
+        return
+    res = subprocess.run(["git", "submodule", "update", "--init", "--", *missing],
+                         cwd=root, capture_output=True, text=True, timeout=900)
+    if res.returncode != 0:
+        raise StackError(f"could not check out the submodules {', '.join(missing)}: {(res.stderr or res.stdout).strip()[-400:]}")
+
+
 def prepare(repo: dict, ws: str | None = None) -> dict:
     """Resolve the compose file into the isolated demo model, written to the stack's folder."""
     cf = compose_file(repo, ws)
     if not cf:
         raise StackError("no compose file in this project (compose.yaml or docker-compose.yml)")
     root = _scope_dir(repo, ws).resolve()
+    if ws:
+        _init_submodules(root)
     home = _home(repo, ws)
     demo_env = home / "demo.env"
     files = [cf]
