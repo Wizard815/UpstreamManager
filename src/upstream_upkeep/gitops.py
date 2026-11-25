@@ -249,3 +249,41 @@ def status_summary(path: str) -> dict:
     tracked = [l for l in lines if not l.startswith("??")]
     return {"branch": current_branch_name(path), "dirty": len(lines), "tracked": len(tracked),
             "changed": [l[3:] for l in lines[:15]]}
+
+
+# ------------------------------------------------------------------ release wait
+def _iso(ts: float) -> str:
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def aged_commit(path: str, ref: str, days: float) -> dict:
+    """With a waiting period: the newest commit on `ref`'s main line that is at least `days` old.
+
+    Returns {sha (None when every commit is newer), waiting (newer commits held back), ready_at (when
+    the oldest of those may go in), newest (ref itself)}. Upstreams sometimes publish a bad commit or
+    release and fix it a day later; waiting lets that settle before it reaches your branch."""
+    import time as _time
+    cutoff = int(_time.time() - float(days) * 86400)
+    sha = _run(["git", "rev-list", "-1", "--first-parent", f"--before={cutoff}", ref, "--"], cwd=path).stdout.strip() or None
+    rng = f"{sha}..{ref}" if sha else ref
+    stamps = [int(x) for x in _run(["git", "log", "--first-parent", "--format=%ct", rng, "--"], cwd=path).stdout.split() if x.isdigit()]
+    return {"sha": sha, "waiting": len(stamps), "newest": short_sha(path, ref),
+            "ready_at": _iso(min(stamps) + float(days) * 86400) if stamps else None}
+
+
+def aged_tag(path: str, tags: list[str], days: float) -> dict:
+    """The newest of `tags` (newest first) made at least `days` ago: {tag, waiting: [newer tags], ready_at}."""
+    import time as _time
+    cutoff = _time.time() - float(days) * 86400
+    waiting = []
+    for t in tags:
+        out = _run(["git", "for-each-ref", "--format=%(creatordate:unix)", f"refs/tags/{t}"], cwd=path).stdout.strip()
+        when = int(out) if out.isdigit() else 0
+        if when and when > cutoff:
+            waiting.append((t, when))
+            continue
+        return {"tag": t, "waiting": [w[0] for w in waiting],
+                "ready_at": _iso(min(w[1] for w in waiting) + float(days) * 86400) if waiting else None}
+    return {"tag": None, "waiting": [w[0] for w in waiting],
+            "ready_at": _iso(min(w[1] for w in waiting) + float(days) * 86400) if waiting else None}

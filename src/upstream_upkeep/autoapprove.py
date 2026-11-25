@@ -154,12 +154,20 @@ def consider(req_id: str) -> dict | None:
         if not now or now.get("status") != "pending" or now.get("created_at") != req.get("created_at"):
             return None   # decided by hand, or replaced by a newer request, meanwhile
         if not ok:
+            from . import notify
+            notify.notify("auto_failed", f"{repo.get('name') or repo['id']}: check failed, it waits for you",
+                          f"{kind} request {req_id}: " + detail.strip().splitlines()[0][:300] if detail.strip() else kind,
+                          level="high", path=f"/requests#req-{req_id}", key=f"auto-failed:{req_id}:{req.get('created_at')}", repo=repo["id"])
             return store.annotate_request(req_id, auto={"state": "failed", "kind": kind, "check": r["check"],
                                                          "detail": detail, "at": config.now_iso()})
         store.annotate_request(req_id, auto={"state": "passed", "kind": kind, "check": r["check"], "detail": detail,
                                              "at": config.now_iso()})
         result, failed = _approve(now, "approve", f"Approved by the auto-approval rule for {kind}: "
                                   + (f"`{r['check']}` passed" if r["check"] else "it merges cleanly"))
+    from . import notify
+    notify.notify("auto_approved" if not failed else "auto_failed",
+                  f"{repo.get('name') or repo['id']}: {kind} request " + ("went in by itself" if not failed else "passed its check but failed to merge"),
+                  req_id, level="low" if not failed else "high", path="/requests", repo=repo["id"])
     if not failed:
         # The repo moved on: a request whose check failed before may pass on top of this one.
         for other in store.snapshot(store.get_requests()):
@@ -167,6 +175,17 @@ def consider(req_id: str) -> dict | None:
                     and (other.get("auto") or {}).get("state") == "failed"):
                 _on_request(other)
     return result
+
+
+def handles(rec: dict) -> bool:
+    """Will an auto-approval rule look at this request (so the user hears about the outcome instead)?"""
+    from . import registry
+    kind = kind_of(rec)
+    repo = registry.get_repo(rec.get("repo_id") or "")
+    if not kind or not repo:
+        return False
+    r = rules(repo)
+    return bool(r.get(kind)) and (kind != "workspaces" or bool(r["check"]))
 
 
 def _on_request(rec: dict) -> None:

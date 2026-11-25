@@ -17,6 +17,7 @@ import uuid
 from . import config, store, workspaces
 
 KINDS = ("fix", "bug", "feature", "merge", "chore", "idea")
+PRIORITIES = ("urgent", "high", "normal", "low")
 STATUSES = ("open", "working", "parked", "done", "dropped")
 WHERE = ("here", "hermes", "herdr", "studio", "wiki", "orb")
 ABOUT_TYPES = ("commit", "request", "file", "component", "pr", "push", "conflict", "issue")
@@ -70,16 +71,20 @@ def get(task_id: str) -> dict | None:
 
 @store._locked
 def create(repo_id: str, title, body=None, kind: str = "fix", about=None, by: str = "user", upstream: str | None = None,
-           onto: str | None = None) -> dict:
+           onto: str | None = None, priority: str = "normal") -> dict:
     if repo_id != store.GENERAL and not store.get_repo(repo_id):
         raise TaskError(f"no repo {repo_id}")
     if kind not in KINDS:
         raise TaskError("kind must be one of " + ", ".join(KINDS))
+    if priority not in PRIORITIES:
+        raise TaskError("priority must be one of " + ", ".join(PRIORITIES))
     now = config.now_iso()
+    who = {"agent": "an agent", "user": "you", "overseer": "the Overseer"}.get(by, by)
     t = {"id": uuid.uuid4().hex[:12], "repo_id": repo_id, "title": _text(title, "title", 200, True),
          "body": _text(body, "body", 20000), "kind": kind, "about": _clean_about(about),
          "status": "open", "where": None, "created_at": now, "updated_at": now, "by": by,
-         "log": [{"at": now, "text": f"created by {'an agent' if by == 'agent' else 'you'}"}]}
+         "priority": priority, "rank": None, "claimed_by": None, "comments": [],
+         "log": [{"at": now, "text": f"created by {who}"}]}
     if isinstance(onto, str) and onto.strip():
         repo = store.get_repo(repo_id)
         from . import gitops
@@ -116,6 +121,12 @@ def update(task_id: str, **fields) -> dict:
         t["status"] = fields["status"]
     if fields.get("where") is not None:
         t["where"] = fields["where"]
+    if fields.get("priority") is not None:
+        if fields["priority"] not in PRIORITIES:
+            raise TaskError("priority must be one of " + ", ".join(PRIORITIES))
+        if fields["priority"] != t.get("priority", "normal"):
+            t["log"].append({"at": config.now_iso(), "text": f"priority: {t.get('priority', 'normal')} → {fields['priority']}"})
+        t["priority"] = fields["priority"]
     if fields.get("note"):
         t["log"].append({"at": config.now_iso(), "text": str(fields["note"])[:2000]})
         t["log"] = t["log"][-100:]
@@ -365,10 +376,16 @@ def herdr_sync(task: dict, info: dict) -> dict:
     last = where.get("status")
     if status != last:
         where["status"], changed = status, True
+        from . import notify
         if status == "blocked":
             note = note or "the agent is asking you something"
+            notify.notify("agent_waiting", f"An agent waits for you: {task['title'][:80]}",
+                          f"{where.get('agent') or 'the agent'} on {task['repo_id']} is asking something",
+                          level="high", path=f"/work?task={task['id']}", key=f"blocked:{task['id']}:{where.get('agent')}", repo=task["repo_id"])
         elif status in ("done", "idle") and last == "working":
             note = note or "the agent finished: review its changes"
+            notify.notify("task_done", f"Done: {task['title'][:80]}", "the agent finished: review its changes",
+                          level="info", path=f"/work?task={task['id']}", repo=task["repo_id"])
     if info.get("session") and info.get("session") != where.get("session"):
         where["session"], where["session_agent"], changed = info["session"], info.get("session_agent"), True
     if changed:

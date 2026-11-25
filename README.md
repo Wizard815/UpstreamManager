@@ -225,6 +225,58 @@ its exact result is rebuilt in a throwaway checkout (submodules included), the
 command runs there, and the request is approved only if it passes; otherwise it
 waits for you, with the output on it. Pushes never approve themselves.
 
+## The Overseer, the board and agents working together
+
+**Work → Board** shows tasks as a kanban (Open, Working, Parked, Done). Drag a card
+to another column, or up and down; a card you place stays there. Each task has a
+priority (urgent, high, normal, low), the agent holding it, and a thread.
+
+**The Overseer** (its own page) keeps the work moving with plain rules, no model.
+Every few minutes (`UPSTREAM_OVERSEER_MINUTES`, default 10) it:
+
+- scores each repo: the priority you set on the Overseer page (critical, high,
+  normal, low) first, then conflicts with its upstreams, requests waiting for you,
+  failed auto-approval checks, submodules that moved where you watch, open bugs,
+  urgent tasks, errors, how far behind it is;
+- turns problems into tasks once each (a conflict to resolve, a failed check to
+  fix, a repo error) and closes them when the problem is gone;
+- orders the board: urgent first, then priority, kind, age and the repo's need;
+- takes back work from an agent that stopped checking in;
+- tells you what needs you, once each;
+- if you allow it, hands the next tasks to herdr or Studio, a few at a time.
+
+**Agents** (MCP) start with `overseer_plan`, then `next_task` with their name: the
+most important open task nobody has, claimed for them. They check in at least
+every 30 minutes (`heartbeat_task`, `comment_task` or `update_task`), or the claim
+runs out and the task goes back on the board. They talk on a task
+(`comment_task`, to an agent or to you) or to each other (`send_message`; `*` is
+everyone, `user` is you), read theirs with `read_messages`, see the board with
+`board_view` and each other with `list_agents`, and `release_task` when done. An
+agent started by cron calls `next_task`, does it, releases it, and repeats until
+there's nothing left. Repo priority, auto-approval, the release wait,
+notifications and the Overseer's settings stay yours.
+
+## Notifications
+
+Everything that needs you shows in the 🔔 at the top: a request waiting, a failed
+check, an agent asking something, a message from an agent, stuck work, the
+Overseer's alerts. To get them on your phone, set one of these on Settings →
+Notifications (or in `.env`): ntfy (`UPSTREAM_NTFY_URL`, e.g.
+`https://ntfy.sh/<a secret topic>`; the free ntfy app subscribes to it), Gotify
+(`UPSTREAM_GOTIFY_URL` and `UPSTREAM_GOTIFY_TOKEN`) or a webhook
+(`UPSTREAM_NOTIFY_WEBHOOK`, a JSON POST). Pick which kinds ring; the same alert
+rings once, not every time it's seen again. `UPSTREAM_PUBLIC_URL` makes the
+notifications link back to the page.
+
+## Release wait
+
+An upstream sometimes publishes a bad change and fixes it a day later. Repo page →
+an upstream's ⋯ → Release wait: only commits at least that many days old are
+taken (merged by the daily check, offered in requests); newer ones show as
+"⏳ waiting" with the date they become due. Pinned submodules have their own wait
+in their settings; when following releases, only releases that old count. Yours
+to set, not agents'.
+
 ## Groups and GitHub issues
 
 **Groups**: repo page → ⋯ → Groups… (e.g. `glance`, `studio`). The Repos page

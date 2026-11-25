@@ -262,6 +262,7 @@ async function renderRepos() {
 function upstreamBadges(u) {
   if (u.missing_ref) return [badge("warn", "not compared", u.conflict_detail || "press Fetch")]
   const out = []
+  if (u.waiting) out.push(badge("", `⏳ ${u.waiting} waiting`, `release wait ${u.wait_days} day(s): the newest ${u.waiting} commit(s) go in from ${(u.ready_at || "").slice(0, 16).replace("T", " ")}`))
   if (u.up_to_date) out.push(badge("up", "up to date"))
   else {
     if (u.behind) out.push(badge("warn", `${u.behind} behind`, "commits the upstream has that you lack"))
@@ -536,6 +537,11 @@ async function refreshUpstreams(wrap, repoId, treeBadge) {
       { label: u.enabled ? "Disable (stop comparing)" : "Enable", run: async () => {
         await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}/enable`), { method: "POST", body: JSON.stringify({ enabled: !u.enabled }) }); await again() } },
       { label: "Copy URL", run: () => { navigator.clipboard?.writeText(u.url); toast("URL copied", "ok") } },
+      { label: `Release wait… (${u.wait_days ? `${u.wait_days} day(s)` : "off"})`, run: async () => {
+        const v = prompt(`Only take ${u.name}'s commits once they are this many days old (0 = take everything at once). Upstreams sometimes publish a bad change and fix it a day later.`, String(u.wait_days || 0))
+        if (v === null) return
+        const r = await api(apiUrl(`/api/repo/${repoId}/release-wait`), { method: "POST", body: JSON.stringify({ upstream: u.name, days: v }) }).catch(e => ({ ok: false, error: e.message }))
+        if (!r.ok) return toast(r.error, "error"); toast(`${u.name}: ${r.upstreams[u.name] ? `waits ${r.upstreams[u.name]} day(s)` : "no wait"}`, "ok"); await again() } },
       { label: "Remove upstream", danger: true, run: async () => {
         if (!confirm(`Remove upstream ${u.name}? Its git remote is removed too.`)) return
         await api(apiUrl(`/api/repo/${repoId}/upstream/${u.name}`), { method: "DELETE", body: "{}" }); await again() } },
@@ -725,18 +731,20 @@ async function renderComponents(wrap, repoId) {
     const hintIn = el("input", { value: c.after_update || "", placeholder: "command to run after bumping (shown, never run)", "aria-label": `${c.name} follow-up command`, style: "width:360px" })
     const followIn = el("select", { "aria-label": `${c.name} follows` }, el("option", { value: "branch" }, "follow the branch head"), el("option", { value: "releases" }, "follow releases (tags)"))
     followIn.value = c.follow || "branch"
+    const ageIn = el("input", { type: "number", min: "0", step: "0.5", value: String(c.min_age_days || 0), "aria-label": `${c.name} release wait (days)`, title: "Only move the pin to commits or releases this many days old", style: "width:70px" })
     const enabledIn = el("input", { type: "checkbox", "aria-label": `Track ${c.name}` })
     enabledIn.checked = c.enabled !== false
     const saveBtn = el("button", { class: "btn ghost" }, "Save")
     saveBtn.onclick = () => busy(saveBtn, "Saving…", async () => {
       await api(apiUrl(`/api/repo/${repoId}/components/${encodeURIComponent(c.name)}`), { method: "POST", body: JSON.stringify({
-        branch: branchIn.value.trim(), watch_paths: watchIn.value, after_update: hintIn.value.trim(), enabled: enabledIn.checked, follow: followIn.value }) })
+        branch: branchIn.value.trim(), watch_paths: watchIn.value, after_update: hintIn.value.trim(), enabled: enabledIn.checked, follow: followIn.value, min_age_days: ageIn.value }) })
       toast(`${c.name} settings saved`, "ok")
       await renderComponents(wrap, repoId)
     })
     const status = c.status === "disabled" ? [badge("", "not tracked")]
       : ["not_checked_out", "not_fetched", "error"].includes(c.status) ? [badge(c.status === "error" ? "bad" : "warn", c.status.replace(/_/g, " "), c.detail)]
-      : [c.behind ? badge("warn", `↓ ${c.behind} behind${c.release ? ` release ${c.release}` : ""}`, "upstream commits newer than the pin") : badge("up", c.release ? `on the latest release ${c.release}` : "up to date"),
+      : [c.waiting ? badge("", `⏳ ${c.waiting} waiting`, `release wait ${c.min_age_days} day(s): ready ${(c.ready_at || "").slice(0, 16).replace("T", " ")}${c.waiting_tags ? ` (${c.waiting_tags.join(", ")})` : ""}`) : null,
+        c.behind ? badge("warn", `↓ ${c.behind} behind${c.release ? ` release ${c.release}` : ""}`, "upstream commits newer than the pin") : badge("up", c.release ? `on the latest release ${c.release}` : "up to date"),
          c.unreleased ? badge("", `${c.unreleased} unreleased upstream`, "commits on the branch after the latest release; they are not compared") : null,
          c.local ? badge("bad", `${c.local} pinned commits not upstream`, "your own commits inside the submodule; bump needs a merge there first") : null,
          c.moved ? badge("warn", "checked out ≠ pin") : null,
@@ -760,7 +768,7 @@ async function renderComponents(wrap, repoId) {
         c.after_update ? el("div", {}, "After bumping, run: ", el("code", {}, c.after_update)) : null) : null,
       el("details", { style: "margin-top:6px" }, el("summary", { class: "muted" }, "Settings"),
         el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px" },
-          el("label", { class: "muted" }, enabledIn, " track"), followIn, branchIn, watchIn, hintIn, saveBtn))
+          el("label", { class: "muted" }, enabledIn, " track"), followIn, branchIn, watchIn, hintIn, el("label", { class: "muted small" }, "wait ", ageIn, " days"), saveBtn))
     ))
   }
 }
@@ -2033,12 +2041,51 @@ async function renderRequests() {
   } catch (e) { wrap.replaceChildren(el("p", { class: "muted" }, `Could not load requests: ${e.message}`)) }
 }
 
+// Settings -> Notifications: where alerts go (ntfy, Gotify, a webhook) and which kinds go there.
+async function notifyCard() {
+  const card = el("div", { class: "repo-card", id: "notifications", style: "margin-top:16px" })
+  const n = await api(apiUrl("/api/notify/settings")).catch(() => null)
+  if (!n) return card
+  const env = new Set(n.from_env || [])
+  const field = (k, ph, label) => { const i = el("input", { value: n[k] || "", placeholder: ph, "aria-label": label, style: "width:420px;max-width:100%" }); if (env.has(k)) { i.disabled = true; i.title = "set in .env" }; return el("label", { class: "col", style: "gap:2px" }, label + (env.has(k) ? " (from .env)" : ""), i) }
+  const ntfy = field("ntfy_url", "https://ntfy.sh/your-secret-topic", "ntfy topic URL")
+  const ntfyTok = el("input", { type: "password", placeholder: n.ntfy_token_set ? "•••• saved" : "ntfy access token (optional)", "aria-label": "ntfy token", style: "width:260px" })
+  const gotify = field("gotify_url", "https://gotify.example.com", "Gotify server URL")
+  const gotifyTok = el("input", { type: "password", placeholder: n.gotify_token_set ? "•••• saved" : "Gotify application token", "aria-label": "Gotify token", style: "width:260px" })
+  const hook = field("webhook_url", "https://example.com/hook (JSON POST)", "Webhook URL")
+  const pub = field("public_url", "http://192.168.1.20:5001", "This app's address (for links in notifications)")
+  const boxes = Object.entries(n.names).map(([k, label]) => { const i = el("input", { type: "checkbox", style: "height:auto", "aria-label": label }); i.checked = !!n.events[k]; i.dataset.k = k; return i })
+  const save = el("button", { class: "btn" }, "Save")
+  const test = el("button", { class: "btn ghost" }, "Send a test")
+  const val = (w) => w.querySelector("input").value
+  save.onclick = () => busy(save, "Saving…", async () => {
+    const body = { events: Object.fromEntries(boxes.map(b => [b.dataset.k, b.checked])), ntfy_token: ntfyTok.value, gotify_token: gotifyTok.value }
+    for (const [k, w] of [["ntfy_url", ntfy], ["gotify_url", gotify], ["webhook_url", hook], ["public_url", pub]]) if (!env.has(k)) body[k] = val(w)
+    const r = await api(apiUrl("/api/notify/settings"), { method: "POST", body: JSON.stringify(body) }).catch(e => ({ ok: false, error: e.message }))
+    toast(r.ok ? `Saved. Sending to: ${r.channels.join(", ") || "the feed only"}` : r.error, r.ok ? "ok" : "error")
+  })
+  test.onclick = () => busy(test, "Sending…", async () => {
+    const r = await api(apiUrl("/api/notify/test"), { method: "POST", body: "{}" }).catch(e => ({ ok: false, error: e.message }))
+    const sent = (r.sent || []).map(x => `${x.channel}: ${x.ok ? "ok" : (x.error || x.status)}`).join(", ")
+    toast(r.ok ? (sent || "In the feed (no channel set up)") : r.error, r.ok && !(r.sent || []).some(x => !x.ok) ? "ok" : "error"); refreshBell()
+  })
+  card.append(el("h3", { style: "margin-top:0" }, "Notifications"),
+    el("p", { class: "muted small" }, "Everything shows in the bell at the top. Set a channel to also get it on your phone: ntfy (free app, any topic name you keep secret), Gotify, or a webhook."),
+    el("div", { class: "col", style: "gap:8px" }, el("div", { class: "row", style: "gap:8px;align-items:flex-end;flex-wrap:wrap" }, ntfy, ntfyTok),
+      el("div", { class: "row", style: "gap:8px;align-items:flex-end;flex-wrap:wrap" }, gotify, gotifyTok), hook, pub,
+      el("div", { class: "muted small" }, "Send to the phone:"),
+      el("div", { class: "row", style: "gap:14px;flex-wrap:wrap" }, ...boxes.map(b => el("label", { class: "row small", style: "gap:4px" }, b, n.names[b.dataset.k]))),
+      el("div", { class: "row", style: "gap:8px" }, save, test)))
+  return card
+}
+
 async function renderSettings() {
   const content = $("#content")
   content.innerHTML = ""
   content.append(el("h1", { class: "page", style: "margin-bottom:12px" }, "Settings"))
   const card = el("div", { class: "repo-card", style: "margin-top:16px" }, loading())
   content.append(card)
+  notifyCard().then(c => { content.insertBefore(c, card.nextSibling); if (location.hash === "#notifications") c.scrollIntoView() })
   try {
     const local = await api(apiUrl('/api/settings'))
     card.innerHTML = ""
@@ -2367,7 +2414,10 @@ function taskRow(t, onPick, selected) {
   const ag = { blocked: ["warn", "needs you"], working: ["info", "agent working"], done: ["ok", "agent done"], idle: ["", "agent idle"], gone: ["bad", "agent gone"] }[t.agent_status]
   return el("button", { class: `task-row${selected ? " sel" : ""}`, onclick: () => onPick(t), "aria-current": selected ? "true" : null },
     el("div", { class: "row", style: "gap:6px;align-items:center;min-width:0" },
-      badge(STATUS_CLS[t.status] || "", t.status), ag ? badge(ag[0], ag[1]) : null, el("span", { class: "muted small" }, KIND_LABEL[t.kind] || t.kind),
+      badge(STATUS_CLS[t.status] || "", t.status), ag ? badge(ag[0], ag[1]) : null,
+      t.priority && t.priority !== "normal" ? badge(t.priority === "urgent" ? "bad" : t.priority === "high" ? "warn" : "", t.priority) : null,
+      t.claimed_by && t.claimed_by.until > new Date().toISOString() ? badge("info", `🤖 ${t.claimed_by.agent}`) : null,
+      el("span", { class: "muted small" }, KIND_LABEL[t.kind] || t.kind),
       el("strong", { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0" }, t.title)),
     el("div", { class: "muted small", style: "text-align:left" }, `${t.repo_name}${t.onto ? ` → ${t.onto}` : ""} · ${where ? WHERE_LABEL[where] : "not started"}${running ? " · working…" : ""} · ${t.updated_at.slice(0, 16).replace("T", " ")}`))
 }
@@ -2412,11 +2462,25 @@ async function renderWork() {
   repoSel.onchange = () => { repoF = repoSel.value; draw() }
   const newBtn = el("button", { class: "btn", onclick: () => taskDialog({ repo: repoF || undefined }) }, "+ New task")
   const issuesBtn = el("button", { class: "btn ghost", title: "Make tasks of a repo's GitHub issues", onclick: () => repoF ? issuesDialog(repoF) : toast("Pick a repo first (the list above)", "info") }, "Import issues")
+  let view = picked ? "list" : store_.get("workView", "list")
+  const viewBar = el("div", { class: "tabs", role: "tablist", "aria-label": "View" })
+  const grid = el("div", { class: "work-grid" }, el("div", { class: "col", style: "gap:12px;min-width:0" }, el("div", { class: "panel", style: "min-width:0" }, fbar, listBox), roster), detail)
+  const boardHost = el("div")
+  const showView = async () => {
+    viewBar.replaceChildren(...[["list", "List"], ["board", "Board"]].map(([k, v]) => el("button", { class: `tab${k === view ? " active" : ""}`, role: "tab", "aria-selected": String(k === view),
+      onclick: () => { view = k; store_.set("workView", k); showView() } }, v)))
+    grid.hidden = view !== "list"; boardHost.hidden = view !== "board"
+    if (view === "board") await renderBoard(boardHost, repoF, (t) => { view = "list"; picked = t.id; history.replaceState({}, "", `${BASE}/work?task=${t.id}`); showView() })
+    else await draw()
+  }
+  const origPick = pick
+  repoSel.onchange = () => { repoF = repoSel.value; showView() }
   main.replaceChildren(
     el("div", { class: "row", style: "margin-bottom:12px;gap:10px;flex-wrap:wrap;align-items:center" }, el("h1", { class: "page", style: "margin:0" }, "Work"),
-      el("span", { class: "muted" }, "Fixes, bugs and changes for your coding agents: work on them here, send them to herdr or Studio, or park them."), el("div", { class: "spacer" }), repoSel, issuesBtn, newBtn),
-    el("div", { class: "work-grid" }, el("div", { class: "col", style: "gap:12px;min-width:0" }, el("div", { class: "panel", style: "min-width:0" }, fbar, listBox), roster), detail))
-  await draw()
+      el("span", { class: "muted" }, "Fixes, bugs and changes for your coding agents: work on them here, send them to herdr or Studio, or park them."), el("div", { class: "spacer" }), viewBar, repoSel, issuesBtn, newBtn),
+    grid, boardHost)
+  void origPick
+  await showView()
   drawRoster()
 }
 
@@ -2484,7 +2548,76 @@ async function taskDetail(box, t, redraw) {
   const agentBox = ["hermes", "herdr", "studio"].includes(where.type) ? agentPanel(t) : null
   const branchBox = where.workspace ? branchPanel(t, redraw) : null
   box.replaceChildren(el("div", { class: "col", style: "gap:10px;padding:14px" }, ...parts,
-    agentBox || branchBox ? el("div", { class: "agent-grid" }, agentBox, branchBox) : null, log))
+    agentBox || branchBox ? el("div", { class: "agent-grid" }, agentBox, branchBox) : null, taskTalk(t, redraw), log))
+}
+
+// Priority, who holds it, and the task's thread (agents hand over and ask here; you answer here).
+function taskTalk(t, redraw) {
+  const prio = el("select", { "aria-label": "Priority" }, ...["urgent", "high", "normal", "low"].map(p => el("option", { value: p }, p)))
+  prio.value = t.priority || "normal"
+  prio.onchange = async () => { await api(apiUrl(`/api/tasks/${t.id}/priority`), { method: "POST", body: JSON.stringify({ priority: prio.value }) }); toast(`Priority: ${prio.value}`, "ok"); await redraw() }
+  const c = t.claimed_by && t.claimed_by.until > new Date().toISOString() ? t.claimed_by : null
+  const thread = el("div", { class: "col", style: "gap:6px" }, ...(t.comments || []).map(m => el("div", { class: "panel", style: "padding:6px 8px" },
+    el("div", { class: "small muted" }, `${m.by}${m.to ? ` → ${m.to}` : ""} · ${m.at.slice(0, 16).replace("T", " ")}`), el("div", { style: "white-space:pre-wrap" }, m.text))))
+  const input = el("textarea", { rows: "2", placeholder: "Write on this task (agents read it; @name: … reaches one agent)", "aria-label": "Comment", style: "width:100%" })
+  const post = el("button", { class: "btn small" }, "Comment")
+  post.onclick = () => busy(post, "Posting…", async () => {
+    const text = input.value.trim(); if (!text) return
+    const m = text.match(/^@([A-Za-z0-9][A-Za-z0-9._:@/-]*)[:,]?\s+/)
+    await api(apiUrl(`/api/tasks/${t.id}/comments`), { method: "POST", body: JSON.stringify({ text: m ? text.slice(m[0].length) : text, to: m ? m[1] : null }) })
+    await redraw()
+  })
+  return el("div", { class: "col", style: "gap:6px" },
+    el("div", { class: "row", style: "gap:8px;align-items:center;flex-wrap:wrap" }, el("label", { class: "row small", style: "gap:4px" }, "Priority", prio),
+      c ? badge("info", `held by ${c.agent} until ${c.until.slice(11, 16)} UTC`) : el("span", { class: "muted small" }, "nobody holds it"),
+      t.why?.length ? el("span", { class: "muted small", title: t.why.join("; ") }, `Overseer score ${t.score}`) : null),
+    el("strong", { class: "small" }, `Thread (${(t.comments || []).length})`), thread, input, el("div", {}, post))
+}
+
+// ---- the kanban: Work as a board. Drag a card to another column, or up and down to reorder it.
+async function renderBoard(host, repoF, onPick) {
+  const r = await api(apiUrl(`/api/board${repoF ? `?repo=${encodeURIComponent(repoF)}` : ""}`)).catch(e => ({ columns: {}, error: e.message }))
+  const names = { open: "Open", working: "Working", parked: "Parked", done: "Done" }
+  const cols = Object.entries(names).map(([k, label]) => {
+    const cards = (r.columns?.[k] || [])
+    const col = el("div", { class: "kcol", "data-status": k }, el("h3", {}, el("span", {}, label), el("span", { class: "muted" }, String(cards.length))))
+    for (const c of cards) {
+      const card = el("div", { class: `kcard prio-${c.priority || "normal"}`, draggable: "true", tabindex: "0", "data-id": c.id, "data-rank": c.rank ?? "" ,
+        onclick: () => onPick({ id: c.id }), onkeydown: (e) => { if (e.key === "Enter") onPick({ id: c.id }) } },
+        el("div", { class: "t" }, c.title),
+        el("div", { class: "m" }, c.priority && c.priority !== "normal" ? badge(c.priority === "urgent" ? "bad" : c.priority === "high" ? "warn" : "", c.priority) : null,
+          el("span", {}, KIND_LABEL[c.kind] || c.kind), el("span", {}, `· ${c.repo_id}`),
+          c.claimed_by ? badge("info", `🤖 ${c.claimed_by.agent}`) : c.where?.type ? badge("", c.where.type) : null,
+          c.comments ? el("span", { title: c.last_comment ? `${c.last_comment.by}: ${c.last_comment.text}` : "" }, `💬 ${c.comments}`) : null,
+          c.by === "overseer" ? el("span", { title: "made by the Overseer" }, "🧭") : null))
+      card.ondragstart = (e) => { e.dataTransfer.setData("text/x-task", c.id); card.style.opacity = ".5" }
+      card.ondragend = () => { card.style.opacity = "" }
+      col.append(card)
+    }
+    col.ondragover = (e) => { if (e.dataTransfer.types.includes("text/x-task")) { e.preventDefault(); col.classList.add("drop") } }
+    col.ondragleave = () => col.classList.remove("drop")
+    col.ondrop = async (e) => {
+      e.preventDefault(); col.classList.remove("drop")
+      const id = e.dataTransfer.getData("text/x-task"); if (!id) return
+      // the new place: between the cards above and below where it was dropped
+      const others = [...col.querySelectorAll(".kcard")].filter(x => x.dataset.id !== id)
+      const below = others.find(x => e.clientY < x.getBoundingClientRect().top + x.offsetHeight / 2)
+      const idx = below ? others.indexOf(below) : others.length
+      const rk = (x) => x && x.dataset.rank !== "" ? Number(x.dataset.rank) : null
+      const above = rk(others[idx - 1]), under = rk(others[idx])
+      const rank = above == null && under == null ? null : above == null ? under + 10 : under == null ? above - 10 : (above + under) / 2
+      const res = await api(apiUrl(`/api/tasks/${id}/move`), { method: "POST", body: JSON.stringify({ status: k, rank }) }).catch(er => ({ ok: false, error: er.message }))
+      if (!res.ok) toast(res.error, "error")
+      refreshWorkCount(); renderBoard(host, repoF, onPick)
+    }
+    return col
+  })
+  const agents = (r.agents || []).filter(a => a.on.length || (a.minutes_since_seen ?? 1e9) < 120)
+  host.replaceChildren(
+    agents.length ? el("div", { class: "row small", style: "gap:8px;flex-wrap:wrap;margin-bottom:8px" }, el("span", { class: "muted" }, "Agents:"),
+      ...agents.map(a => badge(a.on.length ? "info" : "", `${a.name}${a.on.length ? `: ${a.on[0].title.slice(0, 30)}` : " (free)"}`, `last heard ${a.minutes_since_seen} min ago`))) : null,
+    el("div", { class: "kanban" }, ...cols),
+    el("p", { class: "muted small" }, "The Overseer keeps each column in order of importance; a card you drag stays where you drop it. 🧭 = made by the Overseer."))
 }
 
 let agentTimer = null
@@ -2872,6 +3005,64 @@ async function renderReferences() {
 // What this setup is connected to and whether it works, your other containers, and how far each
 // repo is integrated. This app's own record: nothing is written to the wiki or GitHub. See services.py.
 const MARK_CLS = { integrated: "up", partial: "warn", planned: "info", none: "", "": "" }
+// The Overseer: what it sees, what it did, and how it should run. Plain rules, not a model.
+async function renderOverseer() {
+  const main = $("#content")
+  main.replaceChildren(el("h1", { class: "page" }, "Overseer"), loading("Asking the Overseer…"))
+  let r = await api(apiUrl("/api/overseer")).catch(e => ({ ok: false, error: e.message }))
+  if (!r.ok) return main.replaceChildren(el("h1", { class: "page" }, "Overseer"), el("p", { class: "muted" }, r.error))
+  if (!r.report?.at) r = { ...r, report: (await api(apiUrl("/api/overseer/run"), { method: "POST", body: "{}" })).report }
+  const rep = r.report, st = r.settings
+  const runBtn = el("button", { class: "btn" }, "Look again now")
+  runBtn.onclick = () => busy(runBtn, "Looking…", async () => { await api(apiUrl("/api/overseer/run"), { method: "POST", body: "{}" }); await renderOverseer() })
+  const card = (title, ...body) => el("div", { class: "card", style: "margin-top:12px" }, el("h3", { style: "margin-top:0" }, title), ...body)
+  const taskLink = (t) => el("a", { href: `${BASE}/work?task=${t.id}` }, t.title)
+  // repos: priority you set + how much they need attention now
+  const repoRows = (rep.repos || []).map(x => {
+    const sel = el("select", { "aria-label": `${x.name} priority` }, ...["critical", "high", "normal", "low"].map(p => el("option", { value: p }, p)))
+    sel.value = x.priority || "normal"
+    sel.onchange = async () => { await api(apiUrl(`/api/repo/${x.id}/priority`), { method: "POST", body: JSON.stringify({ priority: sel.value }) }); toast(`${x.name}: ${sel.value}`, "ok") }
+    return el("tr", {}, el("td", {}, el("a", { href: `${BASE}/repo/${x.id}` }, x.name)), el("td", {}, sel), el("td", {}, el("b", {}, String(Math.round(x.score)))),
+      el("td", { class: "muted small" }, x.why.join(" · ") || "nothing needs doing"))
+  })
+  // settings
+  const en = el("input", { type: "checkbox", style: "height:auto", "aria-label": "Overseer on" }); en.checked = st.enabled
+  const mk = el("input", { type: "checkbox", style: "height:auto", "aria-label": "Make tasks" }); mk.checked = st.make_tasks
+  const disp = el("select", { "aria-label": "Hand tasks to" }, el("option", { value: "off" }, "nobody (agents take work themselves)"), el("option", { value: "herdr" }, "herdr agents"), el("option", { value: "studio" }, "Hermes Studio"))
+  disp.value = st.dispatch
+  const maxA = el("input", { type: "number", min: "0", max: "20", value: String(st.max_agents), "aria-label": "At most this many agents", style: "width:60px" })
+  const every = el("input", { type: "number", min: "1", value: String(st.every_minutes), "aria-label": "Every minutes", style: "width:70px" })
+  const stale = el("input", { type: "number", min: "0.1", step: "0.5", value: String(st.stale_request_days), "aria-label": "Remind about requests after days", style: "width:70px" })
+  const save = el("button", { class: "btn small" }, "Save")
+  save.onclick = () => busy(save, "Saving…", async () => {
+    const res = await api(apiUrl("/api/overseer/settings"), { method: "POST", body: JSON.stringify({ enabled: en.checked, make_tasks: mk.checked, dispatch: disp.value, max_agents: maxA.value, every_minutes: every.value, stale_request_days: stale.value }) }).catch(e => ({ ok: false, error: e.message }))
+    toast(res.ok ? "Saved" : res.error, res.ok ? "ok" : "error")
+  })
+  main.replaceChildren(
+    el("div", { class: "row", style: "gap:10px;align-items:center;flex-wrap:wrap" }, el("h1", { class: "page", style: "margin:0" }, "Overseer"),
+      el("span", { class: "muted" }, `Ranks your repos and the board, turns problems into tasks, takes back stalled work and keeps agents going. Plain rules, no model. Last looked ${(rep.at || "").slice(0, 16).replace("T", " ")} UTC.`),
+      el("div", { class: "spacer" }), el("a", { href: `${BASE}/work`, class: "btn ghost", onclick: () => store_.set("workView", "board") }, "Open the board"), runBtn),
+    el("div", { class: "tiles", style: "margin-top:12px" },
+      el("div", { class: "tile" }, el("span", { class: "muted" }, "Open tasks"), el("b", {}, String((rep.next || []).length))),
+      el("div", { class: "tile" }, el("span", { class: "muted" }, "Being worked on"), el("b", {}, String((rep.working || []).length))),
+      el("div", { class: `tile ${(rep.waiting_for_you || []).length ? "warn" : "good"}` }, el("span", { class: "muted" }, "Waiting for you"), el("b", {}, String((rep.waiting_for_you || []).length))),
+      el("div", { class: "tile" }, el("span", { class: "muted" }, "Agents heard from"), el("b", {}, String((rep.agents || []).length)))),
+    card("Next up (agents get these in this order)", (rep.next || []).length ? el("ol", { style: "margin:0;padding-left:20px" }, ...rep.next.map(t =>
+      el("li", { style: "margin:4px 0" }, badge(t.priority === "urgent" ? "bad" : t.priority === "high" ? "warn" : "", t.priority || "normal"), " ", taskLink(t),
+        el("span", { class: "muted small" }, ` · ${t.repo} · ${(t.why || []).join("; ")}`)))) : el("p", { class: "muted" }, "Nothing open. 🎉")),
+    card("Being worked on", (rep.working || []).length ? el("ul", { style: "margin:0;padding-left:20px" }, ...rep.working.map(t => el("li", {}, taskLink(t), el("span", { class: "muted small" }, ` · ${t.repo}${t.agent ? ` · ${t.agent}` : ""}`)))) : el("p", { class: "muted" }, "Nobody is on anything right now.")),
+    card("Repos, most in need first", el("p", { class: "muted small", style: "margin-top:0" }, "Set how much each repo matters to you; the Overseer weighs that first, then conflicts, waiting requests, failed checks, bugs and how far behind it is."),
+      el("div", { class: "table-box" }, el("table", { class: "list" }, el("thead", {}, el("tr", {}, el("th", {}, "Repo"), el("th", {}, "Matters"), el("th", {}, "Need"), el("th", {}, "Why"))), el("tbody", {}, ...repoRows)))),
+    card("What it did last time", (rep.actions || []).length ? el("ul", { class: "small", style: "margin:0;padding-left:20px" }, ...rep.actions.map(a => el("li", {}, a))) : el("p", { class: "muted small" }, "Nothing needed doing.")),
+    card("How it runs", el("div", { class: "col", style: "gap:8px" },
+      el("label", { class: "row", style: "gap:6px" }, en, `On, every`, every, "minutes"),
+      el("label", { class: "row", style: "gap:6px" }, mk, "Turn problems into tasks (conflicts, failed checks, repo errors) and close them when they're gone"),
+      el("label", { class: "row", style: "gap:6px" }, "Hand the next tasks to", disp, "at most", maxA, "at a time"),
+      el("label", { class: "row", style: "gap:6px" }, "Remind me about requests waiting", stale, "days"),
+      el("div", {}, save),
+      el("p", { class: "muted small", style: "margin:0" }, "Agents ask it for work with next_task (an agent run by cron does that first), talk on tasks and to each other, and check in while they work; a claim that runs out goes back on the board."))))
+}
+
 async function renderIntegrations() {
   const main = $("#content")
   main.replaceChildren(el("h1", { class: "page" }, "Integrations"), loading("Checking each connection…"))
@@ -3360,7 +3551,7 @@ function currentView() {
   if (BASE && path.startsWith(BASE)) path = path.slice(BASE.length)
   const parts = path.split('/').filter(Boolean)
   if (parts[0] === 'repo' && parts[1]) return ['repo', decodeURIComponent(parts[1])]
-  if (['requests', 'settings', 'chats', 'workflows', 'work', 'references', 'integrations'].includes(parts[0])) return [parts[0]]
+  if (['requests', 'settings', 'chats', 'workflows', 'work', 'references', 'integrations', 'overseer'].includes(parts[0])) return [parts[0]]
   if (!parts.length || parts[0] === 'repos') return ['repos']
   return ['notfound']
 }
@@ -3401,7 +3592,7 @@ async function router() {
     a.classList.toggle("on", on)
     if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current")
   }
-  document.title = ({ repos: "Repositories", repo: id, chats: "Chats", workflows: "Workflows", requests: "Requests", settings: "Settings", work: "Work", references: "References", integrations: "Integrations" }[view] || "Not found") + " · Upstream Manager"
+  document.title = ({ repos: "Repositories", repo: id, chats: "Chats", workflows: "Workflows", requests: "Requests", settings: "Settings", work: "Work", references: "References", integrations: "Integrations", overseer: "Overseer" }[view] || "Not found") + " · Upstream Manager"
   try {
     if (view === "repos") await renderRepos()
     else if (view === "repo") await renderRepoPage(id)
@@ -3410,6 +3601,7 @@ async function router() {
     else if (view === "requests") await renderRequests()
     else if (view === "work") await renderWork()
     else if (view === "references") await renderReferences()
+    else if (view === "overseer") await renderOverseer()
     else if (view === "integrations") await renderIntegrations()
     else if (view === "settings") await renderSettings()
     else $("#content").replaceChildren(el("div", { class: "card", style: "max-width:520px;margin:40px auto;text-align:center" },
@@ -3438,6 +3630,32 @@ document.addEventListener('click', (e) => {
   route(navPath)
 })
 window.addEventListener('popstate', router)
+
+// ---- notifications: the bell and its feed
+async function refreshBell() {
+  const r = await api(apiUrl("/api/notifications?limit=1")).catch(() => null)
+  if (r) $("#bell-count").textContent = r.unread || ""
+}
+async function toggleBell() {
+  const open = document.querySelector(".bell-panel")
+  if (open) { open.remove(); $("#bell").setAttribute("aria-expanded", "false"); return }
+  const r = await api(apiUrl("/api/notifications?limit=60")).catch(e => ({ items: [], error: e.message }))
+  const markAll = el("button", { class: "btn ghost small", onclick: async () => { await api(apiUrl("/api/notifications/read"), { method: "POST", body: "{}" }); panel.remove(); refreshBell() } }, "Mark all read")
+  const panel = el("div", { class: "bell-panel", role: "dialog", "aria-label": "Notifications" },
+    el("div", { class: "row", style: "margin-bottom:6px" }, el("strong", {}, "Notifications"), el("div", { class: "spacer" }), markAll,
+      el("a", { href: `${BASE}/settings#notifications`, class: "small", style: "margin-left:8px" }, "Settings")),
+    ...(r.items.length ? r.items.map(n => el("a", { class: `note lvl-${n.level}${n.read ? "" : " unread"}`, href: `${BASE}${n.path || "/overseer"}`, onclick: () => {
+        api(apiUrl("/api/notifications/read"), { method: "POST", body: JSON.stringify({ ids: [n.id] }) }).then(refreshBell); panel.remove() } },
+      el("div", { style: "font-weight:600;font-size:13px" }, n.title),
+      n.message ? el("div", { class: "small muted" }, n.message.slice(0, 220)) : null,
+      el("div", { class: "small muted" }, `${(n.at || "").slice(0, 16).replace("T", " ")} · ${n.event}${n.repo ? ` · ${n.repo}` : ""}`)))
+      : [el("p", { class: "muted small" }, "Nothing yet. Requests waiting for you, failed checks, agents asking something and the Overseer's alerts show up here.")]))
+  document.body.append(panel); $("#bell").setAttribute("aria-expanded", "true")
+  const away = (e) => { if (!panel.contains(e.target) && e.target.id !== "bell" && !e.target.closest("#bell")) { panel.remove(); document.removeEventListener("click", away) } }
+  setTimeout(() => document.addEventListener("click", away))
+}
+$("#bell")?.addEventListener("click", toggleBell)
+refreshBell(); setInterval(() => { if (!document.hidden) { refreshBell(); refreshPendingCount() } }, 30000)
 // The script tag sits at the end of <body>, so the DOM is ready already.
 router()
 refreshModelStatus()

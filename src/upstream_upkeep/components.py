@@ -29,7 +29,7 @@ from . import gitops
 
 # Without a tag_pattern, a release is a plain version (v2.8.0, 3.6.0): not "vue3", not v1.0.0-rc.1.
 _RELEASE = re.compile(r"^v?\d+(\.\d+){1,3}$")
-_EDITABLE = ("enabled", "branch", "watch_paths", "after_update", "follow", "tag_pattern")
+_EDITABLE = ("enabled", "branch", "watch_paths", "after_update", "follow", "tag_pattern", "min_age_days")
 
 
 def _git(cwd, *args):
@@ -75,6 +75,7 @@ def sync(repo: dict) -> list[dict]:
             "after_update": prev.get("after_update") or "",
             "follow": prev.get("follow") or "branch",
             "tag_pattern": prev.get("tag_pattern") or "",
+            "min_age_days": prev.get("min_age_days") or 0,
         })
     return merged
 
@@ -90,6 +91,11 @@ def update_settings(comp: dict, patch: dict) -> dict:
             v = bool(v)
         elif k == "follow":
             v = "releases" if v == "releases" else "branch"
+        elif k == "min_age_days":
+            try:
+                v = max(0.0, min(float(v or 0), 365.0))
+            except (TypeError, ValueError):
+                v = 0.0
         else:
             v = str(v or "").strip()
         comp[k] = v
@@ -241,9 +247,22 @@ def compare(repo_path: str, comp: dict, do_fetch: bool = False, light: bool = Fa
             out["detail"] = (f"no release tags {'matching ' + pattern if comp.get('tag_pattern') else '(like v1.2.3)'} "
                              f"on origin/{br}: comparing with the branch")
         else:
-            out["release"] = tags[0]
-            out["unreleased"] = gitops.behind_ahead(sub, f"{tags[0]}^{{commit}}", ref)[0]
-            ref = f"refs/tags/{tags[0]}^{{commit}}"
+            wait = float(comp.get("min_age_days") or 0)
+            pick = gitops.aged_tag(sub, tags, wait) if wait else {"tag": tags[0], "waiting": [], "ready_at": None}
+            if pick["waiting"]:
+                out.update(min_age_days=wait, waiting=len(pick["waiting"]), waiting_tags=pick["waiting"][:5], ready_at=pick["ready_at"])
+            release = pick["tag"] or None
+            if release:
+                out["release"] = release
+                out["unreleased"] = gitops.behind_ahead(sub, f"{release}^{{commit}}", ref)[0]
+                ref = f"refs/tags/{release}^{{commit}}"
+            else:
+                ref = out["pin"]   # every release is still too new: stay where we are
+    elif float(comp.get("min_age_days") or 0) > 0:
+        held = gitops.aged_commit(sub, ref, float(comp["min_age_days"]))
+        if held["waiting"]:
+            out.update(min_age_days=float(comp["min_age_days"]), waiting=held["waiting"], ready_at=held["ready_at"])
+            ref = held["sha"] or out["pin"]
     out["upstream"] = gitops.short_sha(sub, ref)
     out["behind"], out["local"] = gitops.behind_ahead(sub, out["pin"], ref)
     if out["follow"] == "branch" and out["behind"] and out["pin_tag"]:

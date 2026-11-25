@@ -398,6 +398,7 @@ def _summary(repo: dict) -> dict:
         "last_commit": commits[0] if commits else None,
         "integration": repo.get("integration"),
         "groups": repo.get("groups") or [],
+        "priority": repo.get("priority") or "normal",
         **({"dirty": st["dirty"], "dirty_tracked": st["tracked"]} if (st := (gitops.status_summary(repo["path"]) if not error else None)) else {"dirty": 0, "dirty_tracked": 0}),
         "error": error,
     }

@@ -239,3 +239,36 @@ def test_a_failed_check_is_tried_again_after_another_request_goes_in(client, rep
     finally:
         autoapprove._on_request = real
     assert "mine:other" in calls
+
+
+# ------------------------------------------------------------ release wait
+def _old_commit(repo, name, days_ago, msg):
+    import time as _t
+    when = str(int(_t.time() - days_ago * 86400))
+    env = {**os.environ, "GIT_AUTHOR_DATE": f"@{when}", "GIT_COMMITTER_DATE": f"@{when}"}
+    Path(repo, name).write_text(msg + "\n")
+    import subprocess
+    subprocess.run(["git", "add", name], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "commit", "-qm", msg], cwd=repo, check=True, env=env)
+
+
+def test_release_wait_takes_only_old_enough_commits(client, repos):
+    up, mine = repos
+    registry.add_repo(str(mine), None, "mine")
+    _old_commit(up, "old.txt", 5, "five days old")
+    _old_commit(up, "new.txt", 0.1, "brand new")
+    agent = {"X-Upstream-Client": "agent"}
+    assert client.post("/api/repo/mine/release-wait", json={"days": 0}, headers=agent).status_code == 403
+    assert client.post("/api/repo/mine/release-wait", json={"days": 2}).get_json()["upstreams"] == {"origin": 2.0}
+    plan = client.post("/api/repo/mine/fetch", json={}).get_json()["plan"]
+    u = plan["upstreams"][0]
+    assert u["behind"] == 1 and u["waiting"] == 1 and u["ready_at"] and u["target"], u
+    res = client.post("/api/run-daily", json={}).get_json()["results"]
+    assert any(r.get("status") == "merged" for r in res), res
+    assert (Path(mine) / "old.txt").is_file() and not (Path(mine) / "new.txt").exists()
+    # nothing old enough left: reads as up to date, with one waiting
+    u = client.get("/api/repo/mine/compare").get_json()["plan"]["upstreams"][0]
+    assert u["behind"] == 0 and u["waiting"] == 1
+    client.post("/api/repo/mine/release-wait", json={"days": 0})
+    u = client.get("/api/repo/mine/compare").get_json()["plan"]["upstreams"][0]
+    assert u["behind"] == 1 and "waiting" not in u

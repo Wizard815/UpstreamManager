@@ -30,6 +30,10 @@ class UpstreamComparison:
     refspec: str | None = None
     conflict_files: list[str] = field(default_factory=list)
     missing_ref: bool = False
+    wait_days: float = 0          # the release wait: only commits this old are taken
+    waiting: int = 0              # newer upstream commits held back by it
+    ready_at: str | None = None   # when the oldest of those may go in
+    target: str | None = None     # the commit taken (pins merges and requests) when some are held back
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -46,6 +50,9 @@ class UpstreamComparison:
             "refspec": self.refspec,
             "conflict_files": self.conflict_files,
             "missing_ref": self.missing_ref,
+            **({"wait_days": self.wait_days, "waiting": self.waiting, "ready_at": self.ready_at}
+               if self.wait_days else {}),
+            **({"target": self.target} if self.target else {}),
         }
 
 
@@ -118,6 +125,14 @@ def compare_upstream(path: str, upstream: dict, focus_branch: str | None = None,
         return UpstreamComparison(name=remote, url=url, branch=branch, ahead=0, behind=0, up_to_date=False,
                                   conflict_detail=detail, missing_ref=True)
     local = gitops.short_sha(path, focus)
+    wait = float(upstream.get("wait_days") or 0)
+    held = {"waiting": 0, "ready_at": None}
+    if wait > 0:
+        held = gitops.aged_commit(path, ref, wait)
+        if held["waiting"]:
+            # compare with (and later merge) only what is old enough; with nothing old enough, the focus
+            # branch itself stands in, so it reads as nothing to take yet
+            ref = held["sha"] or local
     upstream_sha = gitops.short_sha(path, ref)
     behind, ahead = gitops.behind_ahead(path, focus, ref)
 
@@ -131,7 +146,11 @@ def compare_upstream(path: str, upstream: dict, focus_branch: str | None = None,
         elif conflict:
             detail = f"{len(files)} conflicting file(s)"
 
+    if held["waiting"] and not held.get("sha"):
+        ahead = 0   # nothing upstream is old enough to compare with yet
     return UpstreamComparison(
+        wait_days=wait, waiting=held["waiting"], ready_at=held["ready_at"],
+        target=upstream_sha if held["waiting"] and behind else None,
         name=remote, url=url, branch=branch, ahead=ahead, behind=behind,
         up_to_date=(ahead == 0 and behind == 0), local_sha=local, upstream_sha=upstream_sha,
         conflict=conflict, conflict_detail=detail, conflict_files=files,

@@ -23,6 +23,8 @@ from .app import flask_app
 def main(default_port: int = 5000) -> None:
     memory.start_background()  # writes the log of each finished day that had activity
     references.start_background()  # keeps reference repos up to date (daily unless set otherwise)
+    from . import overseer
+    overseer.start_background()    # ranks the board, makes tasks of problems, keeps agents going
     port = int(os.environ.get("PORT", str(default_port)))
     # Agents on other machines: the MCP tools over HTTP when UPSTREAM_MCP_PORT is set (token: UPSTREAM_MCP_TOKEN).
     from . import mcp_server

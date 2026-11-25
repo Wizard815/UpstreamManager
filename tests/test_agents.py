@@ -197,7 +197,9 @@ def test_mcp_tool_parameters_cover_every_editable_setting():
     from upstream_upkeep import components
     tools = {t.name: t for t in _run(lambda c: c.list_tools()).tools}
     params = set(tools["set_component"].input_schema["properties"])
-    assert set(components._EDITABLE) <= params, set(components._EDITABLE) - params
+    users_only = {"min_age_days"}   # the release wait: an agent could shorten it to rush a change in
+    assert set(components._EDITABLE) - users_only <= params, set(components._EDITABLE) - users_only - params
+    assert not users_only & params
 
 
 def test_stack_set_merges_env_and_null_removes(client, conflicted, monkeypatch):

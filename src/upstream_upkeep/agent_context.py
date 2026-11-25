@@ -67,8 +67,19 @@ def briefing(repo: dict) -> str:
             auto = r.get("auto") or {}
             lines.append(f"- {r['id']} ({what}) {ups}" + (f" [auto-approval check: {auto['state']}]" if auto.get("state") else ""))
         lines.append("")
-    from . import autoapprove
-    lines += [autoapprove.describe(repo), ""]
+    from . import autoapprove, board, tasks
+    lines += [autoapprove.describe(repo)]
+    waits = [f"{u['name']} {u['wait_days']:g} day(s)" for u in repo.get("upstreams") or [] if u.get("wait_days")]
+    waits += [f"submodule {c['name']} {c['min_age_days']:g} day(s)" for c in repo.get("components") or [] if c.get("min_age_days")]
+    if waits:
+        lines.append("Release wait (only commits this old are taken; newer ones show as waiting): " + ", ".join(waits) + ".")
+    lines.append(f"Priority the user gave this repo: {repo.get('priority') or 'normal'}.")
+    mine = [t for t in tasks.list_tasks(repo["id"]) if t["status"] in ("open", "working")]
+    if mine:
+        lines += ["", "## Tasks on the board (overseer_plan / next_task for the order)"]
+        lines += [f"- {t['id']} [{t.get('priority', 'normal')}, {t['status']}] {t['title']}"
+                  + (f" (held by {t['claimed_by']['agent']})" if board.claim_alive(t) else "") for t in mine[:12]]
+    lines.append("")
     ws = workspaces.list_workspaces(repo)
     if ws:
         lines.append("## Merge workspaces")

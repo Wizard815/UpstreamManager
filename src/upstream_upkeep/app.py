@@ -35,7 +35,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, render_template_string, abort, send_file
 
-from . import (actions, autoapprove, issues, agent_context, components, config, credentials, daily_check, edits, github, gitops, hermes,
+from . import (actions, autoapprove, board, issues, notify, overseer, agent_context, components, config, credentials, daily_check, edits, github, gitops, hermes,
                herdr, memory, orb, pull_report, references, registry, services, stacks, storage, store, studio, tasks, upstream_check, wiki, workflows, workspaces)
 from .store import settings as get_settings, save_settings
 
@@ -349,6 +349,8 @@ def api_component_settings(repo_id, name):
     if not repo:
         abort(404)
     patch = request.get_json(force=True) or {}
+    if "min_age_days" in patch and (refused := _user_only("Changing the release wait")):
+        return refused
     with store.lock:
         comp = next((c for c in repo.get("components") or [] if c["name"] == name), None)
         if not comp:
@@ -1292,6 +1294,190 @@ def api_remove_upstream(repo_id, name):
     return jsonify({"ok": True, "repo": repo})
 
 
+@flask_app.route("/api/repo/<repo_id>/release-wait", methods=["POST"])
+def api_release_wait(repo_id):
+    """Only take upstream commits at least `days` old: {days, upstream?} (every upstream when none is named).
+    Pinned submodules have their own min_age_days (component settings). Yours only."""
+    if (refused := _user_only("Changing the release wait")):
+        return refused
+    repo = _tracked(repo_id)
+    data = request.get_json(force=True) or {}
+    try:
+        days = max(0.0, min(float(data.get("days") or 0), 365.0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "days is a number"}), 400
+    name = data.get("upstream")
+    hit = [u for u in repo.get("upstreams") or [] if not name or u["name"] == name]
+    if name and not hit:
+        abort(404)
+    with store.lock:
+        for u in hit:
+            u["wait_days"] = days
+        store.save_repo(repo)
+    return jsonify({"ok": True, "upstreams": {u["name"]: u.get("wait_days", 0) for u in repo.get("upstreams") or []}})
+
+
+@flask_app.route("/api/notifications")
+def api_notifications():
+    return jsonify({"ok": True, **notify.feed(int(request.args.get("limit") or 100), request.args.get("unread") == "1")})
+
+
+@flask_app.route("/api/notifications/read", methods=["POST"])
+def api_notifications_read():
+    ids = (request.get_json(silent=True) or {}).get("ids")
+    return jsonify({"ok": True, "marked": notify.mark_read(ids if isinstance(ids, list) else None)})
+
+
+@flask_app.route("/api/notify/settings")
+def api_notify_settings():
+    return jsonify({"ok": True, **notify.public()})
+
+
+@flask_app.route("/api/notify/settings", methods=["POST"])
+def api_save_notify_settings():
+    if (refused := _user_only("Changing notifications")):
+        return refused
+    try:
+        return jsonify({"ok": True, **notify.save(request.get_json(force=True) or {})})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@flask_app.route("/api/notify/test", methods=["POST"])
+def api_notify_test():
+    if (refused := _user_only("Sending a test notification")):
+        return refused
+    return jsonify(notify.test())
+
+
+# ------------------------------------------------------- the board, agents talking, the Overseer
+def _board_call(fn, *a, **kw):
+    try:
+        return jsonify({"ok": True, **(fn(*a, **kw) or {})})
+    except KeyError:
+        abort(404)
+    except (board.BoardError, tasks.TaskError, ValueError) as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+def _who(data: dict) -> str:
+    """Who is speaking: the agent's name it gives, or you."""
+    return board.agent_name(data.get("agent")) if _from_agent() else "you"
+
+
+@flask_app.route("/api/board")
+def api_board():
+    return jsonify(board.board(request.args.get("repo") or None, request.args.get("group") or None))
+
+
+@flask_app.route("/api/tasks/<task_id>/move", methods=["POST"])
+def api_task_move(task_id):
+    d = request.get_json(force=True) or {}
+    rank = d.get("rank")
+    return _board_call(lambda: {"task": _task_out(board.move(task_id, d.get("status") or (tasks.get(task_id) or {}).get("status"),
+                                                             float(rank) if rank is not None else None,
+                                                             by=_who(d)))})
+
+
+@flask_app.route("/api/tasks/<task_id>/priority", methods=["POST"])
+def api_task_priority(task_id):
+    d = request.get_json(force=True) or {}
+    return _board_call(lambda: {"task": _task_out(tasks.update(task_id, priority=d.get("priority"),
+                                                               note=f"priority set by {_who(d)}"))})
+
+
+@flask_app.route("/api/tasks/<task_id>/claim", methods=["POST"])
+def api_task_claim(task_id):
+    d = request.get_json(force=True) or {}
+    return _board_call(lambda: {"task": _task_out(board.claim(task_id, d.get("agent"), d.get("minutes") or board.LEASE_MINUTES))})
+
+
+@flask_app.route("/api/tasks/<task_id>/heartbeat", methods=["POST"])
+def api_task_heartbeat(task_id):
+    d = request.get_json(force=True) or {}
+    return _board_call(lambda: {"task": _task_out(board.heartbeat(task_id, d.get("agent"), d.get("note"), d.get("minutes") or board.LEASE_MINUTES))})
+
+
+@flask_app.route("/api/tasks/<task_id>/release", methods=["POST"])
+def api_task_release(task_id):
+    d = request.get_json(force=True) or {}
+    return _board_call(lambda: {"task": _task_out(board.release(task_id, d.get("agent"), d.get("status") or "open", d.get("note")))})
+
+
+@flask_app.route("/api/tasks/<task_id>/comments", methods=["POST"])
+def api_task_comment(task_id):
+    d = request.get_json(force=True) or {}
+    return _board_call(lambda: {"comment": board.comment(task_id, _who(d), d.get("text"), (d.get("to") or None))})
+
+
+@flask_app.route("/api/messages")
+def api_messages():
+    who = request.args.get("agent") if _from_agent() else "user"
+    return _board_call(lambda: {"items": board.inbox(who or "", request.args.get("all") != "1", request.args.get("peek") != "1")})
+
+
+@flask_app.route("/api/messages", methods=["POST"])
+def api_post_message():
+    d = request.get_json(force=True) or {}
+    return _board_call(lambda: {"message": board.post(_who(d), d.get("to") or "", d.get("text"), d.get("task") or None)})
+
+
+@flask_app.route("/api/agents")
+def api_agents():
+    return jsonify({"ok": True, "items": board.agents()})
+
+
+@flask_app.route("/api/overseer")
+def api_overseer():
+    rep = overseer.last()
+    return jsonify({"ok": True, "report": rep, "settings": overseer.settings()})
+
+
+@flask_app.route("/api/overseer/run", methods=["POST"])
+def api_overseer_run():
+    return jsonify({"ok": True, "report": overseer.run("asked by " + ("an agent" if _from_agent() else "you"))})
+
+
+@flask_app.route("/api/overseer/plan")
+def api_overseer_plan():
+    return jsonify({"ok": True, "text": overseer.plan(request.args.get("agent") or None)})
+
+
+@flask_app.route("/api/overseer/next", methods=["POST"])
+def api_overseer_next():
+    d = request.get_json(force=True) or {}
+    kinds = d.get("kinds") if isinstance(d.get("kinds"), list) else None
+    def go():
+        out = overseer.next_task(d.get("agent"), d.get("repo") or None, d.get("group") or None, kinds, d.get("minutes") or board.LEASE_MINUTES)
+        return {**out, "task": _task_out(out["task"]) if out.get("task") else None}
+    return _board_call(go)
+
+
+@flask_app.route("/api/overseer/settings", methods=["POST"])
+def api_overseer_settings():
+    if (refused := _user_only("Changing the Overseer")):
+        return refused
+    try:
+        return jsonify({"ok": True, "settings": overseer.save_settings(request.get_json(force=True) or {})})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@flask_app.route("/api/repo/<repo_id>/priority", methods=["POST"])
+def api_repo_priority(repo_id):
+    """How much this repo matters to you: critical, high, normal or low (the Overseer weighs it first)."""
+    if (refused := _user_only("Setting a repo's priority")):
+        return refused
+    repo = _tracked(repo_id)
+    p = (request.get_json(force=True) or {}).get("priority")
+    if p not in overseer.REPO_PRIORITY:
+        return jsonify({"ok": False, "error": "priority is critical, high, normal or low"}), 400
+    with store.lock:
+        repo["priority"] = p
+        store.save_repo(repo)
+    return jsonify({"ok": True, "priority": p})
+
+
 @flask_app.route("/api/mcp")
 def api_mcp():
     """How coding agents connect: the stdio command always; the network address when UPSTREAM_MCP_PORT is set."""
@@ -1415,6 +1601,11 @@ def api_run_daily():
                 results.append({"repo_id": repo["id"], "status": "error", "error": str(e)})
     for r in results:
         _remember_daily(r)
+    errors = [r for r in results if r.get("status") == "error"]
+    if errors:
+        notify.notify("daily", f"Daily check: {len(errors)} repo(s) had errors",
+                      "; ".join(f"{r.get('repo_name') or r.get('repo_id')}: {str(r.get('error'))[:120]}" for r in errors[:5]),
+                      level="high", path="/repos", key="daily:" + ",".join(sorted(str(r.get("repo_id")) for r in errors)))
     wiki.log_daily(results)  # one line in the LLMWIKI daily note, when it is set up
     memory.write_due_logs_soon()  # log any finished day that has no log yet
     return jsonify({"ok": True, "results": results})
@@ -1533,6 +1724,31 @@ def decide(req: dict, decision: str, comment: str | None = None) -> tuple[dict, 
 
 
 autoapprove.install(decide)
+overseer.SEND = lambda task_id, to, message=None, opts=None: _send_task(task_id, to, message, opts)
+
+
+def _notify_request(rec: dict) -> None:
+    """A new request waits for you: say so (unless an auto-approval rule takes it; then its outcome is said)."""
+    if autoapprove.handles(rec):
+        return
+    what = requestLine(rec)
+    notify.notify("request", f"{rec.get('repo_name') or rec.get('repo_id')}: waits for your approval", what,
+                  level="high" if rec.get("safe") is False else "info", path=f"/requests#req-{rec['id']}",
+                  key=f"request:{rec['id']}:{rec.get('created_at')}", repo=rec.get("repo_id"))
+
+
+def requestLine(r: dict) -> str:
+    if r.get("type") == "components":
+        return "bump " + ", ".join(f"{c.get('name')} ({c.get('behind')} behind)" for c in r.get("components") or [])
+    if r.get("type") == "push":
+        return f"push {r.get('branch')} to {r.get('remote')}"
+    if r.get("type") == "actions":
+        return "change GitHub Actions workflows"
+    return "; ".join(u.get("reason") or f"merge {u.get('behind')} commit(s) from {u.get('name')}" for u in r.get("upstreams") or [])
+
+
+if _notify_request not in store.REQUEST_HOOKS:
+    store.REQUEST_HOOKS.append(_notify_request)
 
 
 @flask_app.route("/api/repo/<repo_id>/auto-approve")
@@ -1813,7 +2029,7 @@ def api_task_create():
     try:
         t = tasks.create(data.get("repo") or store.GENERAL, data.get("title"), data.get("body"),
                          data.get("kind") or "fix", data.get("about"), by="agent" if _from_agent() else "user",
-                         upstream=data.get("upstream"), onto=data.get("onto"))
+                         upstream=data.get("upstream"), onto=data.get("onto"), priority=data.get("priority") or "normal")
     except tasks.TaskError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     out = {"ok": True, "task": t}
@@ -2907,6 +3123,18 @@ pre.term{margin:0;font:12px/1.35 var(--mono);white-space:pre-wrap;color:#cfd6e4}
 .ref-tree .trow{display:flex;gap:6px;align-items:center;padding:4px 8px;cursor:pointer;border-radius:6px}.ref-tree .trow:hover{background:var(--raise)}
 .ref-tree .trow.sel{background:var(--raise);box-shadow:inset 3px 0 0 var(--accent,#4c7dff)}.ref-tree .tw{width:12px;color:var(--muted)}
 .trow.drop,.ref-drop.drop{outline:2px dashed var(--accent,#4c7dff);outline-offset:-2px}
+.bell{background:none;border:0;color:var(--soft);font-size:16px;cursor:pointer;position:relative;padding:4px 8px;border-radius:8px}.bell:hover{background:var(--raise)}
+.bell .count:empty{display:none}.bell .count{position:absolute;top:-2px;right:-4px;font-size:10px;background:var(--bad,#d55);color:#fff;border-radius:999px;padding:0 5px}
+.bell-panel{position:fixed;top:52px;right:12px;width:min(420px,94vw);max-height:70vh;overflow:auto;background:var(--panel);border:1px solid var(--line2);border-radius:10px;box-shadow:0 10px 30px #0008;z-index:50;padding:8px}
+.bell-panel .note{display:block;padding:8px;border-radius:8px;color:var(--text);text-decoration:none;border-bottom:1px solid var(--line)}.bell-panel .note.unread{background:var(--raise)}
+.bell-panel .lvl-urgent,.bell-panel .lvl-high{border-left:3px solid var(--bad,#d55)}
+.kanban{display:grid;grid-template-columns:repeat(4,minmax(220px,1fr));gap:10px;align-items:start;overflow-x:auto}
+.kcol{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px;min-height:200px}.kcol.drop{outline:2px dashed var(--accent,#3b6cff)}
+.kcol h3{margin:2px 4px 8px;font-size:13px;display:flex;justify-content:space-between}
+.kcard{background:var(--card);border:1px solid var(--line2);border-radius:8px;padding:8px;margin-bottom:6px;cursor:grab}.kcard:hover{border-color:var(--accent,#3b6cff)}
+.kcard .t{font-weight:600;font-size:13px}.kcard .m{font-size:11px;color:var(--soft);margin-top:4px;display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+.prio-urgent{border-left:3px solid #e5484d}.prio-high{border-left:3px solid #f5a524}.prio-low{opacity:.8}
+@media (max-width:900px){.kanban{grid-template-columns:repeat(4,85vw)}}
 .chip{background:var(--raise);border:1px solid var(--line2);color:var(--soft);border-radius:999px;padding:3px 10px;font-size:12px;cursor:pointer}.chip.on{background:var(--accent,#3b6cff);border-color:transparent;color:#fff}
 .ref-row,.ref-head{display:grid;grid-template-columns:22px minmax(140px,1.4fr) minmax(0,2fr) 70px 86px 34px;gap:8px;align-items:center;padding:6px 8px;border-bottom:1px solid var(--line)}
 .ref-row{cursor:pointer}.ref-row:hover{background:var(--raise)}.ref-row .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -2932,12 +3160,14 @@ pre.term{margin:0;font:12px/1.35 var(--mono);white-space:pre-wrap;color:#cfd6e4}
     <a href="{{ base_url }}/work" data-view="work">Work <span class="count" id="work-count"></span></a>
     <a href="{{ base_url }}/chats" data-view="chats">Chats</a>
     <a href="{{ base_url }}/references" data-view="references">References</a>
+    <a href="{{ base_url }}/overseer" data-view="overseer">Overseer</a>
     <a href="{{ base_url }}/integrations" data-view="integrations">Integrations</a>
     <a href="{{ base_url }}/workflows" data-view="workflows">Workflows</a>
     <a href="{{ base_url }}/requests" data-view="requests">Requests <span class="count" id="pending-count"></span></a>
     <a href="{{ base_url }}/settings" data-view="settings">Settings</a>
   </nav>
   <div class="spacer"></div>
+  <button class="bell" id="bell" type="button" aria-label="Notifications" aria-haspopup="true" aria-expanded="false">🔔<span class="count" id="bell-count"></span></button>
   <div class="status-dot" id="model-status"><i></i><span>Model</span></div>
 </header>
 <main id="main">
