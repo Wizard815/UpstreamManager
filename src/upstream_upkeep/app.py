@@ -1727,6 +1727,14 @@ def decide(req: dict, decision: str, comment: str | None = None) -> tuple[dict, 
             except workspaces.WorkspaceError as e:
                 outcome.append({"upstream": "submodules", "ok": False, "detail": str(e)})
             failed = not all(o["ok"] for o in outcome)
+        if req.get("workspace") and not failed:   # the task it was for is done: off the board, nobody holds it
+            linked = workspaces.linked_task(repo, req["workspace"])
+            for t in tasks.list_tasks(repo["id"]):
+                if t["status"] in ("done", "dropped") or not (t["id"] == linked or (t.get("where") or {}).get("workspace") == req["workspace"]):
+                    continue
+                with store.lock:
+                    t["claimed_by"] = None
+                tasks.update(t["id"], status="done", note=f"its change went in: request {req['id']} was approved")
         if req.get("workspace") and not failed:  # its branch is in the focus branch now
             try:
                 workspaces.remove(repo, req["workspace"])
@@ -2274,19 +2282,38 @@ def api_task_commit(task_id):
     if marked:
         return jsonify({"ok": False, "error": f"{len(marked)} file(s) still have conflict markers: {', '.join(marked[:8])}"
                         + (" …" if len(marked) > 8 else "") + ". Resolve them first (or ask the agent to)."}), 409
+    ident = ["-c", f"user.name={gitops._run(['git', 'config', 'user.name'], cwd=repo['path']).stdout.strip() or 'Upstream Manager'}",
+             "-c", f"user.email={gitops._run(['git', 'config', 'user.email'], cwd=repo['path']).stdout.strip() or 'upstream-manager@localhost'}"]
+    # Changes inside a submodule (an agent fixed code there): commit them in the submodule first, with the
+    # same message, so the repo's commit below records the submodule's new pin.
+    subs = [l.split(" ", 1)[1].strip() for l in gitops._run(["git", "submodule", "foreach", "--quiet", "echo x $sm_path"], cwd=path).stdout.splitlines()
+            if l.startswith("x ")]
+    sub_commits = []
+    for sub in subs:
+        if paths and not any(sub == x or sub.startswith(x.rstrip("/") + "/") or x in (".", "") for x in paths):
+            continue
+        sp = Path(path, sub)
+        if not gitops._run(["git", "status", "--porcelain"], cwd=str(sp)).stdout.strip():
+            continue
+        marked_sub = [f"{sub}/{f}" for _st, f in _porcelain(str(sp)) if _has_markers(sp / f)]
+        if marked_sub:
+            return jsonify({"ok": False, "error": f"conflict markers in {', '.join(marked_sub[:8])}"}), 409
+        gitops._run(["git", "add", "-A"], cwd=str(sp))
+        done = gitops._run(["git", *ident, "commit", "-q", "-F", "-"], cwd=str(sp), input=msg + "\n")
+        if done.returncode:
+            return jsonify({"ok": False, "error": f"committing inside {sub} failed: " + ((done.stderr or done.stdout).strip() or "?")}), 400
+        sub_commits.append(f"{sub}@{(gitops.short_sha(str(sp), 'HEAD') or '')[:10]}")
     add = gitops._run(["git", "add", "-A", "--", *(paths or ["."])], cwd=path)
     if add.returncode:
         return jsonify({"ok": False, "error": (add.stderr or add.stdout).strip()}), 400
     gitops._run(["git", "reset", "-q", "--", tasks.COMMIT_FILE], cwd=path)
-    ident = ["-c", f"user.name={gitops._run(['git', 'config', 'user.name'], cwd=repo['path']).stdout.strip() or 'Upstream Manager'}",
-             "-c", f"user.email={gitops._run(['git', 'config', 'user.email'], cwd=repo['path']).stdout.strip() or 'upstream-manager@localhost'}"]
     res = gitops._run(["git", *ident, "commit", "-q", "-F", "-"], cwd=path, input=msg + "\n")
     if res.returncode:
         return jsonify({"ok": False, "error": (res.stderr or res.stdout).strip() or "nothing to commit"}), 400
     Path(path, tasks.COMMIT_FILE).unlink(missing_ok=True)
     sha = (gitops.short_sha(path, "HEAD") or "")[:10]
-    tasks.update(task_id, note=f"committed {sha}: {msg.splitlines()[0][:100]}")
-    return jsonify({"ok": True, "sha": sha})
+    tasks.update(task_id, note=f"committed {sha}: {msg.splitlines()[0][:100]}" + (f" (and inside {', '.join(sub_commits)})" if sub_commits else ""))
+    return jsonify({"ok": True, "sha": sha, "submodule_commits": sub_commits})
 
 
 @flask_app.route("/api/tasks/<task_id>/submit", methods=["POST"])
@@ -2351,7 +2378,18 @@ def api_task_agent_status(task_id):
         return jsonify({"ok": True, "ignored": "the task has moved on to another agent"})
     if status == "gone":
         board.let_go(task_id, tasks.board_name(w))
-        tasks.update(task_id, where={**w, "agent": None}, note="its agent's herdr pane was closed")
+        last = w.get("status")
+        if t["status"] == "working" and last not in ("done", "idle"):
+            # it never finished (crashed on start, or closed mid-way): back on the board for another go;
+            # anything it did is still on the task's branch
+            why = "before it started working" if last not in ("working", "blocked") else "before it finished"
+            tasks.update(task_id, status="open", where={**w, "agent": None, "status": "gone"},
+                         note=f"its agent's herdr pane closed {why}: back on the board (its branch keeps any work)")
+            notify.notify("stuck", f"An agent stopped {why}: {t['title'][:80]}",
+                          "Its herdr pane closed. The task is open again; send it to an agent or work on it.",
+                          level="high", path=f"/work?task={task_id}", key=f"gone:{task_id}:{w.get('agent')}", repo=t["repo_id"])
+        else:
+            tasks.update(task_id, where={**w, "agent": None}, note="its agent's herdr pane was closed")
     else:
         tasks.herdr_sync(t, {"status": status})
     return jsonify({"ok": True})

@@ -24,7 +24,7 @@ import os
 import threading
 import time
 
-from . import board, config, notify, registry, store, tasks
+from . import board, config, gitops, notify, registry, store, tasks
 
 PRIORITY_WEIGHT = {"urgent": 1000, "high": 300, "normal": 100, "low": 20}
 KIND_WEIGHT = {"bug": 40, "merge": 30, "fix": 20, "feature": 10, "chore": 5, "idea": -20}
@@ -53,7 +53,7 @@ def save_settings(data: dict) -> dict:
             raise ValueError("dispatch is off, herdr or studio")
         cur["dispatch"] = data["dispatch"]
     for k, lo, hi in (("max_agents", 0, 20), ("stale_request_days", 0.1, 60), ("every_minutes", 1, 1440),
-                      ("urgent_unclaimed_minutes", 1, 1440)):
+                      ("urgent_unclaimed_minutes", 1, 1440), ("ready_unsubmitted_minutes", 1, 1440)):
         if k in data:
             try:
                 cur[k] = max(lo, min(float(data[k]), hi))
@@ -269,6 +269,39 @@ def _run(reason: str) -> dict:
                           "Merges tab, or nudge the agent.", level="info", path=f"/repo/{repo['id']}",
                           key=f"unsubmitted:{w['name']}:{w.get('head')}", repo=repo["id"])
             actions.append(f"nudged {agent or 'nobody'}: workspace {w['name']} ready but not submitted")
+
+    # a herdr agent that finished but never said so: its status doesn't always reach us (herdr can't always
+    # tell what an agent in a pane is doing), so look at the work itself: changes on the task's branch, the
+    # commit message it proposes, and nothing new for a while
+    from . import workspaces as _ws
+    for t in tasks.list_tasks(status="working"):
+        w = t.get("where") or {}
+        if w.get("type") != "herdr" or not w.get("workspace") or w.get("status") in ("blocked",):
+            continue
+        repo = store.get_repo(t["repo_id"])
+        try:
+            path = _ws.path_of(repo, w["workspace"]) if repo else None
+        except _ws.WorkspaceError:
+            path = None
+        msg = path / tasks.COMMIT_FILE if path else None
+        if not msg or not msg.is_file() or msg.is_symlink():
+            continue
+        changed = [l for l in gitops._run(["git", "status", "--porcelain"], cwd=str(path)).stdout.splitlines()
+                   if l[3:].strip() != tasks.COMMIT_FILE]
+        if not changed and not gitops.behind_ahead(str(path), w.get("base") or (repo.get("focus_branch") or "main"), "HEAD")[0]:
+            continue
+        last = max(_days(t.get("updated_at")), 0) * 1440
+        since_msg = (time.time() - msg.stat().st_mtime) / 60
+        if min(last, since_msg) < s.get("ready_unsubmitted_minutes", 15):
+            continue
+        sent = notify.notify("stuck", f"Ready for your review: {t['title'][:80]}",
+                             f"{w.get('agent') or 'The agent'} left changes and a proposed commit message, then went quiet. "
+                             "Review and commit them on the task.", level="info", path=f"/work?task={t['id']}",
+                             key=f"review:{t['id']}:{int(msg.stat().st_mtime)}", repo=t["repo_id"])
+        if sent:
+            board.comment(t["id"], "overseer", "The agent's changes and proposed commit message are ready and it has gone "
+                                               "quiet: over to you to review and commit them.")
+            actions.append(f"ready for review: {t['id']}")
 
     # what needs the user
     for q in store.snapshot(store.get_requests()):

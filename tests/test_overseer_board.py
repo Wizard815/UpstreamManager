@@ -3,6 +3,7 @@ import datetime as dt
 import http.server
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -231,3 +232,62 @@ def test_a_ready_workspace_nobody_submitted_gets_a_nudge(client, repo):
     client.post(f"/api/repo/mine/workspaces/{ws['name']}/submit", json={"summary": "x"})
     rep = overseer.run("submitted")
     assert not any("ready but not submitted" in a for a in rep["actions"])
+
+
+def test_an_agent_that_dies_on_start_puts_its_task_back(client, repo, monkeypatch):
+    t = _task(client, "Crashy")
+    with store.lock:
+        tasks.get(t["id"])["status"] = "working"
+        tasks.get(t["id"])["where"] = {"type": "herdr", "via": "studio", "agent": "w5:p2", "machine": ""}
+    board.hold(t["id"], "herdr:w5:p2")
+    monkeypatch.setattr("upstream_upkeep.app._via_trusted_proxy", lambda: True)
+    # Studio: the pane closed before the agent ever reported working
+    client.post(f"/api/tasks/{t['id']}/agent-status", json={"status": "gone", "pane": "w5:p2"})
+    back = tasks.get(t["id"])
+    assert back["status"] == "open" and back["claimed_by"] is None and "before it started working" in back["log"][-1]["text"]
+    assert any(n["event"] == "stuck" and "Crashy" in n["title"] for n in notify.feed()["items"])
+    # one that finished first stays for review
+    t2 = _task(client, "Fine")
+    with store.lock:
+        tasks.get(t2["id"])["status"] = "working"
+        tasks.get(t2["id"])["where"] = {"type": "herdr", "via": "studio", "agent": "w6:p2", "status": "done"}
+    client.post(f"/api/tasks/{t2['id']}/agent-status", json={"status": "gone", "pane": "w6:p2"})
+    assert tasks.get(t2["id"])["status"] == "working"
+
+
+def test_a_herdr_agent_that_finished_quietly_is_handed_to_you(client, repo):
+    """herdr can't always tell what an agent is doing: the Overseer looks at the work itself."""
+    import os
+    import time as _t
+    from upstream_upkeep import workspaces
+    t = _task(client, "Quiet one")
+    repo_d = store.get_repo("mine")
+    ws = workspaces.open_workspace(repo_d, change="quiet one")
+    with store.lock:
+        tasks.get(t["id"])["status"] = "working"
+        tasks.get(t["id"])["where"] = {"type": "herdr", "via": "studio", "agent": "w6:p2", "workspace": ws["name"]}
+        tasks.get(t["id"])["updated_at"] = "2000-01-01T00:00:00+00:00"
+    p = Path(ws["path"])
+    (p / "a.txt").write_text("changed\n")
+    overseer.run("no message yet")
+    assert not any(n["title"].startswith("Ready for your review") for n in notify.feed()["items"])
+    (p / tasks.COMMIT_FILE).write_text("Change a.txt\n")
+    old = _t.time() - 3600
+    os.utime(p / tasks.COMMIT_FILE, (old, old))
+    rep = overseer.run("later")
+    assert any("ready for review" in a for a in rep["actions"])
+    assert any(n["title"] == "Ready for your review: Quiet one" for n in notify.feed()["items"])
+    assert tasks.get(t["id"])["comments"][-1]["by"] == "overseer"
+    rep = overseer.run("again")      # once
+    assert not any("ready for review" in a for a in rep["actions"])
+
+
+def test_approving_a_tasks_change_finishes_the_task(client, repo):
+    t = _task(client, "Ship it")
+    client.post(f"/api/tasks/{t['id']}/claim", json={"agent": "hermes-1"}, headers=AGENT)
+    ws = client.post("/api/repo/mine/workspaces", json={"change": "ship it", "task": t["id"]}, headers=AGENT).get_json()["workspace"]
+    commit_file(ws["path"], "ship.txt", "shipped\n", "ship it")
+    req = client.post(f"/api/repo/mine/workspaces/{ws['name']}/submit", json={"summary": "x"}, headers=AGENT).get_json()["request"]
+    assert client.post(f"/api/request/{req['id']}/decide", json={"decision": "approve"}).get_json()["ok"]
+    done = tasks.get(t["id"])
+    assert done["status"] == "done" and done["claimed_by"] is None and "was approved" in done["log"][-1]["text"]

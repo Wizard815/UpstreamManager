@@ -310,3 +310,27 @@ def test_a_submodule_commit_made_in_a_workspace_reaches_the_users_checkout(clien
     # the submodule's upstream was not touched
     assert subprocess.run(["git", "cat-file", "-e", new_sha], cwd=api).returncode != 0
     assert any("on this machine only" in o["detail"] for o in done["result"])
+
+
+def test_committing_a_tasks_change_inside_a_submodule(client, tmp_path, monkeypatch):
+    """A herdr agent leaves its fix uncommitted inside a submodule; your commit goes in there first, then the pin."""
+    import subprocess
+    from upstream_upkeep import tasks
+    for k, v in {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow", "GIT_CONFIG_VALUE_0": "always"}.items():
+        monkeypatch.setenv(k, v)
+    g = lambda cwd, *a: subprocess.run(["git", "-c", "user.email=t@t.t", "-c", "user.name=T", *a], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+    api = tmp_path / "up-api"; api.mkdir(); g(api, "init", "-q", "-b", "main")
+    (api / "server.js").write_text("v1\n"); g(api, "add", "-A"); g(api, "commit", "-qm", "api")
+    hub = tmp_path / "hub"; hub.mkdir(); g(hub, "init", "-q", "-b", "main")
+    g(hub, "submodule", "add", "-q", str(api), "api"); g(hub, "commit", "-qm", "hub")
+    registry.add_repo(str(hub), None, "hub")
+    t = client.post("/api/tasks", json={"repo": "hub", "title": "Add /version", "kind": "feature"}).get_json()["task"]
+    ws = workspaces.open_workspace(store.get_repo("hub"), change="add version")
+    with store.lock:
+        tasks.get(t["id"])["where"] = {"type": "herdr", "workspace": ws["name"]}
+    p = Path(ws["path"]); g(p, "submodule", "update", "--init")
+    (p / "api" / "server.js").write_text("v1 + /version\n")
+    r = client.post(f"/api/tasks/{t['id']}/commit", json={"message": "api: add /version"}).get_json()
+    assert r["ok"] and r["submodule_commits"] and r["submodule_commits"][0].startswith("api@"), r
+    assert g(p / "api", "log", "-1", "--format=%s") == "api: add /version"
+    assert g(p, "log", "-1", "--format=%s") == "api: add /version" and not g(p, "status", "--porcelain")
