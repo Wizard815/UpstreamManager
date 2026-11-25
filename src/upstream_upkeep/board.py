@@ -100,6 +100,8 @@ def move(task_id: str, status: str, rank: float | None = None, by: str = "you") 
     if status != t["status"]:
         t["log"].append({"at": config.now_iso(), "text": f"moved to {status} by {by}"})
         t["status"] = status
+        if status == "done":
+            tasks.finished(t)
         if status in ("done", "dropped", "open", "parked"):
             t["claimed_by"] = None
     if rank is not None:
@@ -170,6 +172,10 @@ def release(task_id: str, agent: str, status: str = "open", note: str | None = N
         raise BoardError("release it as open, done or parked")
     t["claimed_by"] = None
     t["log"].append({"at": config.now_iso(), "text": f"{agent} let it go: {status}" + (f" ({str(note)[:500]})" if note else "")})
+    if status == "done" and t["status"] != "done":
+        t["claimed_by"] = {"agent": agent}   # who finished it, for the wiki's note
+        tasks.finished(t)
+        t["claimed_by"] = None
     t["status"] = status
     t["updated_at"] = config.now_iso()
     _seen(agent, "")

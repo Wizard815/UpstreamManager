@@ -164,9 +164,15 @@ CACHE_SECONDS = 600
 
 
 def settings() -> dict:
-    s = dict(store.settings().get("wiki") or {})
-    s.setdefault("enabled", False)
-    s.setdefault("mode", "folder")          # folder | rest
+    saved = store.settings().get("wiki")
+    s = dict(saved or {})
+    # LLMWIKI_MCP_URL in .env connects the reading side too (over the Local REST API next to it),
+    # unless the page was used to set reading up some other way
+    from_env = saved is None and enabled()
+    s.setdefault("enabled", from_env)
+    s.setdefault("mode", "rest" if from_env else "folder")          # folder | rest
+    s.setdefault("record_tasks", True)      # finished tasks go to the vault's short-term tier
+    s.setdefault("priorities_note", "")     # the note the Overseer follows; "" = "Upstream priorities"
     s.setdefault("path", "")
     s.setdefault("url", "")
     s.setdefault("read", True)              # give chats and agents what wiki/ says about a repo
@@ -359,3 +365,213 @@ def park(title: str, content: str) -> dict:
         n += 1
     v.write(rel, content)
     return {"via": s["mode"], "note": rel}
+
+
+# ======================================================================
+# Search and read the long-term notes (agents and chats), the priorities page the Overseer
+# follows, and finished work handed to the vault's short-term tier.
+# ======================================================================
+def _within_wiki(rel: str) -> str:
+    rel = (rel or "").strip().lstrip("/")
+    if not rel.endswith(".md"):
+        rel += ".md"
+    if not rel.startswith("wiki/"):
+        rel = "wiki/" + rel
+    if ".." in rel.split("/"):
+        raise WikiError("path outside wiki/")
+    return rel
+
+
+_STOP = {"the", "a", "an", "of", "for", "in", "on", "and", "or", "to", "is", "what", "how", "about", "my", "our", "with",
+         "repo", "repository", "project", "wiki", "note", "notes", "please", "find", "look", "up", "do", "does", "we",
+         "i", "you", "are", "it", "be", "can", "should", "when", "where", "which", "who", "why", "there", "this", "that"}
+
+
+def _terms(query: str) -> list[str]:
+    words = list(dict.fromkeys(re.findall(r"[\w./#-]{2,}", (query or "").lower())))
+    return [w for w in words if w not in _STOP][:8] or words[:8]
+
+
+def search(query: str, limit: int = 20) -> list[dict]:
+    """Notes in wiki/ (the long-term tier) that mention every word of `query`, best first:
+    [{note, path, status, score, lines}]. The vault's own search when reached over REST."""
+    s = settings()
+    if not s["enabled"]:
+        raise WikiError("the LLM wiki is off (Settings → LLM wiki)")
+    terms = _terms(query)
+    if not terms:
+        raise WikiError("search for at least one word")
+    v = vault()
+    candidates = None
+    if isinstance(v, _Rest):   # let the vault narrow it down (Local REST API simple search), word by word
+        found = []
+        for t in terms:
+            r = v._req("POST", "/search/simple/", params={"query": t, "contextLength": 80})
+            if r.status_code >= 400:
+                found = None
+                break
+            found += [h.get("filename") for h in r.json() if isinstance(h, dict) and str(h.get("filename", "")).startswith("wiki/")]
+        candidates = list(dict.fromkeys(found)) if found is not None else None
+    need = max(1, (len(terms) + 1) // 2)        # most of the words, not all: agents ask in sentences
+    out = []
+    for rel in candidates if candidates is not None else v.notes("wiki"):
+        if "/logs/" in rel:
+            continue
+        text = v.read(rel) or ""
+        meta, body = _front(text)
+        title = rel.rsplit("/", 1)[-1][:-3]
+        hay = (title + "\n" + body).lower()
+        hits = [t for t in terms if t in hay]
+        if len(hits) < need:
+            continue
+        lines = [l.strip() for l in body.splitlines() if not l.lstrip().startswith("#") and any(t in l.lower() for t in hits)][:6]
+        score = 20 * len(hits) + sum(hay.count(t) for t in hits) + 10 * sum(t in title.lower() for t in hits)
+        out.append({"note": title, "path": rel, "status": meta.get("status", ""), "score": score,
+                    "lines": [redact(l)[:300] for l in lines]})
+    out.sort(key=lambda n: -n["score"])
+    return out[:max(1, min(int(limit), 50))]
+
+
+def read_note(path: str, limit: int = 20000) -> dict:
+    """One note of wiki/, secrets removed."""
+    if not settings()["enabled"]:
+        raise WikiError("the LLM wiki is off (Settings → LLM wiki)")
+    rel = _within_wiki(path)
+    text = vault().read(rel)
+    if text is None:
+        raise WikiError(f"no note {rel}")
+    meta, body = _front(text)
+    return {"path": rel, "note": rel.rsplit("/", 1)[-1][:-3], "status": meta.get("status", ""),
+            "text": redact(body)[:limit], "truncated": len(body) > limit}
+
+
+# ------------------------------------------------------------------ the priorities page
+PRIORITIES_NOTE = "Upstream priorities"
+_WEIGHTS = [(re.compile(r"\b(pause[sd]?|freeze|frozen|on hold|hold|skip|ignore|don'?t touch)\b", re.I), -100, "paused"),
+            (re.compile(r"\b(urgent|critical|asap|right now|now|blocker|broken)\b", re.I), 60, "urgent"),
+            (re.compile(r"\b(high|important|focus|priority|first|this week)\b", re.I), 30, "high"),
+            (re.compile(r"\b(low|later|someday|nice to have|eventually)\b", re.I), -20, "low")]
+
+
+def _weight(text: str) -> tuple[int, str] | None:
+    for pat, w, word in _WEIGHTS:
+        if pat.search(text):
+            return w, word
+    return None
+
+
+def priorities(repos: list[dict] | None = None) -> dict:
+    """What the user wrote in the wiki note "Upstream priorities" (settings: wiki.priorities_note), per repo:
+    {note, path, repos: {repo_id: {weight, word, line}}, lines}. A line names repos by id or name, or a group
+    as #group; its words say how much it matters (urgent / high / low / pause...), else the heading above
+    the line does, else it counts as wanted (+20). Cached like the rest of the reading."""
+    s = settings()
+    empty = {"note": None, "path": None, "repos": {}, "lines": []}
+    if not s["enabled"]:
+        return empty
+    want = (s.get("priorities_note") or PRIORITIES_NOTE).strip()
+    key = "prio:" + want
+    hit = _CACHE.get(key)
+    if hit and time.time() - hit[0] < 120:
+        text, rel = hit[1]
+    else:
+        v = vault()
+        rel = None
+        try:
+            direct = _within_wiki(want)
+            if v.read(direct) is not None:
+                rel = direct
+        except WikiError:
+            pass
+        if not rel:
+            rel = next((n for n in v.notes("wiki") if n.rsplit("/", 1)[-1][:-3].lower() == want.lower().rsplit("/", 1)[-1].removesuffix(".md")), None)
+        text = (v.read(rel) or "") if rel else ""
+        _CACHE[key] = (time.time(), (text, rel))
+    if not rel:
+        return empty
+    repos = repos if repos is not None else store.snapshot(store.all_repos())
+    names = {}
+    for r in repos:
+        for n in {r.get("id"), r.get("name")} - {None, ""}:
+            names[n.lower()] = r["id"]
+    groups = {}
+    for r in repos:
+        for g in r.get("groups") or []:
+            groups.setdefault(g.lower(), []).append(r["id"])
+    out, lines, heading = {}, [], None
+    _, body = _front(text)
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#") and not re.match(r"^#[\w-]+(\s|$)", line):   # a heading, not a #group
+            heading = _weight(line)
+            continue
+        hit_ids = {rid for n, rid in names.items() if re.search(r"(?<![\w-])" + re.escape(n) + r"(?![\w-])", line, re.I)}
+        for g in re.findall(r"#([\w-]+)", line):
+            hit_ids.update(groups.get(g.lower(), []))
+        if not hit_ids:
+            continue
+        w = _weight(line) or heading or (20, "wanted")
+        clean = redact(line.lstrip("-*0123456789. "))[:200]
+        lines.append({"text": clean, "weight": w[0], "word": w[1], "repos": sorted(hit_ids)})
+        for rid in hit_ids:
+            if rid not in out or abs(w[0]) > abs(out[rid]["weight"]):
+                out[rid] = {"weight": w[0], "word": w[1], "line": clean}
+    return {"note": rel.rsplit("/", 1)[-1][:-3], "path": rel, "repos": out, "lines": lines}
+
+
+# ------------------------------------------------------------------ finished work -> the vault
+def task_done_text(task: dict, repo: dict | None) -> tuple[str, str]:
+    """(one line for the daily note, a note for the inbox) about a finished task."""
+    who = (task.get("claimed_by") or {}).get("agent") or (task.get("where") or {}).get("agent")
+    hands = sorted({c["by"] for c in task.get("comments") or [] if c.get("by") not in ("you", "overseer")})
+    by = ", ".join(hands) or who or "you"
+    repo_name = (repo or {}).get("name") or task["repo_id"]
+    commits = [l["text"] for l in task.get("log") or [] if l["text"].startswith(("committed ", "its change went in"))]
+    line = redact(f"Upkeep task done: {task['title']} ({repo_name}, {task['kind']}, by {by})")[:300]
+    parts = [f"# Done: {task['title']}", "",
+             f"- Repo: {repo_name}", f"- Kind: {task['kind']}, priority {task.get('priority', 'normal')}",
+             f"- Done by: {by}", f"- Upstream Manager task {task['id']}, opened {task['created_at'][:10]}, done {config.now_iso()[:10]}"]
+    parts += [f"- {c}" for c in commits[-4:]]
+    if task.get("body"):
+        parts += ["", "## What was asked", "", task["body"][:3000]]
+    notes = [c for c in task.get("comments") or [] if c.get("by") != "overseer"][-6:]
+    if notes:
+        parts += ["", "## What happened (the task's thread)", ""] + [f"- {c['by']}: {c['text'][:800]}" for c in notes]
+    return line, redact("\n".join(parts))[:12000]
+
+
+def record_task_done(task: dict) -> None:
+    """Hand a finished task to the vault: a line in today's daily note and a note for its inbox (Capture
+    files it into the long-term tier). Through the MCP writer, else as an inbox note via the reader."""
+    s = settings()
+    if not (enabled() or s["enabled"]) or not s.get("record_tasks", True):
+        return
+    repo = store.get_repo(task["repo_id"])
+    line, note = task_done_text(task, repo)
+
+    def run():
+        if enabled():
+            call_tool("memory_log", {"text": line, "source": SOURCE})
+            call_tool("memory_capture", {"title": f"Done: {task['title']}"[:120], "content": note})
+            return
+        from datetime import datetime
+        v = vault()
+        safe = re.sub(r"\s+", " ", re.sub(r'[\\/:*?"<>|#^\[\]]+', " ", task["title"])).strip()[:70] or "Task"
+        v.write(f"inbox/{datetime.now().strftime('%Y-%m-%d %H%M')} - Done - {safe}.md", note)
+
+    if enabled():
+        _in_background("task done", run)
+    else:
+        threading.Thread(target=lambda: _quiet(run), daemon=True, name="llmwiki-task-done").start()
+
+
+def _quiet(fn):
+    try:
+        fn()
+    except Exception as e:
+        log.warning("LLMWIKI: recording a finished task failed: %s", e)
+
+
+from . import config  # noqa: E402  (after the module's own imports, like store above)

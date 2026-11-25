@@ -673,6 +673,42 @@ def api_wiki():
     return jsonify(wiki.status())
 
 
+@flask_app.route("/api/wiki/search")
+def api_wiki_search():
+    try:
+        return jsonify({"ok": True, "items": wiki.search(request.args.get("q") or "", int(request.args.get("limit") or 20))})
+    except (wiki.WikiError, ValueError) as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@flask_app.route("/api/wiki/note")
+def api_wiki_note():
+    try:
+        return jsonify({"ok": True, **wiki.read_note(request.args.get("path") or "")})
+    except wiki.WikiError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404 if str(e).startswith("no note") else 400
+
+
+@flask_app.route("/api/wiki/priorities")
+def api_wiki_priorities():
+    try:
+        return jsonify({"ok": True, **wiki.priorities()})
+    except wiki.WikiError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@flask_app.route("/api/wiki/connect")
+def api_wiki_connect():
+    """How a client on this machine reaches the vault's own MCP tools: for Hermes Studio, to give Hermes the
+    wiki directly. Carries the key, so only Studio (Upstream's trusted proxy) asks, never an agent."""
+    if not _via_trusted_proxy() or _from_agent():
+        return jsonify({"ok": False, "error": "only Hermes Studio asks for this"}), 403
+    url = os.environ.get("LLMWIKI_MCP_URL", "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "the LLM wiki's MCP address isn't set (LLMWIKI_MCP_URL)"}), 404
+    return jsonify({"ok": True, "url": url, "key": os.environ.get("LLMWIKI_API_KEY", "").strip()})
+
+
 @flask_app.route("/api/wiki/settings", methods=["POST"])
 def api_wiki_settings():
     """Reading the vault: {enabled, mode: folder|rest, path, url, read}. The REST key is saved under Accounts
@@ -683,9 +719,11 @@ def api_wiki_settings():
     if not isinstance(data, dict):
         return jsonify({"ok": False, "error": "send an object"}), 400
     s = wiki.settings()
-    for k in ("enabled", "read"):
+    for k in ("enabled", "read", "record_tasks"):
         if k in data:
             s[k] = bool(data[k])
+    if "priorities_note" in data:
+        s["priorities_note"] = str(data["priorities_note"] or "").strip()[:200]
     if "mode" in data:
         s["mode"] = "rest" if data["mode"] == "rest" else "folder"
     for k in ("path", "url"):

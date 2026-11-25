@@ -3384,6 +3384,17 @@ async function wikiSetup() {
   const url = el("input", { value: st.url || "", placeholder: st.rest_url || "http://192.168.20.5:27123", style: "width:100%" })
   const key = el("input", { type: "password", placeholder: st.key_set ? "•••• set (type to replace)" : "the plugin's API key", style: "width:100%", autocomplete: "off" })
   const read = el("input", { type: "checkbox", style: "height:auto" }); read.checked = st.read
+  const rec = el("input", { type: "checkbox", style: "height:auto" }); rec.checked = st.record_tasks !== false
+  const prioNote = el("input", { value: st.priorities_note || "", placeholder: "Upstream priorities", style: "width:100%", "aria-label": "Priorities note" })
+  // try it: search the long-term notes like an agent would
+  const q = el("input", { type: "search", placeholder: "Search wiki/ (as agents do)…", "aria-label": "Search the wiki", style: "flex:1 1 240px" })
+  const found = el("div", { class: "col small", style: "gap:4px" })
+  q.onkeydown = async (e) => {
+    if (e.key !== "Enter" || !q.value.trim()) return
+    const r = await api(apiUrl(`/api/wiki/search?q=${encodeURIComponent(q.value)}`)).catch(er => ({ ok: false, error: er.message }))
+    found.replaceChildren(...(!r.ok ? [el("span", { class: "muted" }, r.error)] : !r.items.length ? [el("span", { class: "muted" }, "Nothing found.")]
+      : r.items.map(n => el("div", {}, el("strong", {}, `[[${n.note}]]`), n.status === "draft" ? badge("warn", "draft") : null, el("span", { class: "muted" }, ` ${n.lines.slice(0, 2).join(" … ")}`)))))
+  }
   const pathRow = el("label", { class: "col", style: "gap:4px" }, "Vault folder", path)
   const restRows = el("div", { class: "col" }, el("label", { class: "col", style: "gap:4px" }, "REST API URL", url),
     el("label", { class: "col", style: "gap:4px" }, "API key (kept with your accounts, never shown again)", key))
@@ -3394,16 +3405,19 @@ async function wikiSetup() {
   const save = el("button", { class: "btn" }, "Save")
   save.onclick = () => busy(save, "Saving…", async () => {
     if (key.value.trim()) await api(apiUrl("/api/credentials"), { method: "POST", body: JSON.stringify({ wiki_api_key: key.value.trim() }) })
-    const r = await api(apiUrl("/api/wiki/settings"), { method: "POST", body: JSON.stringify({ enabled: on.checked, mode: mode.value, path: path.value, url: url.value, read: read.checked }) })
+    const r = await api(apiUrl("/api/wiki/settings"), { method: "POST", body: JSON.stringify({ enabled: on.checked, mode: mode.value, path: path.value, url: url.value, read: read.checked, record_tasks: rec.checked, priorities_note: prioNote.value }) })
     toast(r.ok || !r.enabled ? "Saved" : `Saved, but: ${r.error}`, r.ok || !r.enabled ? "ok" : "error")
     box.replaceWith(await wikiSetup())
   })
   box.append(el("h4", { style: "margin-top:20px" }, "LLM wiki"),
-    el("div", { class: "muted" }, "Your agent-kept Obsidian vault (like LLMWIKI). Reading: Upstream Manager gives chats and coding agents what its long-term notes (wiki/) say about each repo, citing the note. It never reads the short-term tier as fact and never writes here."),
+    el("div", { class: "muted" }, "Your agent-kept Obsidian vault (like LLMWIKI). Reading: Upstream Manager gives chats and coding agents what its long-term notes (wiki/) say about each repo, citing the note. Agents can search and read wiki/ too, and the Overseer follows your priorities note there. It never reads the short-term tier as fact, and never writes into wiki/: daily lines, day logs and finished tasks go to the short-term tier (daily note, sources, inbox) for the vault's own workflows."),
     el("div", { class: "col", style: "margin-top:8px" },
       el("label", { class: "row" }, on, "Use the LLM wiki"), el("label", { class: "col", style: "gap:4px" }, "Reach it through", mode), pathRow, restRows,
-      el("label", { class: "row" }, read, "Give chats and agents what wiki/ says about a repo"),
+      el("label", { class: "row" }, read, "Give chats and agents what wiki/ says about a repo (agents can also search and read wiki/)"),
+      el("label", { class: "row" }, rec, "Record finished tasks in the vault (a line in the daily note and a note in inbox/, with the task's thread)"),
+      el("label", { class: "col", style: "gap:4px" }, "The Overseer follows this note in wiki/ (name repos, #groups and words like urgent, high, low, pause)", prioNote),
       state, el("div", { class: "row" }, save),
+      st.ok ? el("div", { class: "row", style: "margin-top:6px" }, q) : null, found,
       el("div", { class: "small", style: `margin-top:6px;color:${st.writer ? "var(--good)" : "var(--muted)"}` }, st.writer
         ? `Writing: on. After each daily check one line goes to today's daily note, and each finished day's logs become a source for the vault's Ingest, through its MCP at ${st.writer_url}.`
         : "Writing: off. Start Upstream Manager with LLMWIKI_MCP_URL (e.g. http://192.168.20.5:27123/mcp) and LLMWIKI_API_KEY to send it each daily check and each finished day's logs (short-term tier only).")))

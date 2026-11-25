@@ -118,6 +118,8 @@ def update(task_id: str, **fields) -> dict:
             raise TaskError("status must be one of " + ", ".join(STATUSES))
         if fields["status"] != t["status"]:
             t["log"].append({"at": config.now_iso(), "text": f"status: {t['status']} → {fields['status']}"})
+            if fields["status"] == "done":
+                t["_finished"] = True
         t["status"] = fields["status"]
     if fields.get("where") is not None:
         t["where"] = fields["where"]
@@ -131,8 +133,19 @@ def update(task_id: str, **fields) -> dict:
         t["log"].append({"at": config.now_iso(), "text": str(fields["note"])[:2000]})
         t["log"] = t["log"][-100:]
     t["updated_at"] = config.now_iso()
+    if t.pop("_finished", False):
+        finished(t)
     store.save_state()
     return t
+
+
+def finished(task: dict) -> None:
+    """A task became done: hand it to the LLM wiki (in the background; the wiki is optional)."""
+    try:
+        from . import wiki
+        wiki.record_task_done(store.snapshot(task))
+    except Exception:
+        pass
 
 
 @store._locked

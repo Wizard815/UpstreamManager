@@ -397,6 +397,28 @@ embedding model or vector database is needed.
   (or set `UPSTREAM_MEMORY`, `UPSTREAM_DAILY_LOG`, `UPSTREAM_MEMORY_AUTOCLEAN`
   to `off`).
 
+### Agents, the Overseer and finished work in the wiki
+
+With `LLMWIKI_MCP_URL` and `LLMWIKI_API_KEY` in `.env`, reading switches on by itself too (over the
+vault's Local REST API next to that address). Then:
+
+- **Agents search and read the wiki**: `wiki_search` (a question works; best matches first, with
+  the lines that match) and `wiki_read`, wiki/ only, secrets removed.
+- **The Overseer follows a priorities page**: write a note `Upstream priorities` in wiki/ (or name
+  another in Settings → LLM wiki). Each line that names a repo (by id or name) or a `#group` counts;
+  its words say how much: *urgent / critical / now* (+60), *high / focus / this week* (+30), *low /
+  later* (−20), *pause / on hold / skip* (paused: the Overseer gives its tasks to nobody unless an
+  agent asks for that repo). A heading's word applies to the lines under it. Agents see the page in
+  `overseer_plan`.
+- **Finished tasks are recorded**: when a task is done, a line goes to today's daily note and a note
+  with what was asked, who did it and the task's thread goes to the inbox (short-term tier; the
+  vault's Capture and Ingest file it). Never into wiki/. Switch it off in Settings → LLM wiki.
+- **Hermes gets the wiki directly**: Studio's Upstream tab has *Give Hermes the wiki tools*, which
+  adds the vault's own MCP server to the Hermes profile (the key goes to the profile's `.env`).
+
+`tests/fake_vault.py` is a stand-in vault (MCP memory tools and the REST API on one port) for trying
+this without a real one: `python tests/fake_vault.py <folder> <port> <key>`.
+
 ### Sending your days to an LLMWIKI vault
 
 If you keep an LLMWIKI vault (an Obsidian vault behind the Local REST API

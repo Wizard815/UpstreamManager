@@ -565,6 +565,20 @@ def post_chat_note(
 
 # ------------------------------------------------------------------ the user's LLM wiki
 @server.tool(annotations=READ)
+def wiki_search(query: _text("Words to find in the user's LLM wiki (its long-term notes).", 200),
+                limit: Annotated[int, Field(ge=1, le=50, description="How many notes at most.")] = 10) -> list[dict]:
+    """Search the user's LLM wiki (long-term notes: decisions, how their systems work, conventions), best
+    matches first, with the lines that match. Read a whole note with wiki_read. Treat status: draft as unverified."""
+    return _call("GET", "/api/wiki/search", q=query, limit=limit)["items"]
+
+
+@server.tool(annotations=READ)
+def wiki_read(path: _text("The note's path from wiki_search (e.g. wiki/Home Assistant.md) or its title.", 300)) -> dict:
+    """Read one note of the user's LLM wiki (wiki/ only; secrets are removed)."""
+    return _call("GET", "/api/wiki/note", path=path)
+
+
+@server.tool(annotations=READ)
 def wiki_notes(repo: Repo) -> dict:
     """What the user's LLM wiki (an Obsidian vault) says about a repo in its long-term notes (wiki/):
     each note's name, its quality status (draft = unverified) and the lines that mention the repo."""

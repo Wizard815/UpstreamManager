@@ -75,6 +75,7 @@ def repo_scores(summaries: list[dict] | None = None) -> list[dict]:
     summaries = summaries if summaries is not None else registry.repo_summary()
     reqs = [r for r in store.snapshot(store.get_requests()) if r.get("status") == "pending"]
     open_tasks = [t for t in tasks.list_tasks() if t["status"] in ("open", "working")]
+    wiki_prio = wiki_priorities()
     out = []
     for r in summaries:
         repo = store.get_repo(r["id"]) or {}
@@ -87,6 +88,9 @@ def repo_scores(summaries: list[dict] | None = None) -> list[dict]:
         p = repo.get("priority") or "normal"
         if REPO_PRIORITY.get(p):
             add(REPO_PRIORITY[p], f"you marked it {p}")
+        wp = wiki_prio["repos"].get(r["id"])
+        if wp:
+            add(wp["weight"], f"the wiki's priorities page: {wp['word']} (\"{wp['line'][:80]}\")")
         if r.get("error"):
             add(20, f"error: {str(r['error'])[:80]}")
         for u in r.get("upstream_details") or []:
@@ -118,8 +122,21 @@ def repo_scores(summaries: list[dict] | None = None) -> list[dict]:
         if (r.get("integration") or {}).get("state") in ("planned", "partial"):
             add(5, f"integration {(r.get('integration') or {}).get('state')}")
         out.append({"id": r["id"], "name": r.get("name") or r["id"], "priority": p, "score": round(score, 1), "why": why,
-                    "groups": r.get("groups") or []})
+                    "groups": r.get("groups") or [], "paused": bool(wp and wp["word"] == "paused")})
     return sorted(out, key=lambda x: -x["score"])
+
+
+def wiki_priorities() -> dict:
+    """The user's priorities page in the LLM wiki (see wiki.priorities); empty when there is none or the wiki is off."""
+    try:
+        from . import wiki
+        return wiki.priorities()
+    except Exception:
+        return {"note": None, "path": None, "repos": {}, "lines": []}
+
+
+def paused_repos() -> set[str]:
+    return {rid for rid, p in wiki_priorities()["repos"].items() if p["word"] == "paused"}
 
 
 def task_score(t: dict, repo_score: float = 0.0) -> tuple[float, list[str]]:
@@ -319,10 +336,11 @@ def _run(reason: str) -> dict:
     if s["dispatch"] != "off" and SEND and s["max_agents"]:
         busy = [t for t in tasks.list_tasks(status="working") if (t.get("where") or {}).get("type") in ("herdr", "studio", "hermes")]
         free = int(s["max_agents"]) - len(busy)
+        paused = {r["id"] for r in scores if r.get("paused")}
         for t in top:
             if free <= 0:
                 break
-            if t["kind"] not in tasks.CODE_KINDS or board.claim_alive(t) or t.get("where"):
+            if t["kind"] not in tasks.CODE_KINDS or board.claim_alive(t) or t.get("where") or t["repo_id"] in paused:
                 continue
             r = SEND(t["id"], s["dispatch"], None, {})
             if r.get("ok"):
@@ -339,6 +357,7 @@ def _run(reason: str) -> dict:
               "working": [{"id": t["id"], "title": t["title"], "repo": t["repo_id"], "agent": (t.get("claimed_by") or {}).get("agent")
                            or (t.get("where") or {}).get("agent")} for t in tasks.list_tasks(status="working")][:30],
               "agents": board.agents(), "actions": actions,
+              "wiki_priorities": {k: v for k, v in wiki_priorities().items() if k in ("note", "path", "lines")},
               "waiting_for_you": [{"id": q["id"], "repo": q.get("repo_id"), "days": round(_days(q.get("created_at")), 1)}
                                   for q in store.snapshot(store.get_requests()) if q.get("status") == "pending"],
               "settings": {k: s[k] for k in ("enabled", "make_tasks", "dispatch", "max_agents", "every_minutes")}}
@@ -363,8 +382,10 @@ def next_task(agent: str, repo: str | None = None, group: str | None = None, kin
     members = {r["id"] for r in store.all_repos() if group in (r.get("groups") or [])} if group else None
     if not last():
         run("first ask")
+    paused = set() if repo else paused_repos()   # a repo the wiki says to pause: only when asked for by name
     pool = [t for t in tasks.list_tasks(status="open")
             if not board.claim_alive(t) and not (t.get("where") or {}).get("type") in ("herdr", "studio", "hermes")
+            and t["repo_id"] not in paused
             and (not repo or t["repo_id"] == repo) and (members is None or t["repo_id"] in members)
             and (not kinds or t["kind"] in kinds) and t["kind"] != "idea"]
     pool.sort(key=lambda t: -(t.get("rank") if t.get("rank") is not None else task_score(t)[0]))
@@ -396,6 +417,11 @@ def plan(agent: str | None = None) -> str:
         lines += [f"- {r['name']} ({r['id']}): {r['score']:.0f}" + (f" - {'; '.join(r['why'][:4])}" if r["why"] else " - fine")
                   for r in rep["repos"][:10]]
         lines.append("")
+    wp = rep.get("wiki_priorities") or {}
+    if wp.get("lines"):
+        lines.append(f"## What the user wrote in the wiki ([[{wp['note']}]])")
+        lines += [f"- {l['text']} ({l['word']}: {', '.join(l['repos'])})" for l in wp["lines"][:12]]
+        lines.append("")
     if rep.get("next"):
         lines.append("## Open tasks, most important first (next_task gives you the top one nobody has)")
         lines += [f"- {t['id']} [{t['priority']}] {t['repo']}: {t['title']}" for t in rep["next"][:10]]
@@ -426,6 +452,8 @@ HOW = """## How agents work together here
 - Finish: submit the workspace for approval, then release_task as done (open if someone else should go on,
   parked if it is blocked: say why in a comment).
 - Started by cron? next_task, do it, release it, and stop when it says there is nothing for you.
+- Look things up in the user's LLM wiki with wiki_search / wiki_read (long-term notes: decisions, how things work).
+  When you finish, your task (with its thread) is recorded there for you: write findings worth keeping as comments.
 - Never approve, push or change the user's settings (auto-approval, release wait, notifications, Overseer)."""
 
 
