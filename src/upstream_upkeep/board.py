@@ -262,3 +262,32 @@ def agents() -> list[dict]:
         out.append({"name": name, "last_seen": a.get("last_seen"), "on": claimed.get(name, []),
                     "minutes_since_seen": int((now - seen).total_seconds() // 60) if seen else None})
     return sorted(out, key=lambda a: a["last_seen"] or "", reverse=True)
+
+
+# ------------------------------------------------------------------ agents Upstream started (herdr, via Studio)
+HELD_MINUTES = 120
+
+
+def hold(task_id: str, agent: str, minutes: int = HELD_MINUTES) -> None:
+    """Mark a task as held by an agent Upstream started for it, and keep it held while that agent reports
+    in (herdr's status, Studio's reports). Quiet: no log line each time."""
+    with store.lock:
+        t = tasks.get(task_id)
+        if not t or t["status"] in ("done", "dropped"):
+            return
+        c = t.get("claimed_by") or {}
+        if claim_alive(t) and c.get("agent") not in (None, agent):
+            return   # an agent that claimed it on the board itself keeps it
+        t["claimed_by"] = {"agent": agent, "at": c.get("at") if c.get("agent") == agent else config.now_iso(),
+                           "until": _iso(_now() + dt.timedelta(minutes=minutes)), "started_by": "upstream"}
+        _seen(agent, task_id)
+        store.save_state()
+
+
+def let_go(task_id: str, agent: str) -> None:
+    with store.lock:
+        t = tasks.get(task_id)
+        if t and (t.get("claimed_by") or {}).get("agent") == agent:
+            t["claimed_by"] = None
+            _seen(agent, "")
+            store.save_state()

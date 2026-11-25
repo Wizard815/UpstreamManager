@@ -2462,7 +2462,7 @@ async function renderWork() {
   repoSel.onchange = () => { repoF = repoSel.value; draw() }
   const newBtn = el("button", { class: "btn", onclick: () => taskDialog({ repo: repoF || undefined }) }, "+ New task")
   const issuesBtn = el("button", { class: "btn ghost", title: "Make tasks of a repo's GitHub issues", onclick: () => repoF ? issuesDialog(repoF) : toast("Pick a repo first (the list above)", "info") }, "Import issues")
-  let view = picked ? "list" : store_.get("workView", "list")
+  let view = picked ? "list" : params.get("view") === "board" ? "board" : params.get("view") === "list" ? "list" : store_.get("workView", "list")
   const viewBar = el("div", { class: "tabs", role: "tablist", "aria-label": "View" })
   const grid = el("div", { class: "work-grid" }, el("div", { class: "col", style: "gap:12px;min-width:0" }, el("div", { class: "panel", style: "min-width:0" }, fbar, listBox), roster), detail)
   const boardHost = el("div")

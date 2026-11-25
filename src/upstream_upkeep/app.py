@@ -1483,7 +1483,13 @@ def api_mcp():
     """How coding agents connect: the stdio command always; the network address when UPSTREAM_MCP_PORT is set."""
     port, host = os.environ.get("UPSTREAM_MCP_PORT"), os.environ.get("UPSTREAM_MCP_HOST", "127.0.0.1")
     shown = request.host.split(":")[0] if host in ("0.0.0.0", "::") else host
-    return jsonify({"ok": True, "stdio": "upstream-mcp", "http_url": f"http://{shown}:{port}/mcp" if port else None,
+    import sys
+    app_port = os.environ.get("PORT") or (request.host.rsplit(":", 1)[1] if ":" in request.host else "5000")
+    return jsonify({"ok": True, "stdio": "upstream-mcp",
+                    # the exact command for a client on this machine (Studio adds it to Hermes with this)
+                    "stdio_command": [sys.executable, "-m", "upstream_upkeep.mcp_server"],
+                    "stdio_env": {"UPSTREAM_APP_URL": f"http://127.0.0.1:{app_port}"},
+                    "http_url": f"http://{shown}:{port}/mcp" if port else None,
                     "listens_on": f"{host}:{port}" if port else None, "token_set": bool(os.environ.get("UPSTREAM_MCP_TOKEN"))})
 
 
@@ -2329,6 +2335,7 @@ def api_task_agent_status(task_id):
     if w.get("type") != "herdr" or (d.get("pane") and w.get("agent") != d.get("pane")):
         return jsonify({"ok": True, "ignored": "the task has moved on to another agent"})
     if status == "gone":
+        board.let_go(task_id, tasks.board_name(w))
         tasks.update(task_id, where={**w, "agent": None}, note="its agent's herdr pane was closed")
     else:
         tasks.herdr_sync(t, {"status": status})

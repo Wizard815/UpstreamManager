@@ -256,6 +256,11 @@ agent started by cron calls `next_task`, does it, releases it, and repeats until
 there's nothing left. Repo priority, auto-approval, the release wait,
 notifications and the Overseer's settings stay yours.
 
+**In Hermes Studio**, the Upstream tab shows what's next and what waits for you, opens the board
+and the Overseer, and can give Hermes these tools with one click (it adds this app's MCP server to
+the Hermes profile). herdr agents started for a task (here or through Studio) show on the board as
+holding it while they work; the task prompt tells them their board name.
+
 ## Notifications
 
 Everything that needs you shows in the 🔔 at the top: a request waiting, a failed

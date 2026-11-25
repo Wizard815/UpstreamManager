@@ -212,9 +212,21 @@ def agent_instructions(task: dict, repo: dict, workdir: str, review: bool = True
                      " and say so. Upstream Manager shows your changes and that message; the user edits it and commits.")
     else:
         lines.append("Commit your work with clear messages (a subject line, a blank line, then the why).")
-    lines.append(f"If you have Upstream Manager's MCP tools (server 'upstream'), use them: repo id {repo['id']}, task {task['id']}"
+    lines.append(f"If you have Upstream Manager's MCP tools (server 'upstream' or 'upstream-manager'), use them: repo id {repo['id']}, task {task['id']}"
                  " (update_task to report progress).")
+    w = task.get("where") or {}
+    name = board_name(w) if w.get("type") == "herdr" and w.get("agent") else None
+    lines.append("This task is on Upstream Manager's board" + (f", held by you as \"{name}\"" if name else "") + ". With those tools: "
+                 + (f'use agent="{name}" in board calls; ' if name else "")
+                 + "comment_task to note findings or ask the user (to=\"user\") or another agent; read_messages for what others "
+                 "tell you; overseer_plan for what else matters; when this is done, release_task as done and next_task for more.")
     return "\n".join(lines)
+
+
+def board_name(where: dict) -> str:
+    """How a herdr agent shows on the board: herdr:<its name or pane>, plus the machine when not this one."""
+    agent = str(where.get("agent") or "?")
+    return f"herdr:{agent}" + (f"@{where['machine']}" if where.get("machine") else "")
 
 
 def suggest(task: dict, available: dict | None = None) -> dict:
@@ -346,6 +358,9 @@ def send_to(task_id: str, to: str, message: str | None = None, opts: dict | None
             sid = studio.run(message or brief(task, repo), workdir, agent_instructions(task, repo, workdir), sid, on_done=done)
             where = {"type": "studio", "studio": sid, "url": studio.link(sid), "workspace": ws and ws["name"], "workdir": workdir}
         update(task_id, status="working", where=where, note=f"handed to {'herdr' if to == 'herdr' else 'Hermes Studio'}")
+        if to == "herdr" and where.get("agent"):
+            from . import board   # on the board it shows as held by that agent; its status reports keep it held
+            board.hold(task_id, board_name(where))
         return {"where": where}
     if to == "wiki":
         res = wiki.park(task["title"], brief(task, repo) + f"\n\n(Parked from Upstream Manager, task {task['id']}.)")
@@ -386,6 +401,12 @@ def herdr_sync(task: dict, info: dict) -> dict:
             note = note or "the agent finished: review its changes"
             notify.notify("task_done", f"Done: {task['title'][:80]}", "the agent finished: review its changes",
                           level="info", path=f"/work?task={task['id']}", repo=task["repo_id"])
+    if where.get("agent"):
+        from . import board
+        if status in ("working", "blocked"):
+            board.hold(task["id"], board_name(where))
+        elif status in ("done", "idle", "gone") and last in ("working", "blocked"):
+            board.let_go(task["id"], board_name(where))   # finished (for review) or gone: nobody holds it now
     if info.get("session") and info.get("session") != where.get("session"):
         where["session"], where["session_agent"], changed = info["session"], info.get("session_agent"), True
     if changed:

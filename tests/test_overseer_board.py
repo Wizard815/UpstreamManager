@@ -188,3 +188,24 @@ def test_a_new_request_rings_unless_a_rule_takes_it(client, repo):
     client.post("/api/repo/mine/fetch", json={})
     client.post("/api/repo/mine/upstream/origin/request-pull", json={"target": "origin/main"})
     assert any(n["event"] == "request" and n["repo"] == "mine" for n in notify.feed()["items"])
+
+
+def test_an_agent_upstream_starts_holds_its_task_on_the_board(client, repo, monkeypatch):
+    """herdr agents started for a task (by Upstream, or through Studio) show as holding it; their status keeps it."""
+    t = _task(client, "Work for herdr")
+    with store.lock:
+        tasks.get(t["id"])["status"] = "working"
+        tasks.get(t["id"])["where"] = {"type": "herdr", "via": "studio", "agent": "w1:p2", "machine": ""}
+    board.hold(t["id"], tasks.board_name(tasks.get(t["id"])["where"]))
+    assert tasks.get(t["id"])["claimed_by"]["agent"] == "herdr:w1:p2"
+    assert "held by you as \"herdr:w1:p2\"" in tasks.agent_instructions(tasks.get(t["id"]), store.get_repo("mine"), "/x")
+    # an agent elsewhere can't take it meanwhile
+    assert not client.post(f"/api/tasks/{t['id']}/claim", json={"agent": "codex-1"}, headers=AGENT).get_json()["ok"]
+    # Studio's report keeps it held; the pane closing lets it go
+    monkeypatch.setattr("upstream_upkeep.app._via_trusted_proxy", lambda: True)
+    client.post(f"/api/tasks/{t['id']}/agent-status", json={"status": "working", "pane": "w1:p2"})
+    assert board.claim_alive(tasks.get(t["id"]))
+    client.post(f"/api/tasks/{t['id']}/agent-status", json={"status": "gone", "pane": "w1:p2"})
+    assert tasks.get(t["id"])["claimed_by"] is None
+    m = client.get("/api/mcp").get_json()
+    assert m["stdio_command"][1:] == ["-m", "upstream_upkeep.mcp_server"] and m["stdio_env"]["UPSTREAM_APP_URL"].startswith("http://127.0.0.1:")
