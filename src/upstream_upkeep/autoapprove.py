@@ -90,7 +90,18 @@ def _prepare(repo: dict, req: dict, kind: str, where: Path) -> str | None:
             if m.returncode != 0:
                 return f"{u.get('name')} does not merge cleanly into {focus} any more"
     if (where / ".gitmodules").is_file():
-        init = _git(where, "submodule", "update", "--init", "--recursive", timeout=1800)
+        if kind == "workspaces" and req.get("workspace"):
+            # a submodule commit the agent made exists only in its workspace: fetch that one from there
+            from . import workspaces
+            try:
+                ws = workspaces.path_of(repo, req["workspace"])
+            except workspaces.WorkspaceError:
+                return "its workspace is gone"
+            _git(where, "submodule", "init")
+            for ch in req.get("submodule_changes") or []:
+                if ch.get("local") and (ws / ch["path"] / ".git").exists():
+                    _git(where, "config", f"submodule.{ch['name']}.url", str(ws / ch["path"]))
+        init = _git(where, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive", timeout=1800)
         if init.returncode != 0:
             return "could not check out the submodules: " + (init.stderr or init.stdout).strip()[-300:]
     if kind == "components":

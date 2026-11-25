@@ -205,6 +205,9 @@ def agent_instructions(task: dict, repo: dict, workdir: str, review: bool = True
         f"Work only in this folder: {workdir}" + (" (the task's own branch)." if workdir != repo["path"] else "."),
         f"The repo is {repo.get('name') or repo['id']}; the result goes into its branch {focus} once the user approves.",
         "Never push, force-push or rewrite history, and never switch the folder to another branch.",
+        "Stay inside that folder: never change another repo, an upstream, the user's own checkout, or git config outside it.",
+        "Code inside a git submodule: commit it inside the submodule (in this folder), then commit the new pin in the repo;"
+        " Upstream Manager brings that submodule commit into the user's checkout when they approve. Don't publish it anywhere.",
     ]
     if review:
         lines.append(f"Do not commit. The user reviews every commit message first: when a change is ready, write the commit message"

@@ -32,7 +32,11 @@ then open_merge_workspace. It gives a separate checkout (path) on its own branch
 started; resolve the conflicts there with your own file and shell tools, run the project's tests,
 `git add` and `git commit`. Check workspace_status, then submit_merge_workspace with a short summary.
 That raises an approval request; the user decides. Never edit the repo's main working tree to merge,
-never push, and keep the user's own commits.
+never push, and keep the user's own commits. Stay inside the workspace: never change another repo, an
+upstream, the user's checkout or any git config outside it. To change code in a git submodule, commit
+inside the submodule within the workspace, then commit the new pin in the repo: on approval Upstream
+Manager brings that submodule commit into the user's checkout (an auto-approval check fetches it from
+the workspace too). Never publish it somewhere to make that work.
 
 To merge several branches together (e.g. three feature branches into main): list_branches, then
 open_branch_set with all of them. They merge in order in one workspace; a clean merge is committed and
@@ -402,10 +406,12 @@ def open_branch_set(
 
 
 @server.tool(annotations=WRITE)
-def open_change_workspace(repo: Repo, title: _text("Short title of the change; it names the workspace branch.", 200)) -> dict:
+def open_change_workspace(repo: Repo, title: _text("Short title of the change; it names the workspace branch.", 200),
+                          task: Annotated[str, Field(description="The board task this work is for (from next_task); links them, "
+                                                                 "so the Overseer can tell when it is ready but not submitted.")] = "") -> dict:
     """A separate checkout on its own branch to make a change of your own (e.g. bump an image tag with
     its submodule pin), commit it, test it with stack_up(workspace=name), then submit it for approval."""
-    return _call("POST", _r(repo) + "/workspaces", {"change": title})["workspace"]
+    return _call("POST", _r(repo) + "/workspaces", {"change": title, **({"task": task} if task else {})})["workspace"]
 
 
 @server.tool(annotations=WRITE)

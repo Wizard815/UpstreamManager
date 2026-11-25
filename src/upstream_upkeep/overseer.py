@@ -30,7 +30,7 @@ PRIORITY_WEIGHT = {"urgent": 1000, "high": 300, "normal": 100, "low": 20}
 KIND_WEIGHT = {"bug": 40, "merge": 30, "fix": 20, "feature": 10, "chore": 5, "idea": -20}
 REPO_PRIORITY = {"critical": 60, "high": 30, "normal": 0, "low": -20}
 DEFAULTS = {"enabled": True, "make_tasks": True, "dispatch": "off", "max_agents": 2, "stale_request_days": 2,
-            "urgent_unclaimed_minutes": 30}
+            "urgent_unclaimed_minutes": 30, "ready_unsubmitted_minutes": 15}
 _lock = threading.Lock()
 SEND = None   # set by app.py: _send_task(task_id, to, message, opts) -> {ok, ...}
 
@@ -240,6 +240,36 @@ def _run(reason: str) -> dict:
                           level="info", path=f"/work?task={t['id']}", key=f"lapsed:{t['id']}:{c.get('until')}", repo=t["repo_id"])
             actions.append(f"took back {t['id']} from {c['agent']}")
 
+    # work that is done but never handed in: a task's workspace is ready, nothing was submitted, and its
+    # agent has been quiet a while (some models stop right after saying what they'll do next)
+    pending_ws = {q.get("workspace") for q in store.snapshot(store.get_requests()) if q.get("status") == "pending"}
+    for repo in store.snapshot(store.all_repos()):
+        from . import workspaces
+        try:
+            open_ws = workspaces.list_workspaces(repo)
+        except Exception:
+            continue
+        for w in open_ws:
+            tid = w.get("task")
+            t = tasks.get(tid) if tid else None
+            if not t or not w.get("ready") or w["name"] in pending_ws or t["status"] != "working":
+                continue
+            quiet = _days(t.get("updated_at")) * 1440
+            if quiet < s.get("ready_unsubmitted_minutes", 15):
+                continue
+            agent = (t.get("claimed_by") or {}).get("agent")
+            if agent and not str(agent).startswith("herdr:"):
+                try:
+                    board.post("overseer", agent, f"Your workspace {w['name']} for task {t['id']} ({t['title'][:80]}) is ready but "
+                               "not submitted: call submit_merge_workspace with a summary, then release_task as done.", t["id"])
+                except board.BoardError:
+                    pass
+            notify.notify("stuck", f"Ready but not submitted: {t['title'][:80]}",
+                          f"workspace {w['name']} in {repo['id']} is ready; {agent or 'its agent'} went quiet. Submit it from the repo's "
+                          "Merges tab, or nudge the agent.", level="info", path=f"/repo/{repo['id']}",
+                          key=f"unsubmitted:{w['name']}:{w.get('head')}", repo=repo["id"])
+            actions.append(f"nudged {agent or 'nobody'}: workspace {w['name']} ready but not submitted")
+
     # what needs the user
     for q in store.snapshot(store.get_requests()):
         if q.get("status") == "pending" and _days(q.get("created_at")) >= s["stale_request_days"]:
@@ -317,7 +347,8 @@ def next_task(agent: str, repo: str | None = None, group: str | None = None, kin
 def _brief(t: dict) -> str:
     repo = store.get_repo(t["repo_id"])
     return (tasks.brief(t, repo) + "\n\n" + "Why now: " + "; ".join(t.get("why") or []) +
-            "\n\nYou have claimed it. Check in (heartbeat_task, a comment or update_task) at least every "
+            f"\n\nPass task=\"{t['id']}\" to open_change_workspace so the workspace is linked to it. "
+            "You have claimed it. Check in (heartbeat_task, a comment or update_task) at least every "
             f"{board.LEASE_MINUTES // 2} minutes or it goes back on the board. Work in a change or merge workspace, run the "
             "tests, submit it for approval, then release_task as done. Stuck? comment_task (to the user or another agent) "
             "and release it as parked.")

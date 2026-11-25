@@ -272,3 +272,41 @@ def test_release_wait_takes_only_old_enough_commits(client, repos):
     client.post("/api/repo/mine/release-wait", json={"days": 0})
     u = client.get("/api/repo/mine/compare").get_json()["plan"]["upstreams"][0]
     assert u["behind"] == 1 and "waiting" not in u
+
+
+# ------------------------------------------------------------ an agent changes code inside a submodule
+def test_a_submodule_commit_made_in_a_workspace_reaches_the_users_checkout(client, tmp_path, monkeypatch):
+    import subprocess
+    for k, v in {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow", "GIT_CONFIG_VALUE_0": "always"}.items():
+        monkeypatch.setenv(k, v)   # the test's submodule upstream is a local path
+    g = lambda cwd, *a: subprocess.run(["git", "-c", "user.email=t@t.t", "-c", "user.name=T", *a], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+    api = tmp_path / "up-api"; api.mkdir(); g(api, "init", "-q", "-b", "main")
+    (api / "server.js").write_text("ok for every path\n"); g(api, "add", "-A"); g(api, "commit", "-qm", "api")
+    hub_up = tmp_path / "up-hub"; hub_up.mkdir(); g(hub_up, "init", "-q", "-b", "main")
+    g(hub_up, "submodule", "add", "-q", str(api), "api"); g(hub_up, "commit", "-qm", "hub")
+    hub = tmp_path / "hub"; g(tmp_path, "clone", "-q", "--recurse-submodules", str(hub_up), str(hub))
+    registry.add_repo(str(hub), None, "hub")
+    # the agent, in a change workspace: commits inside the submodule, then the new pin
+    ws = client.post("/api/repo/hub/workspaces", json={"change": "404 for unknown paths"}).get_json()["workspace"]
+    p = Path(ws["path"])
+    g(p, "submodule", "update", "--init")
+    (p / "api" / "server.js").write_text("404 for unknown paths\n")
+    g(p / "api", "commit", "-qam", "api: 404 for unknown paths")
+    new_sha = g(p / "api", "rev-parse", "HEAD")
+    g(p, "commit", "-qam", "bump api")
+    st = client.get(f"/api/repo/hub/workspaces/{ws['name']}").get_json()
+    st = st.get("workspace", st)
+    assert st["submodule_changes"] == [{"path": "api", "name": "api", "sha": new_sha, "local": True}]
+    # the auto-approval check fetches that commit from the workspace, and approval brings it over
+    client.post("/api/repo/hub/auto-approve", json={"workspaces": True, "check": "grep -q 404 api/server.js"})
+    req = client.post(f"/api/repo/hub/workspaces/{ws['name']}/submit", json={"summary": "404"}).get_json()["request"]
+    assert "carries a new commit" in req["upstreams"][0]["reason"]
+    autoapprove.wait()
+    done = store.get_request(req["id"])
+    assert done["status"] == "approved", (done.get("auto"), done.get("result"))
+    assert (hub / "api" / "server.js").read_text() == "404 for unknown paths\n"
+    assert g(hub / "api", "rev-parse", "HEAD") == new_sha
+    assert g(hub / "api", "rev-parse", f"refs/upkeep/local/{new_sha}") == new_sha   # kept until you push it
+    # the submodule's upstream was not touched
+    assert subprocess.run(["git", "cat-file", "-e", new_sha], cwd=api).returncode != 0
+    assert any("on this machine only" in o["detail"] for o in done["result"])

@@ -209,3 +209,25 @@ def test_an_agent_upstream_starts_holds_its_task_on_the_board(client, repo, monk
     assert tasks.get(t["id"])["claimed_by"] is None
     m = client.get("/api/mcp").get_json()
     assert m["stdio_command"][1:] == ["-m", "upstream_upkeep.mcp_server"] and m["stdio_env"]["UPSTREAM_APP_URL"].startswith("http://127.0.0.1:")
+
+
+def test_a_ready_workspace_nobody_submitted_gets_a_nudge(client, repo):
+    """Some models stop right after saying what they'll do next: the Overseer notices the finished, unsubmitted work."""
+    t = _task(client, "Small fix")
+    client.post(f"/api/tasks/{t['id']}/claim", json={"agent": "hermes-1"}, headers=AGENT)
+    ws = client.post("/api/repo/mine/workspaces", json={"change": "small fix", "task": t["id"]}, headers=AGENT).get_json()["workspace"]
+    assert ws["task"] == t["id"]
+    commit_file(ws["path"], "fix.txt", "fixed\n", "the fix")
+    overseer.run("fresh")      # not quiet long enough yet
+    assert not client.get("/api/messages?agent=hermes-1", headers=AGENT).get_json()["items"]
+    with store.lock:
+        tasks.get(t["id"])["updated_at"] = "2000-01-01T00:00:00+00:00"
+    rep = overseer.run("later")
+    assert any("ready but not submitted" in a for a in rep["actions"])
+    msgs = client.get("/api/messages?agent=hermes-1", headers=AGENT).get_json()["items"]
+    assert msgs and "submit_merge_workspace" in msgs[0]["text"] and msgs[0]["from"] == "overseer"
+    assert any(n["event"] == "stuck" and "Ready but not submitted" in n["title"] for n in notify.feed()["items"])
+    # once submitted, no more nudges
+    client.post(f"/api/repo/mine/workspaces/{ws['name']}/submit", json={"summary": "x"})
+    rep = overseer.run("submitted")
+    assert not any("ready but not submitted" in a for a in rep["actions"])

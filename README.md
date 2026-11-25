@@ -261,6 +261,16 @@ and the Overseer, and can give Hermes these tools with one click (it adds this a
 the Hermes profile). herdr agents started for a task (here or through Studio) show on the board as
 holding it while they work; the task prompt tells them their board name.
 
+**Changes inside a submodule.** An agent that fixes code in a hub's submodule commits inside
+the submodule in its workspace, then commits the new pin. That submodule commit exists only in the
+workspace; Upstream fetches it from there for the auto-approval check, and on approval brings it into
+your submodule checkout (kept under `refs/upkeep/local/` until you push it). The request says so.
+Agents are told never to touch other repos, upstreams or git config outside their workspace.
+
+**Finished but not handed in.** An agent that links its workspace to its task
+(`open_change_workspace(..., task=…)`) and then goes quiet with the work ready but not submitted
+gets a message from the Overseer after 15 minutes, and you get a notification.
+
 ## Notifications
 
 Everything that needs you shows in the 🔔 at the top: a request waiting, a failed

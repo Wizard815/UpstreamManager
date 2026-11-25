@@ -852,6 +852,10 @@ def api_open_workspace(repo_id):
         with _run_lock:
             ws = workspaces.open_workspace(repo, data.get("upstream") or None, branches,
                                            (str(data.get("change") or "").strip()[:120] or None))
+            task_id = str(data.get("task") or "").strip()
+            if task_id and (t := tasks.get(task_id)) and t["repo_id"] == repo["id"]:
+                workspaces.link_task(repo, ws["name"], task_id)   # the Overseer watches it for that task
+                ws["task"] = task_id
     except workspaces.WorkspaceError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     return jsonify({"ok": True, "workspace": ws})
@@ -899,6 +903,8 @@ def api_submit_workspace(repo_id, name):
     rec = store.record_request({
         "id": f"{repo['id']}:{focus}:{name}", "repo_id": repo["id"], "repo_name": repo["name"], "focus_branch": focus,
         "workspace": name, "summary": summary or None, "sources": ws["sources"],
+        "base": gitops.short_sha(repo["path"], f"refs/heads/{focus}"),
+        "submodule_changes": ws.get("submodule_changes") or [],
         "conflicts": [], "safe": True, "status": "pending", "created_at": config.now_iso(),
         "comment": None, "decided_at": None,
         "upstreams": [{"name": "workspace", "url": ws["path"], "branch": ws["branch"], "target": ws["head"],
@@ -906,7 +912,10 @@ def api_submit_workspace(repo_id, name):
                        "conflict": False, "conflict_files": [],
                        "reason": (f"change: {ws['change']}" if ws.get("change") and not ws["sources"] else
                                   f"merges {', '.join(s['label'] for s in ws['sources']) or 'the workspace'}")
-                                 + f" (in workspace {name})" + (f": {summary}" if summary else "")}],
+                                 + f" (in workspace {name})"
+                                 + "".join(f"; carries a new commit {c['sha'][:10]} in submodule {c['path']}, made in the workspace"
+                                           for c in ws.get("submodule_changes") or [] if c["local"])
+                                 + (f": {summary}" if summary else "")}],
     })
     return jsonify({"ok": True, "request": store.snapshot(rec)})
 
@@ -1712,6 +1721,12 @@ def decide(req: dict, decision: str, comment: str | None = None) -> tuple[dict, 
                            allow_merge_commit=True)}
                        for u in req.get("upstreams", [])]
         failed = not all(o["ok"] for o in outcome)
+        if req.get("workspace") and not failed and req.get("submodule_changes"):
+            try:
+                outcome += workspaces.carry_submodule_commits(repo, req["workspace"], req.get("base") or req["focus_branch"])
+            except workspaces.WorkspaceError as e:
+                outcome.append({"upstream": "submodules", "ok": False, "detail": str(e)})
+            failed = not all(o["ok"] for o in outcome)
         if req.get("workspace") and not failed:  # its branch is in the focus branch now
             try:
                 workspaces.remove(repo, req["workspace"])

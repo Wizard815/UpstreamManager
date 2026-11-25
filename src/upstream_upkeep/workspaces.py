@@ -353,8 +353,77 @@ def status(repo: dict, name: str) -> dict:
             "change": meta.get("change"),
             "sources": sources, "unresolved": unresolved, "conflict_markers": markers, "uncommitted": dirty[:50],
             "commits_beyond_focus": behind, "focus_commits_missing": ahead, "ready": ready, "next_step": step,
-            "head": gitops.short_sha(str(ws), "HEAD"), "reused_resolutions": meta.get("reused") or [],
+            "head": gitops.short_sha(str(ws), "HEAD"), "reused_resolutions": meta.get("reused") or [], "task": meta.get("task"),
+            "submodule_changes": submodule_changes(ws, base) if (ws / ".gitmodules").is_file() else [],
             "merge_helpers": {"rerere": True, "mergiraf": bool(mergiraf_path())}}
+
+
+def _submodule_names(root: Path) -> dict[str, str]:
+    """path -> name, from .gitmodules."""
+    out = _git(root, "config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$").stdout
+    names = {}
+    for line in out.splitlines():
+        key, _, path = line.partition(" ")
+        names[path.strip()] = key[len("submodule."):-len(".path")]
+    return names
+
+
+def submodule_changes(ws: Path, base: str) -> list[dict]:
+    """Submodules whose pin this workspace moves: [{path, name, sha, local}]. `local` means the new
+    commit is not on any branch or tag the submodule has from its upstream: it was made here (an agent
+    changed code inside the submodule), so it has to be carried into the user's checkout on approval."""
+    out = []
+    names = _submodule_names(ws) if (ws / ".gitmodules").is_file() else {}
+    for line in _git(ws, "diff", "--raw", "--no-abbrev", base, "HEAD").stdout.splitlines():
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if len(parts) < 4 or parts[1] != "160000":
+            continue
+        sha = parts[3]
+        sub = ws / path
+        known = bool(_git(sub, "branch", "-r", "--contains", sha).stdout.strip()
+                     or _git(sub, "tag", "--contains", sha).stdout.strip()) if (sub / ".git").exists() else False
+        out.append({"path": path, "name": names.get(path, path), "sha": sha, "local": not known})
+    return out
+
+
+def carry_submodule_commits(repo: dict, name: str, base: str) -> list[dict]:
+    """After a workspace was merged: bring the submodule commits it made into the user's own submodule
+    checkouts (fetched from the workspace, kept under refs/upkeep/local/), and check the new pins out.
+    Nothing is pushed: the commit lives on this machine until the user pushes it from the submodule."""
+    ws = path_of(repo, name)
+    main = Path(repo["path"])
+    results = []
+    for ch in submodule_changes(ws, base):
+        sub_ws, sub_main = ws / ch["path"], main / ch["path"]
+        if ch["local"]:
+            if not (sub_main / ".git").exists():
+                _git(main, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--", ch["path"])
+            got = _git(sub_main, "fetch", "-q", str(sub_ws), "HEAD", "+refs/heads/*:refs/upkeep/from-workspace/*")
+            if _git(sub_main, "cat-file", "-e", f"{ch['sha']}^{{commit}}").returncode != 0:
+                results.append({"upstream": f"submodule {ch['path']}", "ok": False,
+                                "detail": f"could not bring its commit {ch['sha'][:10]} over: {(got.stderr or got.stdout).strip()[-200:]}"})
+                continue
+            _git(sub_main, "update-ref", f"refs/upkeep/local/{ch['sha']}", ch["sha"])
+        moved = _git(main, "submodule", "update", "--", ch["path"])
+        results.append({"upstream": f"submodule {ch['path']}", "ok": moved.returncode == 0,
+                        "detail": (f"checked out {ch['sha'][:10]}" + (" (made in the workspace, on this machine only: push it from the submodule when you want it upstream)" if ch["local"] else ""))
+                                  if moved.returncode == 0 else f"the pin is {ch['sha'][:10]}, but checking it out failed: {(moved.stderr or moved.stdout).strip()[-200:]}"})
+    return results
+
+
+def link_task(repo: dict, name: str, task_id: str) -> None:
+    ws = path_of(repo, name)
+    meta = _load(ws)
+    meta["task"] = task_id
+    _save(ws, meta)
+
+
+def linked_task(repo: dict, name: str) -> str | None:
+    try:
+        return _load(path_of(repo, name)).get("task")
+    except (WorkspaceError, OSError, ValueError):
+        return None
 
 
 def _belongs(repo: dict, ws: Path) -> bool:
