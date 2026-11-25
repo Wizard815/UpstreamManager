@@ -15,9 +15,13 @@ has not moved). Nothing is pushed.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 from . import config, gitops
@@ -29,6 +33,68 @@ MAX_SOURCES = 12
 
 class WorkspaceError(ValueError):
     pass
+
+
+# ------------------------------------------------------------------ merge helpers
+# Two things make a workspace merge conflict less, only here (the user's own repo config is not changed):
+#  - git's rerere ("reuse recorded resolution"): a conflict resolved once in a workspace is resolved the
+#    same way the next time it comes up, as it does again and again when syncing a fork;
+#  - Mergiraf (https://mergiraf.org), when installed: merges by syntax tree, so two sides adding separate
+#    functions, imports or keys no longer conflict. UPSTREAM_MERGIRAF names the program (or "off").
+def mergiraf_path() -> str | None:
+    want = (os.environ.get("UPSTREAM_MERGIRAF") or "").strip()
+    if want.lower() in ("off", "0", "false", "no"):
+        return None
+    if want:
+        return want if os.access(want, os.X_OK) else shutil.which(want)
+    return shutil.which("mergiraf")
+
+
+_MERGIRAF_FALLBACK = ["*.py", "*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.java", "*.kt", "*.rs", "*.go", "*.c",
+                      "*.h", "*.cc", "*.cpp", "*.hpp", "*.cs", "*.rb", "*.php", "*.scala", "*.lua", "*.nix", "*.json",
+                      "*.yaml", "*.yml", "*.toml", "*.html", "*.xml", "*.css", "*.dart", "*.ex", "*.exs", "*.hs", "*.sh",
+                      "go.mod", "go.sum", "pyproject.toml", "Cargo.toml"]
+
+
+@functools.lru_cache(maxsize=4)
+def _mergiraf_attributes(program: str) -> str:
+    """The .gitattributes lines that send the files Mergiraf understands to it (it says which)."""
+    try:
+        out = subprocess.run([program, "languages", "--gitattributes"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    lines = [l.strip() for l in out.splitlines() if "merge=mergiraf" in l]
+    return "\n".join(lines or [f"{p} merge=mergiraf" for p in _MERGIRAF_FALLBACK]) + "\n"
+
+
+def merge_helpers() -> dict:
+    return {"rerere": True, "mergiraf": mergiraf_path()}
+
+
+def _merge_config() -> list[str]:
+    """`-c` options for a merge in a workspace."""
+    args = ["-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=true"]
+    program = mergiraf_path()
+    if program:
+        attrs = config.CONFIG_PATH.parent / "mergiraf.gitattributes"
+        text = _mergiraf_attributes(program)
+        own = (subprocess.run(["git", "config", "--global", "core.attributesFile"], capture_output=True, text=True).stdout or "").strip()
+        if own and Path(os.path.expanduser(own)).is_file():   # keep the user's own global attributes too
+            text = Path(os.path.expanduser(own)).read_text(errors="replace") + "\n" + text
+        if not attrs.is_file() or attrs.read_text() != text:
+            attrs.parent.mkdir(parents=True, exist_ok=True)
+            attrs.write_text(text)
+        args += ["-c", f"core.attributesFile={attrs}", "-c", "merge.mergiraf.name=mergiraf",
+                 "-c", f"merge.mergiraf.driver={program} merge --git %O %A %B -s %S -x %X -y %Y -p %P -l %L"]
+    return args
+
+
+def _record_resolutions(ws: Path) -> None:
+    """Teach rerere how the last conflicts were resolved. A merge committed with our `-c` options records
+    it itself; one committed by hand (an agent's own `git commit`) leaves MERGE_RR behind, read here."""
+    gitdir = Path(_git(ws, "rev-parse", "--absolute-git-dir").stdout.strip() or ws / ".git")
+    if (gitdir / "MERGE_RR").is_file() and not _merging(ws):
+        _git(ws, "-c", "rerere.enabled=true", "rerere")
 
 
 def _root(repo: dict) -> Path:
@@ -143,13 +209,21 @@ def _advance(ws: Path, meta: dict, focus: str) -> None:
             src["state"] = "merged"  # already in (an earlier source contained it)
             continue
         msg = f"Merge {src['label']} ({src['sha'][:10]}) into {focus}"
-        res = _git(ws, *_identity(ws), "merge", "--no-ff", "-m", msg, "--end-of-options", src["sha"])
+        res = _git(ws, *_identity(ws), *_merge_config(), "merge", "--no-ff", "-m", msg, "--end-of-options", src["sha"])
         if res.returncode == 0:
             src["state"] = "merged"
             continue
         if _unresolved(ws):
             src["state"] = "conflict"
             return
+        reused = re.findall(r"(?:Resolved|Staged) '([^']+)' using previous resolution", (res.stdout or "") + (res.stderr or ""))
+        if reused and _merging(ws) and not _markers(ws, "HEAD", reused):
+            # rerere resolved every conflict as it was resolved before: commit it and go on
+            done = _git(ws, *_identity(ws), "-c", "rerere.enabled=true", "commit", "--no-edit")
+            if done.returncode == 0:
+                src["state"] = "merged"
+                meta.setdefault("reused", []).extend(f"{src['label']}: {f}" for f in reused)
+                continue
         _git(ws, "merge", "--abort")
         src["state"] = "failed"
         src["error"] = (res.stderr or res.stdout).strip()[-400:]
@@ -215,7 +289,7 @@ def continue_workspace(repo: dict, name: str) -> dict:
             raise WorkspaceError("conflict markers are still in: " + ", ".join(left[:10]))
         if unmerged:
             _git(ws, "add", "--", *unmerged)
-        res = _git(ws, *_identity(ws), "commit", "--no-edit")
+        res = _git(ws, *_identity(ws), "-c", "rerere.enabled=true", "commit", "--no-edit")
         if res.returncode != 0:
             raise WorkspaceError((res.stderr or res.stdout).strip()[-400:] or "could not commit the merge")
         for s in meta["sources"]:
@@ -235,6 +309,7 @@ def status(repo: dict, name: str) -> dict:
     if not ws.exists():
         raise WorkspaceError(f"no workspace {name}")
     meta = _load(ws)
+    _record_resolutions(ws)
     focus = meta.get("focus_branch") or repo.get("focus_branch") or "main"
     branch = (_git(ws, "rev-parse", "--abbrev-ref", "HEAD").stdout or "").strip()
     merging = _merging(ws)
@@ -278,7 +353,8 @@ def status(repo: dict, name: str) -> dict:
             "change": meta.get("change"),
             "sources": sources, "unresolved": unresolved, "conflict_markers": markers, "uncommitted": dirty[:50],
             "commits_beyond_focus": behind, "focus_commits_missing": ahead, "ready": ready, "next_step": step,
-            "head": gitops.short_sha(str(ws), "HEAD")}
+            "head": gitops.short_sha(str(ws), "HEAD"), "reused_resolutions": meta.get("reused") or [],
+            "merge_helpers": {"rerere": True, "mergiraf": bool(mergiraf_path())}}
 
 
 def _belongs(repo: dict, ws: Path) -> bool:

@@ -185,7 +185,57 @@ The agent gets:
 - `fetch_upstreams`, `add_note` and `request_clean_pull`.
 
 It has no tool that approves, merges into your branch or pushes: those stay
-with you on the Requests page.
+with you on the Requests page (or with the auto-approval rules you set).
+
+Also: `list_groups`, `set_repo_groups` and `fetch_group` (repo groups),
+`list_issues` and `import_issues` (GitHub issues as Work tasks).
+
+### Agents on other machines (MCP over HTTP)
+
+The same tools are served over MCP's streamable HTTP when you set, in `.env`:
+
+```sh
+UPSTREAM_MCP_PORT=5002
+UPSTREAM_MCP_HOST=0.0.0.0          # 127.0.0.1 (default) keeps it on this machine
+UPSTREAM_MCP_TOKEN=<a long random string>   # required beyond this machine
+```
+
+The app then serves `http://<host>:5002/mcp`; every request must send
+`Authorization: Bearer <token>`. For example, from Claude Code on another machine:
+`claude mcp add --transport http upstream http://<host>:5002/mcp --header "Authorization: Bearer <token>"`.
+`upstream-mcp --http 0.0.0.0:5002` runs it on its own. The Integrations page shows the address.
+
+## Fewer conflicts, and requests that approve themselves
+
+**Merge workspaces resolve less by hand.** Git's *rerere* is on in every
+workspace (only there; your repo's own config is not changed): a conflict
+resolved once is resolved the same way the next time it comes up, which it
+does again and again when you keep a fork in sync. The workspace says which
+files were "resolved as before". If [Mergiraf](https://mergiraf.org) is
+installed, workspaces also merge with it: it merges by syntax tree, so two
+sides adding separate functions, imports or keys no longer conflict.
+`UPSTREAM_MERGIRAF` names the program (or `off`).
+
+**Auto-approval** (repo page → Merges → "Goes in by itself"; yours only, agents
+can't change it). Pick which requests may go in without asking: clean upstream
+pulls, submodule pin bumps, and workspaces an agent submitted (those need a
+check). Give a check command, e.g. `npm ci && npm test` or
+`cd ui && npm ci && npm run build && npm test`. When such a request is raised,
+its exact result is rebuilt in a throwaway checkout (submodules included), the
+command runs there, and the request is approved only if it passes; otherwise it
+waits for you, with the output on it. Pushes never approve themselves.
+
+## Groups and GitHub issues
+
+**Groups**: repo page → ⋯ → Groups… (e.g. `glance`, `studio`). The Repos page
+then shows a chip per group: pick one and the list, "Fetch" and the daily
+check cover only that group.
+
+**GitHub issues as tasks**: Work → Import issues (or repo page → ⋯). Pick the
+remote (origin, or an upstream on github.com) and tick issues; each becomes a
+task with the issue's text and a link back, its kind taken from labels (bug,
+enhancement...). An issue is never imported twice. Public repos work without a
+token; nothing is written to GitHub.
 
 ## Connections: herdr, Hermes Studio, Hermes, Pondering Orb, the wiki
 

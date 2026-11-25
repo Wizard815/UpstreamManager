@@ -147,14 +147,35 @@ def get_requests() -> list[dict]:
     return requests_store()
 
 
-@_locked
+# Called with each newly raised request (the auto-approval rules listen here).
+REQUEST_HOOKS: list = []
+
+
 def record_request(rec: dict) -> dict:
     """Add a request, replacing an earlier one with the same id (one per repo + branch)."""
-    reqs = requests_store()
-    reqs[:] = [r for r in reqs if r.get("id") != rec["id"]]
-    reqs.append(rec)
-    save_state()
+    with lock:
+        reqs = requests_store()
+        reqs[:] = [r for r in reqs if r.get("id") != rec["id"]]
+        reqs.append(rec)
+        save_state()
+    if rec.get("status") == "pending":
+        for hook in REQUEST_HOOKS:
+            try:
+                hook(rec)
+            except Exception:
+                pass
     return rec
+
+
+@_locked
+def annotate_request(req_id: str, **fields) -> dict | None:
+    """Set extra fields on a request (e.g. what the auto-approval rules did with it)."""
+    for r in requests_store():
+        if r.get("id") == req_id:
+            r.update(fields)
+            save_state()
+            return r
+    return None
 
 
 def get_request(req_id: str) -> dict | None:

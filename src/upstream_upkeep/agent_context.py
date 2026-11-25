@@ -64,8 +64,11 @@ def briefing(repo: dict) -> str:
             what = r.get("type") or "merge"
             ups = "; ".join(f"{u['name']}/{u.get('branch')}: {u.get('behind')} commit(s), {u.get('reason', '')}"
                             for u in r.get("upstreams") or [])
-            lines.append(f"- {r['id']} ({what}) {ups}")
+            auto = r.get("auto") or {}
+            lines.append(f"- {r['id']} ({what}) {ups}" + (f" [auto-approval check: {auto['state']}]" if auto.get("state") else ""))
         lines.append("")
+    from . import autoapprove
+    lines += [autoapprove.describe(repo), ""]
     ws = workspaces.list_workspaces(repo)
     if ws:
         lines.append("## Merge workspaces")

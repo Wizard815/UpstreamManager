@@ -35,7 +35,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, render_template_string, abort, send_file
 
-from . import (actions, agent_context, components, config, credentials, daily_check, edits, github, gitops, hermes,
+from . import (actions, autoapprove, issues, agent_context, components, config, credentials, daily_check, edits, github, gitops, hermes,
                herdr, memory, orb, pull_report, references, registry, services, stacks, storage, store, studio, tasks, upstream_check, wiki, workflows, workspaces)
 from .store import settings as get_settings, save_settings
 
@@ -171,6 +171,8 @@ def index(repo_id: str | None = None, anything: str | None = None):
 def api_repos():
     registry.adopt_watch_folders(force=request.args.get("rescan") == "1")   # clones dropped into ManagerFiles/Repos
     repos = registry.repo_summary()
+    if request.args.get("group"):
+        repos = [r for r in repos if request.args["group"] in (r.get("groups") or [])]
     return jsonify(repos)
 
 
@@ -1290,6 +1292,48 @@ def api_remove_upstream(repo_id, name):
     return jsonify({"ok": True, "repo": repo})
 
 
+@flask_app.route("/api/mcp")
+def api_mcp():
+    """How coding agents connect: the stdio command always; the network address when UPSTREAM_MCP_PORT is set."""
+    port, host = os.environ.get("UPSTREAM_MCP_PORT"), os.environ.get("UPSTREAM_MCP_HOST", "127.0.0.1")
+    shown = request.host.split(":")[0] if host in ("0.0.0.0", "::") else host
+    return jsonify({"ok": True, "stdio": "upstream-mcp", "http_url": f"http://{shown}:{port}/mcp" if port else None,
+                    "listens_on": f"{host}:{port}" if port else None, "token_set": bool(os.environ.get("UPSTREAM_MCP_TOKEN"))})
+
+
+@flask_app.route("/api/groups")
+def api_groups():
+    return jsonify({"ok": True, "groups": registry.groups()})
+
+
+@flask_app.route("/api/repo/<repo_id>/groups", methods=["POST"])
+def api_set_groups(repo_id):
+    repo = registry.set_groups(repo_id, (request.get_json(force=True) or {}).get("groups"))
+    if not repo:
+        abort(404)
+    return jsonify({"ok": True, "groups": repo.get("groups") or [], "all": registry.groups()})
+
+
+@flask_app.route("/api/groups/<name>/fetch", methods=["POST"])
+def api_fetch_group(name):
+    """Fetch every repo in a group (several at a time)."""
+    from concurrent.futures import ThreadPoolExecutor
+    members = [r for r in store.snapshot(store.all_repos()) if name in (r.get("groups") or [])]
+    if not members:
+        return jsonify({"ok": False, "error": f"no repos in group {name}"}), 404
+
+    def one(r):
+        try:
+            plan = upstream_check.build_merge_plan(r["path"], r["id"], r["name"], r["upstreams"],
+                                                   focus_branch=r.get("focus_branch"), fetch=True).to_dict()
+            return {"repo": r["id"], "ok": True, "actions": plan.get("actions") or [], "conflicts": plan.get("conflicts") or []}
+        except Exception as e:
+            return {"repo": r["id"], "ok": False, "error": str(e)[:300]}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(one, members))
+    return jsonify({"ok": all(x["ok"] for x in results), "results": results})
+
+
 @flask_app.route("/api/run-daily", methods=["POST"])
 def api_run_daily():
     """Fetch every watched repo and bring it up to date where that is risk-free.
@@ -1299,8 +1343,9 @@ def api_run_daily():
     dirty tree) raises one approval request per repo and branch. Nothing is pushed.
     """
     results = []
+    group = (request.get_json(silent=True) or {}).get("group")
     with _run_lock:
-        watching = registry.get_watching_repos()
+        watching = [r for r in registry.get_watching_repos() if registry.in_group(r, group)]
         # The network part first, several repos at a time; then each repo's decisions, one by one.
         from concurrent.futures import ThreadPoolExecutor
 
@@ -1435,6 +1480,87 @@ def api_requests():
     return jsonify(store.get_requests())
 
 
+def decide(req: dict, decision: str, comment: str | None = None) -> tuple[dict, bool]:
+    """Approve (run it) or deny a pending request; returns (the decided request, failed). Used by the
+    Requests page and by the auto-approval rules (autoapprove.py)."""
+    outcome, failed = None, False
+    if decision == "approve":
+        # Approval runs the merge. Conflicts can't be resolved here: the merge is
+        # aborted and reported, and the working tree is left untouched.
+        repo = registry.get_repo(req["repo_id"])
+        if not repo:
+            raise LookupError("the repo of this request is no longer tracked")
+        if req.get("type") == "actions":
+            outcome = _do_actions(req)
+            failed = not all(o["ok"] for o in outcome)
+            return store.decide_request(req["id"], decision, comment, outcome, failed), failed
+        if req.get("type") == "push":
+            with _run_lock:
+                outcome, failed = _do_push(repo, req), False
+            failed = not all(o["ok"] for o in outcome)
+            return store.decide_request(req["id"], decision, comment, outcome, failed), failed
+        if req.get("type") == "components":
+            with _run_lock:
+                bumped = components.bump(repo, [c["name"] for c in req.get("components", [])], req["focus_branch"])
+            outcome = [{"upstream": r["name"], **r} for r in bumped["results"]] or [{"upstream": "components", "ok": False, "detail": bumped["detail"]}]
+            if bumped.get("commit"):
+                outcome.append({"upstream": "commit", "ok": True, "detail": f"{bumped['commit'][:10]}: {bumped['detail']}"})
+            failed = not bumped["ok"]
+            return store.decide_request(req["id"], decision, comment, outcome, failed), failed
+        # Merge exactly what the request showed: upstream commits pushed after it
+        # was raised were never reviewed, so they wait for the next request.
+        with _run_lock:
+            outcome = [{"upstream": u["name"], **daily_check.merge_upstream(
+                           repo["path"], {**u, "target": u.get("target") or u.get("upstream_sha")}, req["focus_branch"],
+                           allow_merge_commit=True)}
+                       for u in req.get("upstreams", [])]
+        failed = not all(o["ok"] for o in outcome)
+        if req.get("workspace") and not failed:  # its branch is in the focus branch now
+            try:
+                workspaces.remove(repo, req["workspace"])
+            except Exception:
+                pass
+    result = store.decide_request(req["id"], decision, comment, outcome, failed)
+    try:
+        memory.remember(result["repo_id"], (
+            f"{config.now_iso()[:10]}: Merge request for branch {result.get('focus_branch')} was {result['status']}"
+            f" ({'; '.join(o['detail'] for o in result.get('result') or []) or 'no merge run'}; "
+            f"conflicts: {', '.join(map(str, result.get('conflicts') or [])) or 'none'})"
+            + (f". Comment: {comment}" if comment else ".")), kind="decision")
+    except Exception:
+        pass
+    return result, failed
+
+
+autoapprove.install(decide)
+
+
+@flask_app.route("/api/repo/<repo_id>/auto-approve")
+def api_auto_approve(repo_id):
+    return jsonify({"ok": True, "rules": autoapprove.rules(_tracked(repo_id)), "kinds": list(autoapprove.KINDS)})
+
+
+@flask_app.route("/api/repo/<repo_id>/auto-approve", methods=["POST"])
+def api_set_auto_approve(repo_id):
+    """Which requests of this repo approve themselves, and the check they must pass. Yours only: an agent
+    that could set this could approve its own work."""
+    if (refused := _user_only("Changing auto-approval rules")):
+        return refused
+    repo = _tracked(repo_id)
+    try:
+        rules = autoapprove.clean_rules(request.get_json(force=True) or {})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    with store.lock:
+        repo["auto_approve"] = rules
+        store.save_repo(repo)
+    # requests already waiting are checked against the new rules too
+    for req in store.snapshot(store.get_requests()):
+        if req.get("repo_id") == repo_id and req.get("status") == "pending" and not (req.get("auto") or {}).get("state") == "checking":
+            autoapprove._on_request(req)
+    return jsonify({"ok": True, "rules": autoapprove.rules(repo)})
+
+
 @flask_app.route("/api/request/<req_id>/decide", methods=["POST"])
 def api_decide(req_id):
     if (refused := _user_only("Approving or denying a request")):
@@ -1449,55 +1575,10 @@ def api_decide(req_id):
         abort(404)
     if req.get("status") != "pending":
         return jsonify({"ok": False, "error": f"request is already {req.get('status')}"}), 409
-    outcome, failed = None, False
-    if decision == "approve":
-        # Approval runs the merge. Conflicts can't be resolved here: the merge is
-        # aborted and reported, and the working tree is left untouched.
-        repo = registry.get_repo(req["repo_id"])
-        if not repo:
-            abort(404)
-        if req.get("type") == "actions":
-            outcome = _do_actions(req)
-            failed = not all(o["ok"] for o in outcome)
-            result = store.decide_request(req_id, decision, comment, outcome, failed)
-            return jsonify({"ok": not failed, "request": store.snapshot(result)})
-        if req.get("type") == "push":
-            with _run_lock:
-                outcome, failed = _do_push(repo, req), False
-            failed = not all(o["ok"] for o in outcome)
-            result = store.decide_request(req_id, decision, comment, outcome, failed)
-            return jsonify({"ok": not failed, "request": store.snapshot(result)})
-        if req.get("type") == "components":
-            with _run_lock:
-                bumped = components.bump(repo, [c["name"] for c in req.get("components", [])], req["focus_branch"])
-            outcome = [{"upstream": r["name"], **r} for r in bumped["results"]] or [{"upstream": "components", "ok": False, "detail": bumped["detail"]}]
-            if bumped.get("commit"):
-                outcome.append({"upstream": "commit", "ok": True, "detail": f"{bumped['commit'][:10]}: {bumped['detail']}"})
-            failed = not bumped["ok"]
-            result = store.decide_request(req_id, decision, comment, outcome, failed)
-            return jsonify({"ok": not failed, "request": store.snapshot(result)})
-        # Merge exactly what the request showed: upstream commits pushed after it
-        # was raised were never reviewed, so they wait for the next request.
-        with _run_lock:
-            outcome = [{"upstream": u["name"], **daily_check.merge_upstream(
-                           repo["path"], {**u, "target": u.get("target") or u.get("upstream_sha")}, req["focus_branch"],
-                           allow_merge_commit=True)}
-                       for u in req.get("upstreams", [])]
-        failed = not all(o["ok"] for o in outcome)
-        if req.get("workspace") and not failed:  # its branch is in the focus branch now
-            try:
-                workspaces.remove(repo, req["workspace"])
-            except Exception:
-                pass
-    result = store.decide_request(req_id, decision, comment, outcome, failed)
     try:
-        memory.remember(result["repo_id"], (
-            f"{config.now_iso()[:10]}: Merge request for branch {result.get('focus_branch')} was {result['status']}"
-            f" ({'; '.join(o['detail'] for o in result.get('result') or []) or 'no merge run'}; "
-            f"conflicts: {', '.join(map(str, result.get('conflicts') or [])) or 'none'})"
-            + (f". Comment: {comment}" if comment else ".")), kind="decision")
-    except Exception:
-        pass
+        result, failed = decide(req, decision, comment)
+    except LookupError:
+        abort(404)
     return jsonify({"ok": not failed, "request": store.snapshot(result)})
 
 
@@ -1700,6 +1781,29 @@ def api_tasks():
         except herdr.HerdrError:
             pass
     return jsonify({"ok": True, "items": out})
+
+
+@flask_app.route("/api/repo/<repo_id>/issues")
+def api_issues(repo_id):
+    """The GitHub issues of the repo behind one of its remotes (?remote=, ?state=open|closed|all)."""
+    repo = _tracked(repo_id)
+    try:
+        return jsonify(issues.list_issues(repo, request.args.get("remote") or None, request.args.get("state") or "open",
+                                          request.args.get("limit") or 50))
+    except (issues.IssueError, github.GitHubError, ValueError) as e:
+        return jsonify({"ok": False, "error": str(e), "remotes": issues.remotes(repo)}), 400
+
+
+@flask_app.route("/api/repo/<repo_id>/issues/import", methods=["POST"])
+def api_import_issues(repo_id):
+    """Make Work tasks of issues: {numbers: [12, 15], remote?}."""
+    repo = _tracked(repo_id)
+    data = request.get_json(force=True) or {}
+    try:
+        return jsonify(issues.import_issues(repo, data.get("numbers"), data.get("remote") or None,
+                                            by="agent" if _from_agent() else "user"))
+    except (issues.IssueError, github.GitHubError, tasks.TaskError) as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 
 @flask_app.route("/api/tasks", methods=["POST"])
@@ -2803,6 +2907,7 @@ pre.term{margin:0;font:12px/1.35 var(--mono);white-space:pre-wrap;color:#cfd6e4}
 .ref-tree .trow{display:flex;gap:6px;align-items:center;padding:4px 8px;cursor:pointer;border-radius:6px}.ref-tree .trow:hover{background:var(--raise)}
 .ref-tree .trow.sel{background:var(--raise);box-shadow:inset 3px 0 0 var(--accent,#4c7dff)}.ref-tree .tw{width:12px;color:var(--muted)}
 .trow.drop,.ref-drop.drop{outline:2px dashed var(--accent,#4c7dff);outline-offset:-2px}
+.chip{background:var(--raise);border:1px solid var(--line2);color:var(--soft);border-radius:999px;padding:3px 10px;font-size:12px;cursor:pointer}.chip.on{background:var(--accent,#3b6cff);border-color:transparent;color:#fff}
 .ref-row,.ref-head{display:grid;grid-template-columns:22px minmax(140px,1.4fr) minmax(0,2fr) 70px 86px 34px;gap:8px;align-items:center;padding:6px 8px;border-bottom:1px solid var(--line)}
 .ref-row{cursor:pointer}.ref-row:hover{background:var(--raise)}.ref-row .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ref-row>span:nth-child(3){overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ref-drop{min-height:120px;border-radius:8px}

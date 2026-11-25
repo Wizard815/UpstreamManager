@@ -23,10 +23,16 @@ from .app import flask_app
 def main(default_port: int = 5000) -> None:
     memory.start_background()  # writes the log of each finished day that had activity
     references.start_background()  # keeps reference repos up to date (daily unless set otherwise)
+    port = int(os.environ.get("PORT", str(default_port)))
+    # Agents on other machines: the MCP tools over HTTP when UPSTREAM_MCP_PORT is set (token: UPSTREAM_MCP_TOKEN).
+    from . import mcp_server
+    url = mcp_server.start_http_in_background(f"http://127.0.0.1:{port}")
+    if url:
+        print(f"MCP for coding agents: {url}", flush=True)
     serve(
         flask_app,
         host=os.environ.get("HOST", "127.0.0.1"),
-        port=int(os.environ.get("PORT", str(default_port))),
+        port=port,
         threads=int(os.environ.get("UPSTREAM_THREADS", "8")),
         # LLM chat and git fetches can run for minutes; don't drop them early
         # (keep this above UPSTREAM_LLM_TIMEOUT).

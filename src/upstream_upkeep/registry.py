@@ -397,6 +397,7 @@ def _summary(repo: dict) -> dict:
         "upstreams": [u["name"] for u in repo.get("upstreams", [])],
         "last_commit": commits[0] if commits else None,
         "integration": repo.get("integration"),
+        "groups": repo.get("groups") or [],
         **({"dirty": st["dirty"], "dirty_tracked": st["tracked"]} if (st := (gitops.status_summary(repo["path"]) if not error else None)) else {"dirty": 0, "dirty_tracked": 0}),
         "error": error,
     }
@@ -425,3 +426,41 @@ def _component_summary(repo: dict) -> list[dict]:
 
 def get_watching_repos() -> list[dict]:
     return [r for r in store.all_repos() if r.get("watch", True)]
+
+
+# ------------------------------------------------------------------ groups
+def clean_groups(groups) -> list[str]:
+    """Group names a repo belongs to ("glance", "studio", "work"): trimmed, lower-case, unique, at most 20."""
+    if isinstance(groups, str):
+        groups = groups.split(",")
+    out = []
+    for g in groups or []:
+        if not isinstance(g, str):
+            continue
+        g = re.sub(r"\s+", "-", g.strip().lower())[:40]
+        if g and re.fullmatch(r"[a-z0-9][a-z0-9._-]*", g) and g not in out:
+            out.append(g)
+    return out[:20]
+
+
+def set_groups(repo_id: str, groups) -> dict | None:
+    repo = _get_repo(repo_id)
+    if not repo:
+        return None
+    with store.lock:
+        repo["groups"] = clean_groups(groups)
+        _save_repo(repo)
+    return repo
+
+
+def groups() -> dict[str, list[str]]:
+    """Every group and the ids of its repos."""
+    out: dict[str, list[str]] = {}
+    for r in store.all_repos():
+        for g in r.get("groups") or []:
+            out.setdefault(g, []).append(r["id"])
+    return dict(sorted(out.items()))
+
+
+def in_group(repo: dict, group: str | None) -> bool:
+    return not group or group in (repo.get("groups") or [])

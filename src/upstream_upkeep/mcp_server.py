@@ -125,15 +125,49 @@ def _r(repo: str) -> str:
 
 # ------------------------------------------------------------------ reading
 @server.tool(annotations=READ)
-def list_repos() -> list[dict]:
-    """Every watched repo: id, path, focus branch, and how far behind/ahead of each upstream it is."""
+def list_repos(group: Annotated[str, Field(description="Only repos in this group (see list_groups); empty for all.")] = "") -> list[dict]:
+    """Every watched repo: id, path, focus branch, groups, and how far behind/ahead of each upstream it is."""
     out = []
-    for r in _call("GET", "/api/repos"):
+    for r in _call("GET", "/api/repos", group=group):
         out.append({"id": r["id"], "name": r.get("name"), "path": r.get("path"), "focus_branch": r.get("focus_branch"),
-                    "uncommitted_files": r.get("dirty"), "error": r.get("error"),
+                    "groups": r.get("groups") or [], "uncommitted_files": r.get("dirty"), "error": r.get("error"),
                     "upstreams": [{k: u.get(k) for k in ("name", "branch", "behind", "ahead", "conflict", "missing_ref",
                                                           "conflict_detail")} for u in r.get("upstream_details") or []]})
     return out
+
+
+@server.tool(annotations=READ)
+def list_issues(repo: Repo,
+                state: Annotated[Literal["open", "closed", "all"], Field(description="Which issues.")] = "open",
+                remote: Annotated[str, Field(description="Which github.com remote's issues (default: origin, else the first upstream).")] = "") -> dict:
+    """The GitHub issues of a repo (not pull requests), newest activity first, each with the task it became if imported."""
+    return _call("GET", _r(repo) + "/issues", state=state, remote=remote)
+
+
+@server.tool(annotations=WRITE)
+def import_issues(repo: Repo,
+                  numbers: Annotated[list[int], Field(min_length=1, max_length=50, description="Issue numbers from list_issues.")],
+                  remote: Annotated[str, Field(description="The remote list_issues used, if not the default.")] = "") -> dict:
+    """Make Work tasks of GitHub issues (title, text and a link back). An issue already imported is skipped."""
+    return _call("POST", _r(repo) + "/issues/import", {"numbers": numbers, "remote": remote})
+
+
+@server.tool(annotations=READ)
+def list_groups() -> dict:
+    """The user's repo groups (e.g. "glance": the Glance apps) and the repo ids in each."""
+    return _call("GET", "/api/groups")["groups"]
+
+
+@server.tool(annotations=WRITE)
+def set_repo_groups(repo: Repo, groups: Annotated[list[str], Field(description='Every group the repo belongs to, e.g. ["glance", "web"]; [] for none. Lower-case words.')]) -> list[str]:
+    """Put a repo in groups (replaces its list), so it can be listed, fetched and checked with the rest of its group."""
+    return _call("POST", _r(repo) + "/groups", {"groups": groups})["groups"]
+
+
+@server.tool(annotations=WRITE)
+def fetch_group(group: Annotated[str, Field(min_length=1, description="Group name from list_groups.")]) -> dict:
+    """Fetch the upstreams of every repo in a group; returns what each would bring and any conflicts."""
+    return _call("POST", f"/api/groups/{quote(group, safe='')}/fetch", {})
 
 
 @server.tool(annotations=READ)
@@ -700,8 +734,78 @@ def mark_integration(repo: Repo,
     return _call("POST", _r(repo) + "/integration", {"state": state, "note": note})
 
 
+# ------------------------------------------------------------------ over the network
+# `upstream-mcp --http 0.0.0.0:5002` (or UPSTREAM_MCP_PORT for the web app to start it) serves the same
+# tools over MCP's streamable HTTP at http://<host>:<port>/mcp, so agents on other machines can use them.
+# Every request must carry `Authorization: Bearer <UPSTREAM_MCP_TOKEN>`; without a token it only listens
+# on this machine (127.0.0.1).
+def _loopback(host: str) -> bool:
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+class _BearerAuth:
+    """ASGI wrapper: refuse any HTTP request without the right bearer token."""
+
+    def __init__(self, app, token: str):
+        self.app, self.token = app, token.encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and self.token:
+            import hmac
+            got = dict(scope.get("headers") or []).get(b"authorization", b"")
+            if not (got.startswith(b"Bearer ") and hmac.compare_digest(got[7:].strip(), self.token)):
+                body = b'{"error":"send Authorization: Bearer <UPSTREAM_MCP_TOKEN>"}'
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"application/json"), (b"www-authenticate", b"Bearer")]})
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+def http_app(host: str = "127.0.0.1", token: str | None = None):
+    from mcp.server.transport_security import TransportSecuritySettings
+    token = token if token is not None else os.environ.get("UPSTREAM_MCP_TOKEN", "")
+    if not token and not _loopback(host):
+        raise SystemExit("Serving MCP beyond this machine needs a token: set UPSTREAM_MCP_TOKEN "
+                         "(e.g. python -c 'import secrets; print(secrets.token_urlsafe(32))').")
+    # With a token, the token is the protection; the Host check would only refuse LAN names and IPs.
+    security = TransportSecuritySettings(enable_dns_rebinding_protection=not token)
+    app = server.streamable_http_app(host=host, transport_security=security)
+    return _BearerAuth(app, token) if token else app
+
+
+def serve_http(host: str, port: int, token: str | None = None) -> None:
+    import uvicorn
+    uvicorn.run(http_app(host, token), host=host, port=port, log_level="warning")
+
+
+def start_http_in_background(app_url: str) -> str | None:
+    """Started by the web app when UPSTREAM_MCP_PORT is set. Returns the URL agents use, or None."""
+    port = os.environ.get("UPSTREAM_MCP_PORT")
+    if not port:
+        return None
+    global APP
+    APP = app_url.rstrip("/")
+    host = os.environ.get("UPSTREAM_MCP_HOST", "127.0.0.1")
+    import threading
+    import uvicorn
+    cfg = uvicorn.Config(http_app(host), host=host, port=int(port), log_level="warning")
+    srv = uvicorn.Server(cfg)
+    threading.Thread(target=srv.run, daemon=True, name="upstream-mcp-http").start()
+    return f"http://{host}:{port}/mcp"
+
+
 def main() -> None:
-    server.run("stdio")
+    import argparse
+    p = argparse.ArgumentParser(prog="upstream-mcp", description="Upstream Manager's tools for coding agents (MCP).")
+    p.add_argument("--http", metavar="[HOST:]PORT", help="serve over the network (streamable HTTP at /mcp) instead of stdio; "
+                   "needs UPSTREAM_MCP_TOKEN unless HOST is 127.0.0.1")
+    a = p.parse_args()
+    if not a.http:
+        server.run("stdio")
+        return
+    host, _, port = a.http.rpartition(":")
+    serve_http(host or "127.0.0.1", int(port))
 
 
 if __name__ == "__main__":

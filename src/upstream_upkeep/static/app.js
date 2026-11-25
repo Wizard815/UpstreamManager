@@ -125,8 +125,14 @@ function requestLine(r) {
 async function renderRepos() {
   const content = $("#content")
   content.replaceChildren(loading("Checking repos…"))
-  const [repos, reqs] = await Promise.all([api(apiUrl('/api/repos')), refreshPendingCount()])
-  const pending = reqs.filter(r => r.status === "pending")
+  const [allRepos, reqs] = await Promise.all([api(apiUrl('/api/repos')), refreshPendingCount()])
+  // Groups ("glance", "studio"...): a chip per group filters the page; Fetch and the daily check follow it.
+  let group = ""; try { group = localStorage.getItem("repo-group") || "" } catch {}
+  const allGroups = [...new Set(allRepos.flatMap(r => r.groups || []))].sort()
+  if (group && !allGroups.includes(group)) group = ""
+  const repos = group ? allRepos.filter(r => (r.groups || []).includes(group)) : allRepos
+  const inView = new Set(repos.map(r => r.id))
+  const pending = reqs.filter(r => r.status === "pending" && (!group || inView.has(r.repo_id)))
   content.innerHTML = ""
 
   // header + add form
@@ -147,16 +153,16 @@ async function renderRepos() {
     el("p", { class: "muted", style: "margin:8px 0 0" }, "A URL is cloned into the watch folder. A local folder is watched where it is. Add more upstreams on the repo's page."))
   const addToggle = el("button", { class: "btn ghost" }, "+ Add repo")
   addToggle.onclick = () => { addBox.hidden = !addBox.hidden; if (!addBox.hidden) urlIn.focus() }
-  const fetchBtn = el("button", { class: "btn ghost" }, "Fetch all")
+  const fetchBtn = el("button", { class: "btn ghost" }, group ? `Fetch ${group}` : "Fetch all")
   fetchBtn.onclick = () => busy(fetchBtn, "Fetching…", async () => {
     const failed = []
     await Promise.all(repos.map(r => api(apiUrl(`/api/repo/${r.id}/fetch`), { method: "POST", body: "{}" }).catch(() => failed.push(r.name || r.id))))
     if (failed.length) toast(`Fetch failed for ${failed.join(", ")}`, "error")
     await renderRepos()
   })
-  const runBtn = el("button", { class: "btn" }, "▶ Run daily check")
+  const runBtn = el("button", { class: "btn" }, group ? `▶ Check ${group}` : "▶ Run daily check")
   runBtn.onclick = () => busy(runBtn, "Running…", async () => {
-    const res = await api(apiUrl('/api/run-daily'), { method: "POST", body: "{}" })
+    const res = await api(apiUrl('/api/run-daily'), { method: "POST", body: JSON.stringify(group ? { group } : {}) })
     const n = (s) => res.results.filter(r => r.status === s).length
     toast(`Done: ${n("merged")} fast-forwarded, ${n("request_raised")} requests raised, ${n("skipped")} skipped, ${n("error")} errors`
       + res.results.filter(r => r.status === "skipped").map(r => `\n${r.repo_name}: ${r.detail}`).join(""), n("error") || n("skipped") ? "error" : "ok")
@@ -166,8 +172,16 @@ async function renderRepos() {
     el("div", { class: "row" }, el("h1", { class: "page" }, "Repositories"), el("div", { class: "spacer" }), addToggle, fetchBtn, runBtn),
     addBox))
   const wrap = content.firstChild
+  if (allGroups.length) {
+    const pick = (g) => { try { localStorage.setItem("repo-group", g) } catch {}; renderRepos() }
+    wrap.append(el("div", { class: "row group-chips", role: "toolbar", "aria-label": "Repo groups", style: "gap:6px;flex-wrap:wrap" },
+      el("span", { class: "muted small" }, "Groups:"),
+      el("button", { class: `chip${group ? "" : " on"}`, "aria-pressed": String(!group), onclick: () => pick("") }, `All (${allRepos.length})`),
+      ...allGroups.map(g => el("button", { class: `chip${g === group ? " on" : ""}`, "aria-pressed": String(g === group), onclick: () => pick(g) },
+        `${g} (${allRepos.filter(r => (r.groups || []).includes(g)).length})`))))
+  }
 
-  if (!repos.length) {
+  if (!allRepos.length) {
     addBox.hidden = false
     wrap.append(el("p", { class: "muted" }, "No repos yet. Add one above, or put a clone in your Repos folder (ManagerFiles/Repos); it shows up here by itself."))
     return
@@ -234,6 +248,7 @@ async function renderRepos() {
       el("td", {}, el("a", { href: `${BASE}/repo/${r.id}`, style: "font-weight:600;color:var(--text);text-decoration:none" }, r.name || r.id),
         r.integration?.state && r.integration.state !== "none" ? el("a", { href: `${BASE}/integrations`, style: "margin-left:6px;text-decoration:none", title: r.integration.note || "" },
           badge(MARK_CLS[r.integration.state], { integrated: "integrated", partial: "partly integrated", planned: "to integrate" }[r.integration.state])) : null,
+        ...(r.groups || []).map(g => el("span", { class: "badge", style: "margin-left:6px", title: `group ${g}` }, `#${g}`)),
         el("div", { class: "muted small" }, `${r.focus_branch || ""} · ${r.path}`)),
       el("td", { class: "muted" }, ups(r).map(u => `${u.name}/${u.branch}`).join(", ") || "-"),
       el("td", {}, status),
@@ -379,13 +394,26 @@ async function renderRepoPage(repoId) {
     } catch (e) { toast(e, "error"); focusSel.disabled = false; focusSel.value = repo.focus_branch }
   }
   const tree = el("span", { class: "badge" }, "…")
+  const groupsEl = el("span", { class: "row", style: "gap:4px" })
+  const drawGroups = (gs) => groupsEl.replaceChildren(...gs.map(g => el("button", { class: "chip", title: `Show the ${g} group`, onclick: () => { try { localStorage.setItem("repo-group", g) } catch {}; route("/repos") } }, `#${g}`)))
+  drawGroups(repo.groups || [])
+  const editGroups = async () => {
+    const all = Object.keys((await api(apiUrl("/api/groups")).catch(() => ({ groups: {} }))).groups || {})
+    const v = prompt(`Groups for ${repo.name || repoId}, comma separated` + (all.length ? ` (existing: ${all.join(", ")})` : " (e.g. glance, web)") + ":", (repo.groups || []).join(", "))
+    if (v === null) return
+    const r = await api(apiUrl(`/api/repo/${repoId}/groups`), { method: "POST", body: JSON.stringify({ groups: v }) }).catch(e => ({ ok: false, error: e.message }))
+    if (!r.ok) return toast(r.error, "error")
+    repo.groups = r.groups; drawGroups(r.groups); toast(r.groups.length ? `Groups: ${r.groups.join(", ")}` : "In no group", "ok")
+  }
   const pathEl = el("button", { class: "path btn link", title: `${repo.path} (click to copy)`, onclick: () => { navigator.clipboard?.writeText(repo.path); toast("Path copied", "ok") } }, repo.path)
   content.append(el("div", { class: "repo-head" },
     el("a", { href: `${BASE}/repos`, class: "muted", style: "text-decoration:none" }, "Repos"), el("span", { class: "muted" }, "/"),
     el("h1", { class: "page" }, repo.name || repoId),
-    el("label", { class: "row muted", style: "gap:6px" }, "Focus", focusSel), tree, el("div", { class: "spacer" }), pathEl,
+    el("label", { class: "row muted", style: "gap:6px" }, "Focus", focusSel), tree, groupsEl, el("div", { class: "spacer" }), pathEl,
     menu(`More actions for ${repo.name || repoId}`, [
       { label: "New task…", run: () => taskDialog({ repo: repoId }) },
+      { label: "Groups…", run: editGroups },
+      { label: "Import GitHub issues…", run: () => issuesDialog(repoId) },
       { label: "Copy folder path", run: () => { navigator.clipboard?.writeText(repo.path); toast("Path copied", "ok") } },
       { label: "Remove from Upstream Manager", danger: true, run: removeRepo },
     ])))
@@ -572,9 +600,43 @@ async function branchSetDialog(repoId) {
   redraw()
 }
 
+// What the auto-approval rules did with a request: checking, passed, or failed (with the output).
+function autoLine(r) {
+  const a = r.auto
+  if (!a || !a.state) return null
+  const head = { checking: "⏳ Auto-approval: checking", passed: "✓ Auto-approval check passed", failed: "✗ Auto-approval check failed: it waits for you" }[a.state] || a.state
+  const out = a.detail ? el("details", { style: "margin-top:4px" }, el("summary", { class: "small" }, "output"), el("pre", { class: "small mono", style: "white-space:pre-wrap;max-height:240px;overflow:auto" }, a.detail)) : null
+  return el("div", { class: "small", style: `margin:6px 0;color:${a.state === "failed" ? "var(--bad)" : a.state === "passed" ? "var(--good, #6c6)" : "inherit"}` },
+    head + (a.check ? ` (${a.check})` : ""), out)
+}
+
+// "Goes in by itself": which of this repo's requests approve themselves, and the check they must pass.
+async function autoApproveCard(repoId) {
+  const card = el("div", { class: "card", style: "margin-bottom:12px" })
+  const r = (await api(apiUrl(`/api/repo/${repoId}/auto-approve`)).catch(() => null))?.rules
+  if (!r) return card
+  const box = (k, label) => { const i = el("input", { type: "checkbox", style: "height:auto", "aria-label": label }); i.checked = !!r[k]; return [i, el("label", { class: "row", style: "gap:6px" }, i, label)] }
+  const [clean, cleanL] = box("clean", "Clean upstream pulls")
+  const [comps, compsL] = box("components", "Submodule pin bumps")
+  const [wsx, wsL] = box("workspaces", "Workspaces an agent submits (needs a check)")
+  const check = el("input", { value: r.check || "", placeholder: "check command, e.g. npm ci && npm test", "aria-label": "Check command", style: "flex:1 1 320px" })
+  const timeout = el("input", { type: "number", min: "30", value: String(r.timeout || 1200), "aria-label": "Check timeout (seconds)", style: "width:90px" })
+  const save = el("button", { class: "btn small" }, "Save")
+  save.onclick = () => busy(save, "Saving…", async () => {
+    const res = await api(apiUrl(`/api/repo/${repoId}/auto-approve`), { method: "POST", body: JSON.stringify({ clean: clean.checked, components: comps.checked, workspaces: wsx.checked, check: check.value, timeout: timeout.value }) }).catch(e => ({ ok: false, error: e.message }))
+    toast(res.ok ? "Saved. Waiting requests are checked against it now." : res.error, res.ok ? "ok" : "error")
+  })
+  card.append(el("div", { class: "row" }, el("strong", {}, "Goes in by itself"), el("span", { class: "muted small" }, "auto-approval: only you can change this")),
+    el("div", { class: "row", style: "gap:16px;margin-top:6px;flex-wrap:wrap" }, cleanL, compsL, wsL),
+    el("div", { class: "row", style: "gap:8px;margin-top:6px;flex-wrap:wrap" }, check, el("span", { class: "muted small" }, "timeout (s)"), timeout, save),
+    el("p", { class: "muted small", style: "margin:6px 0 0" }, "When one of these is raised, its exact result is rebuilt in a throwaway checkout and the check runs there. It is approved only when the check passes; otherwise it waits for you with the output. Pushes never go by themselves."))
+  return card
+}
+
 async function renderMerges(wrap, repoId) {
-  const res = await api(apiUrl(`/api/repo/${repoId}/workspaces`))
+  const [res, auto] = await Promise.all([api(apiUrl(`/api/repo/${repoId}/workspaces`)), autoApproveCard(repoId)])
   wrap.innerHTML = ""
+  wrap.append(auto)
   wrap.append(el("div", { class: "row", style: "margin-bottom:10px" },
     el("h3", {}, "Merge workspaces"), el("div", { class: "spacer" }),
     el("button", { class: "btn ghost small", onclick: () => branchSetDialog(repoId) }, "Merge branches…"),
@@ -613,6 +675,8 @@ async function renderMerges(wrap, repoId) {
         el("span", { class: "muted small" }, `${i + 1}.`), el("span", {}, s.label), stateBadge(s.state)))),
       el("div", { style: "margin-top:8px" }, w.next_step),
       (w.unresolved || []).length ? el("div", { class: "small mono", style: "margin-top:4px;color:var(--bad)" }, `Conflicted: ${w.unresolved.join(", ")}`) : null,
+      (w.reused_resolutions || []).length ? el("div", { class: "small", style: "margin-top:4px" }, `♻ Resolved as before (remembered): ${w.reused_resolutions.join(", ")}`) : null,
+      el("div", { class: "muted small", style: "margin-top:4px" }, `Merge helpers: remembered resolutions on · Mergiraf ${w.merge_helpers?.mergiraf ? "on" : "not installed (mergiraf.org)"}`),
       el("div", { class: "muted small", style: "margin-top:4px" }, w.path)))
   }
 }
@@ -1947,6 +2011,7 @@ async function renderRequests() {
             (u.conflict_files || []).length ? el("div", { class: "muted", style: "font-family:monospace;font-size:12px" }, u.conflict_files.slice(0, 20).join(", ")) : null
           )
         )),
+        autoLine(r),
         (r.result || []).length ? el("div", { class: "muted" }, "Result: " + r.result.map(o => `${o.upstream}: ${o.detail}`).join("; ")) : null,
         (r.result || []).filter(o => o.url).map(o => el("div", {}, el("a", { href: o.url, target: "_blank", rel: "noopener", style: "color:#9fb4ff" }, `Open the pull request: ${o.url}`))),
         (r.result || []).filter(o => o.after_update).map(o => el("div", { style: "color:#e0a060;font-size:13px" }, `Now run for ${o.name}: `, el("code", {}, o.after_update))),
@@ -2158,6 +2223,45 @@ function herdrPicker(ints, current) {
 }
 
 let drawDests = null
+// Import GitHub issues as Work tasks: pick a remote and the issues; ones already imported link to their task.
+async function issuesDialog(repoId) {
+  const body = el("div", { class: "col", style: "gap:10px;min-width:min(620px,86vw)" }, loading("Asking GitHub…"))
+  let close = openDialog("Import GitHub issues", body), remote = "", state = "open"
+  const draw = async () => {
+    body.replaceChildren(loading("Asking GitHub…"))
+    const r = await api(apiUrl(`/api/repo/${repoId}/issues?state=${state}${remote ? `&remote=${encodeURIComponent(remote)}` : ""}`)).catch(e => ({ ok: false, error: e.message }))
+    const remSel = el("select", { "aria-label": "Remote" }, ...(r.remotes || []).map(x => el("option", { value: x.remote }, `${x.remote} · ${x.slug}`)))
+    remSel.value = r.source?.remote || remote; remSel.onchange = () => { remote = remSel.value; draw() }
+    const stSel = el("select", { "aria-label": "Which issues" }, ...["open", "closed", "all"].map(x => el("option", { value: x }, x)))
+    stSel.value = state; stSel.onchange = () => { state = stSel.value; draw() }
+    const head = el("div", { class: "row", style: "gap:8px" }, (r.remotes || []).length ? remSel : null, stSel)
+    if (!r.ok) return body.replaceChildren(head, el("p", { class: "muted" }, r.error))
+    if (!r.items.length) return body.replaceChildren(head, el("p", { class: "muted" }, `No ${state === "all" ? "" : state + " "}issues on ${r.source.slug}.`))
+    const boxes = []
+    const list = el("div", { class: "col", style: "gap:2px;max-height:52vh;overflow:auto" }, ...r.items.map(i => {
+      const cb = el("input", { type: "checkbox", style: "height:auto", "aria-label": `Import #${i.number}` }); cb.disabled = !!i.task; cb.dataset.n = i.number
+      if (!i.task) boxes.push(cb)
+      return el("label", { class: "row", style: "gap:8px;padding:4px 2px;align-items:flex-start" }, cb,
+        el("span", { style: "flex:1" }, el("strong", {}, `#${i.number} `), i.title,
+          ...(i.labels || []).map(lb => el("span", { class: "badge", style: "margin-left:4px" }, lb)),
+          el("div", { class: "muted small" }, `${i.user || ""} · ${(i.updated_at || "").slice(0, 10)} · ${i.comments} comment(s)`)),
+        i.task ? el("button", { class: "btn ghost small", onclick: (e) => { e.preventDefault(); close(); route(`/work?task=${i.task}`) } }, "Its task") :
+          el("a", { href: i.url, target: "_blank", rel: "noopener", class: "small" }, "GitHub"))
+    }))
+    const go = el("button", { class: "btn" }, "Make tasks")
+    go.onclick = () => busy(go, "Importing…", async () => {
+      const numbers = boxes.filter(b => b.checked).map(b => Number(b.dataset.n))
+      if (!numbers.length) return toast("Tick the issues to import", "error")
+      const res = await api(apiUrl(`/api/repo/${repoId}/issues/import`), { method: "POST", body: JSON.stringify({ numbers, remote: r.source.remote }) }).catch(e => ({ ok: false, error: e.message }))
+      if (!res.ok) return toast(res.error, "error")
+      toast(`${res.created.length} task(s) made` + (res.skipped.length ? `, ${res.skipped.length} skipped` : ""), "ok")
+      close(); route(`/work?repo=${encodeURIComponent(repoId)}`)
+    })
+    body.replaceChildren(head, el("div", { class: "muted small" }, `${r.source.slug}: tick issues to make Work tasks of them (title, text and a link back).`), list, el("div", {}, go))
+  }
+  draw()
+}
+
 async function taskDialog(pre = {}) {
   const ints = await loadIntegrations()
   loadIntegrations(true).then(fresh => { Object.assign(ints, fresh); drawDests?.() }).catch(() => {})
@@ -2307,9 +2411,10 @@ async function renderWork() {
   }
   repoSel.onchange = () => { repoF = repoSel.value; draw() }
   const newBtn = el("button", { class: "btn", onclick: () => taskDialog({ repo: repoF || undefined }) }, "+ New task")
+  const issuesBtn = el("button", { class: "btn ghost", title: "Make tasks of a repo's GitHub issues", onclick: () => repoF ? issuesDialog(repoF) : toast("Pick a repo first (the list above)", "info") }, "Import issues")
   main.replaceChildren(
     el("div", { class: "row", style: "margin-bottom:12px;gap:10px;flex-wrap:wrap;align-items:center" }, el("h1", { class: "page", style: "margin:0" }, "Work"),
-      el("span", { class: "muted" }, "Fixes, bugs and changes for your coding agents: work on them here, send them to herdr or Studio, or park them."), el("div", { class: "spacer" }), repoSel, newBtn),
+      el("span", { class: "muted" }, "Fixes, bugs and changes for your coding agents: work on them here, send them to herdr or Studio, or park them."), el("div", { class: "spacer" }), repoSel, issuesBtn, newBtn),
     el("div", { class: "work-grid" }, el("div", { class: "col", style: "gap:12px;min-width:0" }, el("div", { class: "panel", style: "min-width:0" }, fbar, listBox), roster), detail))
   await draw()
   drawRoster()
@@ -2835,6 +2940,21 @@ async function renderIntegrations() {
     el("div", { class: "card", style: "margin-top:14px" }, el("h3", { style: "margin-top:0" }, "Your repos"),
       el("p", { class: "muted small" }, `${counts.integrated} integrated · ${counts.partial} partly · ${counts.planned} to integrate · ${counts.none} not needed. Mark each one; a note says what works or what is missing.`),
       el("div", { class: "table-box" }, el("table", { class: "list" }, el("thead", {}, el("tr", {}, el("th", {}, "Repo"), el("th", {}, "Integration"), el("th", {}, "Runs"), el("th", {}, "Note"))), repoBody))))
+  main.append(await agentsCard())
+}
+
+// How coding agents reach Upstream's tools: on this machine (stdio), and over the network when it is on.
+async function agentsCard() {
+  const m = await api(apiUrl("/api/mcp")).catch(() => null)
+  const card = el("div", { class: "card", style: "margin-top:14px" }, el("h3", { style: "margin-top:0" }, "Coding agents (MCP)"))
+  if (!m) return card
+  const code = (t) => el("pre", { class: "small mono", style: "white-space:pre-wrap;margin:4px 0" }, t)
+  card.append(el("div", { class: "small" }, "On this machine: ", el("code", {}, m.stdio), " (stdio), e.g. ", el("code", {}, "claude mcp add upstream -- upstream-mcp")))
+  if (m.http_url) card.append(el("div", { class: "small", style: "margin-top:8px" }, "Over the network: ", el("code", {}, m.http_url), " ",
+      m.token_set ? badge("up", "token required") : badge("warn", "no token: this machine only")),
+    code(`claude mcp add --transport http upstream ${m.http_url} --header "Authorization: Bearer $UPSTREAM_MCP_TOKEN"`))
+  else card.append(el("p", { class: "muted small" }, "Over the network: off. Set UPSTREAM_MCP_PORT (and UPSTREAM_MCP_HOST=0.0.0.0 with UPSTREAM_MCP_TOKEN) in .env to let agents on other machines use these tools."))
+  return card
 }
 
 function serviceDialog(s, repos) {

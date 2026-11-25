@@ -19,7 +19,7 @@ from . import config, store, workspaces
 KINDS = ("fix", "bug", "feature", "merge", "chore", "idea")
 STATUSES = ("open", "working", "parked", "done", "dropped")
 WHERE = ("here", "hermes", "herdr", "studio", "wiki", "orb")
-ABOUT_TYPES = ("commit", "request", "file", "component", "pr", "push", "conflict")
+ABOUT_TYPES = ("commit", "request", "file", "component", "pr", "push", "conflict", "issue")
 MAX_ABOUT = 12
 
 
