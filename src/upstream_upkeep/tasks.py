@@ -210,7 +210,7 @@ def _exclude_commit_file(path: str) -> None:
         ex.write_text(text + ("" if text.endswith("\n") or not text else "\n") + COMMIT_FILE + "\n")
 
 
-def agent_instructions(task: dict, repo: dict, workdir: str, review: bool = True) -> str:
+def agent_instructions(task: dict, repo: dict, workdir: str, review: bool = True, herdr: bool = False) -> str:
     """What every agent (Hermes, a herdr agent, a Studio run) is told about where and how to work."""
     focus = task.get("onto") or repo.get("focus_branch") or "main"
     lines = [
@@ -232,10 +232,15 @@ def agent_instructions(task: dict, repo: dict, workdir: str, review: bool = True
                  " (update_task to report progress).")
     w = task.get("where") or {}
     name = board_name(w) if w.get("type") == "herdr" and w.get("agent") else None
-    lines.append("This task is on Upstream Manager's board" + (f", held by you as \"{name}\"" if name else "") + ". With those tools: "
+    # Started in herdr (by Upstream or through Studio), the pane isn't known yet when this is written:
+    # the agent's own pane id (or herdr:<pane id>) works as its name on the board.
+    held = (f", held by you as \"{name}\"" if name else
+            ", held by you as herdr:<your herdr pane id> (your pane id alone works too)" if herdr or w.get("type") == "herdr" else "")
+    lines.append("This task is on Upstream Manager's board" + held + ". With those tools: "
                  + (f'use agent="{name}" in board calls; ' if name else "")
                  + "comment_task to note findings or ask the user (to=\"user\") or another agent; read_messages for what others "
-                 "tell you; overseer_plan for what else matters; when this is done, release_task as done and next_task for more.")
+                 "tell you; overseer_plan for what else matters; when this is done, release_task as done (it waits for the user's "
+                 "review until your change goes in) and next_task for more.")
     return "\n".join(lines)
 
 
@@ -326,7 +331,7 @@ def send_to(task_id: str, to: str, message: str | None = None, opts: dict | None
         if to == "herdr":
             opts = opts or {}
             text = message or brief(task, repo)
-            first = agent_instructions(task, repo, workdir) + "\n\n" + text
+            first = agent_instructions(task, repo, workdir, herdr=True) + "\n\n" + text
             env = {"UPSTREAM_TASK_ID": task_id, "UPSTREAM_REPO_ID": repo["id"],
                    **({"UPSTREAM_APP_URL": __import__("os").environ["UPSTREAM_APP_URL"]} if __import__("os").environ.get("UPSTREAM_APP_URL") else {})}
             where = None

@@ -51,6 +51,16 @@ def agent_name(name) -> str:
     return name
 
 
+def same_agent(holder: str | None, agent: str | None) -> bool:
+    """Whether `agent` is the one holding a claim. An agent Upstream started in herdr holds its task as
+    herdr:<pane>[@machine]; it knows itself by its pane id, so that counts too."""
+    if not holder or not agent:
+        return False
+    if holder == agent:
+        return True
+    return holder.startswith("herdr:") and holder[len("herdr:"):].split("@", 1)[0] == agent.removeprefix("herdr:").split("@", 1)[0]
+
+
 def claim_alive(t: dict, now: dt.datetime | None = None) -> bool:
     c = t.get("claimed_by") or {}
     until = _parse(c.get("until"))
@@ -122,9 +132,11 @@ def claim(task_id: str, agent: str, minutes: int = LEASE_MINUTES) -> dict:
     if t["status"] in ("done", "dropped"):
         raise BoardError(f"this task is {t['status']}")
     c = t.get("claimed_by") or {}
-    if claim_alive(t) and c.get("agent") != agent:
+    if claim_alive(t) and not same_agent(c.get("agent"), agent):
         raise BoardError(f"{c['agent']} is on it (until {c['until'][11:16]} UTC): pick another task, or message them")
     minutes = max(5, min(int(minutes or LEASE_MINUTES), 8 * 60))
+    if same_agent(c.get("agent"), agent):
+        agent = c["agent"]          # keep the name it is held under
     t["claimed_by"] = {"agent": agent, "at": c.get("at") if c.get("agent") == agent else config.now_iso(),
                        "until": _iso(_now() + dt.timedelta(minutes=minutes))}
     if t["status"] != "working":
@@ -144,6 +156,8 @@ def heartbeat(task_id: str, agent: str, note: str | None = None, minutes: int = 
     if not t:
         raise KeyError(task_id)
     c = t.get("claimed_by") or {}
+    if same_agent(c.get("agent"), agent):
+        agent = c["agent"]
     if c.get("agent") != agent:
         if claim_alive(t):
             raise BoardError(f"{c['agent']} has this task, not you")
@@ -166,12 +180,25 @@ def release(task_id: str, agent: str, status: str = "open", note: str | None = N
     if not t:
         raise KeyError(task_id)
     c = t.get("claimed_by") or {}
+    if same_agent(c.get("agent"), agent):
+        agent = c["agent"]
     if c.get("agent") not in (None, agent) and claim_alive(t):
         raise BoardError(f"{c['agent']} has this task, not you")
     if status not in ("open", "done", "parked"):
         raise BoardError("release it as open, done or parked")
     t["claimed_by"] = None
     t["log"].append({"at": config.now_iso(), "text": f"{agent} let it go: {status}" + (f" ({str(note)[:500]})" if note else "")})
+    if status == "done" and _awaits_review(t):
+        # its work is on the task's branch but not in yet: the agent is done, the task isn't. It stays in
+        # Working for the user to review and commit; approving it finishes it (and records it in the wiki).
+        t["log"].append({"at": config.now_iso(), "text": "waiting for your review: the change isn't in yet"})
+        from . import notify
+        notify.notify("stuck", f"Ready for your review: {t['title'][:80]}", f"{agent} finished; review and commit its changes.",
+                      level="info", path=f"/work?task={t['id']}", key=f"review:{t['id']}:{agent}", repo=t["repo_id"])
+        t["updated_at"] = config.now_iso()
+        _seen(agent, "")
+        store.save_state()
+        return t
     if status == "done" and t["status"] != "done":
         t["claimed_by"] = {"agent": agent}   # who finished it, for the wiki's note
         tasks.finished(t)
@@ -181,6 +208,26 @@ def release(task_id: str, agent: str, status: str = "open", note: str | None = N
     _seen(agent, "")
     store.save_state()
     return t
+
+
+def _awaits_review(t: dict) -> bool:
+    """A task whose change sits on its own branch (a herdr / Hermes / Studio agent's work) and hasn't gone in."""
+    w = t.get("where") or {}
+    if not w.get("workspace") or w.get("type") not in ("herdr", "hermes", "studio", "here"):
+        return False
+    repo = store.get_repo(t["repo_id"])
+    if not repo:
+        return False
+    from . import workspaces
+    try:
+        path = workspaces.path_of(repo, w["workspace"])
+    except workspaces.WorkspaceError:
+        return False      # the workspace is gone (approved and removed): nothing left to review
+    from . import gitops
+    dirty = gitops._run(["git", "status", "--porcelain"], cwd=str(path)).stdout.strip()
+    focus = t.get("onto") or repo.get("focus_branch") or "main"
+    ahead = gitops.behind_ahead(str(path), focus, "HEAD")[0]
+    return bool(dirty or ahead)
 
 
 # ------------------------------------------------------------------ comments and messages
@@ -199,7 +246,7 @@ def comment(task_id: str, by: str, text: str, to: str | None = None) -> dict:
         if by not in ("you", "overseer"):
             _seen(by)
             c = t.get("claimed_by") or {}
-            if c.get("agent") == by:        # talking about it counts as being on it
+            if same_agent(c.get("agent"), by):        # talking about it counts as being on it
                 c["until"] = _iso(max(_parse(c.get("until")) or _now(), _now() + dt.timedelta(minutes=LEASE_MINUTES)))
         store.save_state()
     if to and to not in ("user", "you"):

@@ -291,3 +291,26 @@ def test_approving_a_tasks_change_finishes_the_task(client, repo):
     assert client.post(f"/api/request/{req['id']}/decide", json={"decision": "approve"}).get_json()["ok"]
     done = tasks.get(t["id"])
     assert done["status"] == "done" and done["claimed_by"] is None and "was approved" in done["log"][-1]["text"]
+
+
+def test_a_herdr_agent_may_use_its_pane_id_and_its_done_waits_for_review(client, repo):
+    """Studio starts the agent before its pane id is known, so it may call itself by the pane id alone;
+    and "done" from an agent whose change isn't in yet means "over to you", not finished."""
+    from upstream_upkeep import workspaces
+    t = _task(client, "Routes")
+    ws = workspaces.open_workspace(store.get_repo("mine"), change="routes")
+    with store.lock:
+        tasks.get(t["id"])["status"] = "working"
+        tasks.get(t["id"])["where"] = {"type": "herdr", "via": "studio", "agent": "w8:p2", "workspace": ws["name"]}
+    board.hold(t["id"], "herdr:w8:p2")
+    assert "held by you as herdr:<your herdr pane id>" in tasks.agent_instructions(
+        {**tasks.get(t["id"]), "where": None}, store.get_repo("mine"), "/x", herdr=True)
+    assert client.post(f"/api/tasks/{t['id']}/heartbeat", json={"agent": "w8:p2", "note": "on it"}, headers=AGENT).get_json()["ok"]
+    assert tasks.get(t["id"])["claimed_by"]["agent"] == "herdr:w8:p2"            # still held under its board name
+    assert client.post(f"/api/tasks/{t['id']}/comments", json={"agent": "w8:p2", "text": "done, see branch"}, headers=AGENT).get_json()["ok"]
+    assert not client.post(f"/api/tasks/{t['id']}/claim", json={"agent": "w9:p2"}, headers=AGENT).get_json()["ok"]   # another pane can't
+    (Path(ws["path"]) / "routes.txt").write_text("new\n")                         # its change, uncommitted
+    r = client.post(f"/api/tasks/{t['id']}/release", json={"agent": "w8:p2", "status": "done"}, headers=AGENT).get_json()
+    assert r["ok"] and r["task"]["status"] == "working" and r["task"]["claimed_by"] is None
+    assert "waiting for your review" in r["task"]["log"][-1]["text"]
+    assert any(n["title"] == "Ready for your review: Routes" for n in notify.feed()["items"])
