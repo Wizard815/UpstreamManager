@@ -309,6 +309,96 @@ def import_mirror(source_url: str, name: str | None = None, private: bool = True
             "detail": f"{source_url} is mirrored to {r['html_url']} every {interval}"}
 
 
+# ------------------------------------------------------------ repos as a base for new ones
+def _made(r: dict) -> dict:
+    return {"owner": r["owner"]["login"], "repo": r["name"], "clone_url": r["clone_url"],
+            "web_url": r["html_url"], "private": r.get("private")}
+
+
+def search_repos(query: str = "", limit: int = 30) -> list[dict]:
+    """Repos on the forge the token can see (to pick a base), best match first."""
+    data = _api("GET", "/repos/search", params={"q": (query or "")[:100], "limit": max(1, min(int(limit), 50))}) or {}
+    return [{"full_name": r.get("full_name"), "description": r.get("description") or "", "private": r.get("private"),
+             "template": r.get("template"), "mirror": r.get("mirror"), "fork": r.get("fork"),
+             "clone_url": r.get("clone_url"), "web_url": r.get("html_url"), "default_branch": r.get("default_branch")}
+            for r in (data.get("data") if isinstance(data, dict) else data) or []]
+
+
+def fork(owner: str, repo: str, name: str = "", org: str | None = None, private: bool = True) -> dict:
+    """The forge's own fork: it keeps the link to the base (shown on the forge, PRs back to it work).
+    A fork starts with the base's visibility; private makes it private afterwards."""
+    body = {"name": name} if name else {}
+    if org:
+        body["organization"] = org
+    try:
+        made = _made(_api("POST", f"/repos/{quote(owner)}/{quote(repo)}/forks", json=body, timeout=300))
+    except ForgeError as e:
+        if "409" in str(e):
+            raise ForgeError(f"{name or repo} already exists there, or that account already has a fork of {owner}/{repo} (one per account): give another name, or fork into an org")
+        raise
+    except KeyError:
+        raise ForgeError("the forge answered the fork without the new repo")
+    if private and not made["private"]:
+        try:
+            made["private"] = bool(_api("PATCH", f"/repos/{quote(made['owner'])}/{quote(made['repo'])}", json={"private": True}).get("private"))
+        except ForgeError as e:
+            made["visibility_error"] = str(e)
+        if not made["private"]:
+            made.setdefault("visibility_error", "the forge keeps a fork as visible as its base: use copy for a private repo")
+    return made
+
+
+def generate(owner: str, repo: str, name: str, private: bool = True, new_owner: str = "") -> dict:
+    """A new repo from a template repo (its files, fresh history; no link back)."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", name or ""):
+        raise ForgeError("repo names may only use letters, digits, '.', '_' and '-'")
+    me = new_owner or _api("GET", "/user")["login"]
+    try:
+        return _made(_api("POST", f"/repos/{quote(owner)}/{quote(repo)}/generate", timeout=300, json={
+            "owner": me, "name": name, "private": bool(private), "git_content": True, "topics": True, "labels": True,
+            "webhooks": False, "avatar": True, "git_hooks": False}))
+    except ForgeError as e:
+        if "422" in str(e) or "404" in str(e):
+            raise ForgeError(f"{owner}/{repo} isn't a template repo: tick \"Template\" in its settings on the forge, or pick copy/fork")
+        if "409" in str(e):
+            raise ForgeError(f"a repo named {name} already exists on the forge")
+        raise
+
+
+# ------------------------------------------------------------ webhooks: the forge tells Upstream about pushes
+def hooks(owner: str, repo: str) -> list[dict]:
+    return [{"id": h.get("id"), "url": (h.get("config") or {}).get("url"), "events": h.get("events"), "active": h.get("active")}
+            for h in (_api("GET", f"/repos/{quote(owner)}/{quote(repo)}/hooks") or [])]
+
+
+def add_push_hook(owner: str, repo: str, target: str, secret: str) -> dict:
+    """A push webhook to Upstream (type gitea: Forgejo and Gitea both send it, signed with the secret)."""
+    if not target.startswith(("http://", "https://")):
+        raise ForgeError("Upstream's address as the forge reaches it starts with http:// or https://")
+    for h in hooks(owner, repo):
+        if h["url"] == target:
+            return {"ok": True, "detail": f"{owner}/{repo} already tells Upstream about pushes", "id": h["id"], "new": False}
+    h = _api("POST", f"/repos/{quote(owner)}/{quote(repo)}/hooks", json={
+        "type": "gitea", "active": True, "events": ["push", "create", "delete"], "branch_filter": "*",
+        "config": {"url": target, "content_type": "json", "secret": secret}})
+    return {"ok": True, "detail": f"{owner}/{repo} now tells Upstream about every push", "id": h.get("id"), "new": True}
+
+
+def verify_hook(body: bytes, headers, secret: str) -> bool:
+    """A delivery signed with the secret: X-Forgejo-Signature / X-Gitea-Signature (hex) or X-Hub-Signature-256."""
+    import hashlib
+    import hmac
+    if not secret:
+        return False
+    want = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    for name in ("X-Forgejo-Signature", "X-Gitea-Signature"):
+        got = (headers.get(name) or "").strip()
+        if got and hmac.compare_digest(got, want):
+            return True
+    got = (headers.get("X-Hub-Signature-256") or "").strip()
+    return bool(got) and hmac.compare_digest(got, "sha256=" + want)
+
+
 # ------------------------------------------------------------ CI and issues
 _RUN_STATE = {"success": "success", "failure": "failure", "cancelled": "cancelled", "skipped": "skipped",
               "running": None, "waiting": None, "blocked": None}

@@ -122,6 +122,33 @@ function requestLine(r) {
     : `merge ${u.behind} commit(s) from ${u.name}/${u.branch}` + (u.conflict ? `, conflicts in ${(u.conflict_files || []).slice(0, 3).join(", ")}` : u.ahead ? ` · ${u.ahead} of yours · merges cleanly` : "")).join("; ")
 }
 
+// Start a new repo on the home forge from a base: a forge repo (OWNER/REPO) or any git URL.
+// copy pushes the base's history into a new private repo and keeps the base as upstream;
+// fork is the forge's own fork; template copies a template repo's files with fresh history.
+function baseRow() {
+  const baseIn = el("input", { placeholder: "base: OWNER/REPO on the forge, or https://github.com/owner/repo", list: "forge-bases", "aria-label": "Base repo", style: "flex:2 1 300px" })
+  const list = el("datalist", { id: "forge-bases" })
+  baseIn.addEventListener("focus", () => {
+    if (list.childElementCount) return
+    api(apiUrl("/api/forge/repos")).then(r => { if (r.ok) list.replaceChildren(...r.repos.map(x => el("option", { value: x.full_name }, `${x.full_name}${x.template ? " (template)" : ""}${x.mirror ? " (mirror)" : ""}`))) }).catch(() => {})
+  }, { once: true })
+  const nameIn = el("input", { placeholder: "new name (optional)", "aria-label": "New repo name", style: "flex:1 1 140px" })
+  const mode = el("select", { "aria-label": "How to start from the base" },
+    el("option", { value: "copy" }, "copy (history, base stays upstream)"),
+    el("option", { value: "fork" }, "fork on the forge"),
+    el("option", { value: "template" }, "from template (fresh history)"))
+  const go = el("button", { class: "btn" }, "Start on forge")
+  go.onclick = () => busy(go, "Creating…", async () => {
+    if (!baseIn.value.trim()) return toast("Give the base repo", "info")
+    const r = await api(apiUrl("/api/forge/new"), { method: "POST", body: JSON.stringify({ base: baseIn.value.trim(), mode: mode.value, name: nameIn.value.trim() || undefined }) })
+    toast(r.ok ? r.detail : r.error, r.ok ? "ok" : "error")
+    if (r.ok) await renderRepos()
+  })
+  return el("div", { style: "margin-top:12px" },
+    el("strong", {}, "Or start a private repo on your forge from a base"),
+    el("div", { class: "row", style: "margin-top:6px" }, baseIn, list, mode, nameIn, go))
+}
+
 async function renderRepos() {
   const content = $("#content")
   content.replaceChildren(loading("Checking repos…"))
@@ -150,7 +177,8 @@ async function renderRepos() {
     })
   }
   addBox.append(el("div", { class: "row" }, urlIn, dirIn, nameIn, addBtn),
-    el("p", { class: "muted", style: "margin:8px 0 0" }, "A URL is cloned into the watch folder. A local folder is watched where it is. Add more upstreams on the repo's page."))
+    el("p", { class: "muted", style: "margin:8px 0 0" }, "A URL is cloned into the watch folder. A local folder is watched where it is. Add more upstreams on the repo's page."),
+    baseRow())
   const addToggle = el("button", { class: "btn ghost" }, "+ Add repo")
   addToggle.onclick = () => { addBox.hidden = !addBox.hidden; if (!addBox.hidden) urlIn.focus() }
   const fetchBtn = el("button", { class: "btn ghost" }, group ? `Fetch ${group}` : "Fetch all")
@@ -1240,6 +1268,12 @@ async function mirrorsCard(wrap, repoId, info) {
       if (left) row.append(mirror, add)
     }
     if (r.mirror || r.push_mirrors.length) row.append(syncBtn)
+    const hookBtn = el("button", { class: "btn ghost" }, "Tell Upstream about pushes")
+    hookBtn.onclick = () => busy(hookBtn, "Adding…", async () => {
+      const x = await api(apiUrl(`/api/repo/${repoId}/forge/webhook`), { method: "POST", body: JSON.stringify({ remote: r.remote }) })
+      toast(x.ok ? x.detail : (x.error || x.detail), x.ok ? "ok" : "error")
+    })
+    row.append(hookBtn)
     card.append(...lines, row)
   }
   card.append(el("div", { class: "muted", style: "font-size:12px;margin-top:4px" },
@@ -2310,6 +2344,7 @@ async function renderSettings() {
       accRow("forge_url", "Home forge address (Forgejo or Gitea), as this machine reaches it", "text", "http://forgejo:3000"),
       accRow("forge_token", "Home forge token (write:repository, write:issue, read:user)", "password", "token from the forge's Settings → Applications"),
       accRow("forge_default_home", "Default home: forge (a repo with a forge remote pushes there unless you pick another), or blank for origin", "text", "forge"),
+      accRow("forge_callback_url", "Upstream's address as the forge reaches it (for push webhooks), e.g. http://upstream-manager:5000", "text", "http://upstream-manager:5000"),
       accRow("forge_jobs_repo", "Forge jobs repo (OWNER/REPO that runner jobs go through; shared with Hermes), or blank for YOUR-LOGIN/hermes-jobs", "text", "wizard/hermes-jobs"),
       accRow("dockerhub_username", "Docker Hub username", "text", "username"),
       accRow("dockerhub_token", "Docker Hub access token (Account settings → Personal access tokens)", "password", "dckr_pat_…"),
@@ -2333,7 +2368,7 @@ async function renderSettings() {
     removeBtn.onclick = () => {
       if (!confirm("Remove the saved GitHub token, forge address and token, and Docker Hub login? (Environment variables are not affected.)")) return
       return busy(removeBtn, "Removing…", async () => {
-        await api(apiUrl('/api/credentials'), { method: "POST", body: JSON.stringify({ github_token: "", forge_url: "", forge_token: "", forge_default_home: "", forge_jobs_repo: "", dockerhub_username: "", dockerhub_token: "" }) })
+        await api(apiUrl('/api/credentials'), { method: "POST", body: JSON.stringify({ github_token: "", forge_url: "", forge_token: "", forge_default_home: "", forge_jobs_repo: "", forge_callback_url: "", dockerhub_username: "", dockerhub_token: "" }) })
         toast("Removed", "ok"); await renderSettings()
       })
     }

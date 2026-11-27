@@ -25,7 +25,9 @@ FIELDS = {
     "forge_url": "UPSTREAM_FORGE_URL",        # the homelab's Forgejo/Gitea, e.g. http://forgejo:3000 (see forge.py)
     "forge_token": "UPSTREAM_FORGE_TOKEN",    # an access token on that forge
     "forge_default_home": "UPSTREAM_FORGE_DEFAULT_HOME",
-    "forge_jobs_repo": "UPSTREAM_FORGE_JOBS_REPO",  # OWNER/REPO runner jobs go through; blank: LOGIN/hermes-jobs (forge.py)  # "forge": a repo with a forge remote pushes there unless you pick
+    "forge_jobs_repo": "UPSTREAM_FORGE_JOBS_REPO",
+    "forge_callback_url": "UPSTREAM_FORGE_CALLBACK_URL",  # Upstream as the forge reaches it, for push webhooks
+    "forge_webhook_secret": "UPSTREAM_FORGE_WEBHOOK_SECRET",  # signs the forge's webhooks (made on first use)  # OWNER/REPO runner jobs go through; blank: LOGIN/hermes-jobs (forge.py)  # "forge": a repo with a forge remote pushes there unless you pick
     "dockerhub_username": "UPSTREAM_DOCKERHUB_USERNAME",
     "dockerhub_token": "UPSTREAM_DOCKERHUB_TOKEN",
     "wiki_api_key": "UPSTREAM_WIKI_API_KEY",  # the vault's Obsidian Local REST API key
@@ -36,7 +38,7 @@ FIELDS = {
     "ntfy_token": "UPSTREAM_NTFY_TOKEN",          # an ntfy access token, for a protected topic
     "gotify_token": "UPSTREAM_GOTIFY_TOKEN",      # a Gotify application token  # the login Studio hands over when Upstream opens in its tab
 }
-SECRET_FIELDS = {"github_token", "forge_token", "dockerhub_token", "wiki_api_key", "orb_token", "hermes_api_key", "studio_token", "studio_proxy_token", "ntfy_token", "gotify_token"}  # usernames are not secret
+SECRET_FIELDS = {"github_token", "forge_token", "forge_webhook_secret", "dockerhub_token", "wiki_api_key", "orb_token", "hermes_api_key", "studio_token", "studio_proxy_token", "ntfy_token", "gotify_token"}  # usernames are not secret
 
 
 def _file() -> Path:

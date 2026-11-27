@@ -536,6 +536,24 @@ def workflow_health(repo: Annotated[str, Field(description="Only this repo (id f
     return [r for r in out if not repo or r.get("repo_id") == repo]
 
 
+# ------------------------------------------------------------------ the home forge
+@server.tool(annotations=READ)
+def forge_repos(query: Annotated[str, Field(description="Words in the repo's name; empty for all the token can see.")] = "") -> list[dict]:
+    """Repos on the user's home forge (Forgejo/Gitea): name, private, template, mirror, fork."""
+    return _call("GET", "/api/forge/repos", q=query)["repos"]
+
+
+@server.tool(annotations=WRITE)
+def forge_new_repo(base: Annotated[str, Field(min_length=3, description="OWNER/REPO on the forge, or a git URL such as https://github.com/owner/repo.")],
+                   mode: Annotated[Literal["copy", "fork", "template"], Field(description="copy: new private forge repo with the base's history, base kept as upstream "
+                                                                                     "(works for GitHub bases); fork: the forge's own fork of a forge repo; "
+                                                                                     "template: a forge template repo's files with fresh history.")] = "copy",
+                   name: Annotated[str, Field(description="Name of the new repo; empty for the base's name.")] = "") -> dict:
+    """Start a private repo on the home forge from a base, clone it here and watch it (home: the new forge repo).
+    Only when the user asked for a new repo."""
+    return _call("POST", "/api/forge/new", {"base": base, "mode": mode, "name": name}, 1900)
+
+
 # ------------------------------------------------------------------ test somewhere clean
 @server.tool(annotations=READ)
 def forge_runners() -> dict:

@@ -532,6 +532,38 @@ is in the Overseer repo, `deploy/forgejo/`.
   write access only to the repos you mirror.
 - Pull mirrors need an `https://` source: Forgejo refuses plain http.
 
+### Three ways a repo can live
+
+- **GitHub only.** Nothing changes: no forge needed.
+- **Home on the forge, upstream on GitHub.** Push and PRs go to the forge
+  copy (its home remote); the GitHub repo stays an upstream you merge from.
+  If the forge copy is a *pull mirror* of GitHub instead, Upstream pushes to
+  GitHub and then asks the forge to sync the copy right away.
+- **A forge repo as the base for new ones.** Repos → + Add repo → **Start on
+  forge** takes a base (`OWNER/REPO` on the forge, or any git URL such as a
+  GitHub repo) and:
+  - **copy**: a new private forge repo with the base's history and branches.
+    The base stays an upstream called `base`, so its new commits show up here.
+  - **fork**: the forge's own fork of a forge repo, with the link shown on the
+    forge. The forge allows one fork per account, and a fork is as visible as
+    its base, so use copy for a private repo of a public base.
+  - **template**: a forge template repo's files with fresh history. There is
+    no upstream, because there is nothing to merge from.
+
+  The new repo is cloned into the watch folder, and its home is the new forge
+  repo. Agents get `forge_repos` and `forge_new_repo` for the same thing.
+
+### Push webhooks
+
+**Tell Upstream about pushes** (Publish → Home forge and mirrors) adds a webhook
+on the forge repo. After that, a push there (to the home copy, a base, or a pull
+mirror fetching GitHub) fetches and checks the repo at once, instead of waiting
+for the daily check. First set **Upstream's address as the forge reaches it**
+in Settings → Accounts, e.g. `http://upstream-manager:5000` on ai_net.
+Deliveries are signed with a secret Upstream makes on first use, and unsigned
+ones get 401. If Forgejo refuses to deliver to that address, add the host to
+its `[webhook] ALLOWED_HOST_LIST`, e.g. `private` or the container name.
+
 ## Test somewhere clean (forge runners and Studio sandboxes)
 
 The Publish tab's **Test somewhere clean** card runs a command on what is
