@@ -187,13 +187,7 @@ def set_state(owner: str, repo: str, workflow_id: int, enable: bool) -> None:
 FAILED = ("failure", "timed_out", "startup_failure", "cancelled")
 
 
-def health(repo: dict, remote: str = "origin") -> dict:
-    """Does each workflow pass? Its latest run (with a link) and the outcome of its last 10 runs."""
-    url = gitops.remotes(repo["path"]).get(remote)
-    gh = github.parse_remote(url or "")
-    if not gh:
-        return {"ok": False, "error": f"{remote} is not a github.com repository"}
-    owner, name = gh
+def _github_items(owner: str, name: str) -> list[dict]:
     wfs = _get(f"/repos/{owner}/{name}/actions/workflows", {"per_page": 100}).get("workflows", [])
     runs = _get(f"/repos/{owner}/{name}/actions/runs", {"per_page": 100}).get("workflow_runs", [])
     by_wf: dict[int, list] = {}
@@ -211,6 +205,25 @@ def health(repo: dict, remote: str = "origin") -> dict:
                 "title": last.get("display_title")},
             "recent": [r.get("conclusion") or r.get("status") for r in rs[:10]],
         })
+    return items
+
+
+def health(repo: dict, remote: str = "origin") -> dict:
+    """Does each workflow pass? Its latest run (with a link) and the outcome of its last 10 runs.
+
+    GitHub Actions for a github.com remote, Forgejo Actions for a home-forge remote."""
+    url = gitops.remotes(repo["path"]).get(remote)
+    from . import forge
+    hit = forge.parse(url or "")
+    if hit and hit.forge == "forge":
+        fh = forge.actions_health(hit.owner, hit.repo)
+        owner, name, items, page, token = hit.owner, hit.repo, fh["items"], fh["url"], True
+    elif hit:
+        owner, name = hit.owner, hit.repo
+        page, token = f"https://github.com/{owner}/{name}/actions", bool(credentials.get("github_token"))
+        items = _github_items(owner, name)
+    else:
+        return {"ok": False, "error": f"{remote} is not on github.com or the home forge"}
     rank = {"failing": 0, "running": 1, "passing": 2, "skipped": 3, "no runs": 4, "disabled": 5}
     for i in items:
         c = (i["last"] or {}).get("conclusion")
@@ -218,6 +231,6 @@ def health(repo: dict, remote: str = "origin") -> dict:
                        else "running" if not c else "failing" if c in FAILED
                        else "passing" if c == "success" else "skipped")  # skipped/neutral is not a pass
     items.sort(key=lambda i: (rank[i["health"]], i["name"].lower()))
-    return {"ok": True, "owner": owner, "repo": name, "url": f"https://github.com/{owner}/{name}/actions",
-            "token": bool(credentials.get("github_token")), "workflows": items,
+    return {"ok": True, "owner": owner, "repo": name, "url": page, "forge": "forge" if hit.forge == "forge" else "github",
+            "token": token, "workflows": items,
             "counts": {k: sum(i["health"] == k for i in items) for k in rank}}

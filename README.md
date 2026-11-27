@@ -502,6 +502,98 @@ Each repo's **Publish** tab:
 - **Copy Docker Hub login to GitHub secrets** sets those two secrets on the
   repo, encrypted with the repo's public key.
 
+## Home forge (Forgejo or Gitea) and mirrors
+
+Repos can live on your own forge instead of, or as well as, GitHub. Set the
+forge's address and a token in **Settings → Accounts** (or
+`UPSTREAM_FORGE_URL` and `UPSTREAM_FORGE_TOKEN`). If the same forge answers
+under other addresses, list them in `UPSTREAM_FORGE_HOSTS`, comma separated
+(`forgejo:3000,192.168.20.5:3030`). The forge token is sent only to those
+hosts; the GitHub token only to github.com. The Unraid compose for the forge
+is in the Overseer repo, `deploy/forgejo/`.
+
+- **Home.** Each repo has one remote it pushes to by default. Pick it in
+  Publish with **Make home**; otherwise it is `origin`, or the repo's forge
+  remote when **Default home** in Settings → Accounts is `forge`
+  (`UPSTREAM_FORGE_DEFAULT_HOME=forge`). Pushes, pull requests and Actions
+  secrets go to whichever forge that remote is on.
+- **Workflows** shows each repo's home CI: GitHub Actions, or Forgejo Actions
+  for a forge home (the forge lists only workflows that have run).
+- **Import issues** reads issues from a GitHub or forge remote.
+- **Create private copy on the forge** makes an empty private repo there,
+  adds it as remote `forge`, and can make it home and mirror it on to the
+  repo's GitHub remote. Then push the branch as usual.
+- **Mirrors** are the forge's own. A push mirror sends every push on the forge
+  on to GitHub. A pull mirror (`POST /api/forge/import`) copies a GitHub repo
+  onto the forge and fetches it every 8 hours. **Sync now** runs either one.
+- Commit on one side only. A mirror stops at the first conflict, and the forge
+  shows the error under the repo's mirror settings.
+- The forge keeps the GitHub token for each mirror it runs, so give that token
+  write access only to the repos you mirror.
+- Pull mirrors need an `https://` source: Forgejo refuses plain http.
+
+### Three ways a repo can live
+
+- **GitHub only.** Nothing changes: no forge needed.
+- **Home on the forge, upstream on GitHub.** Push and PRs go to the forge
+  copy (its home remote); the GitHub repo stays an upstream you merge from.
+  If the forge copy is a *pull mirror* of GitHub instead, Upstream pushes to
+  GitHub and then asks the forge to sync the copy right away.
+- **A forge repo as the base for new ones.** Repos → + Add repo → **Start on
+  forge** takes a base (`OWNER/REPO` on the forge, or any git URL such as a
+  GitHub repo) and:
+  - **copy**: a new private forge repo with the base's history and branches.
+    The base stays an upstream called `base`, so its new commits show up here.
+  - **fork**: the forge's own fork of a forge repo, with the link shown on the
+    forge. The forge allows one fork per account, and a fork is as visible as
+    its base, so use copy for a private repo of a public base.
+  - **template**: a forge template repo's files with fresh history. There is
+    no upstream, because there is nothing to merge from.
+
+  The new repo is cloned into the watch folder, and its home is the new forge
+  repo. Agents get `forge_repos` and `forge_new_repo` for the same thing.
+
+### Push webhooks
+
+**Tell Upstream about pushes** (Publish → Home forge and mirrors) adds a webhook
+on the forge repo. After that, a push there (to the home copy, a base, or a pull
+mirror fetching GitHub) fetches and checks the repo at once, instead of waiting
+for the daily check. First set **Upstream's address as the forge reaches it**
+in Settings → Accounts, e.g. `http://upstream-manager:5000` on ai_net.
+Deliveries are signed with a secret Upstream makes on first use, and unsigned
+ones get 401. If Forgejo refuses to deliver to that address, add the host to
+its `[webhook] ALLOWED_HOST_LIST`, e.g. `private` or the container name.
+
+## Test somewhere clean (forge runners and Studio sandboxes)
+
+The Publish tab's **Test somewhere clean** card runs a command on what is
+pushed (the current branch), away from this machine. Agents get the same as
+the MCP tools `forge_job_run`, `forge_job_status`, `forge_runners`,
+`try_in_sandbox` and `sandbox`.
+
+- **Run on forge runner** runs it on one of the forge's runners, like CI, with
+  the repo's forge copy checked out. Type the runner label: `ubuntu-latest`,
+  or your GPU runner's label (`gpu`). An image runs it in that container.
+  Press **Set up jobs** once: it makes a private `YOUR-LOGIN/hermes-jobs` repo
+  (or the one in Settings → Accounts, **Forge jobs repo**) with the job
+  workflow and a `JOBS_TOKEN` secret for checkouts from **Forge jobs token**
+  (`UPSTREAM_FORGE_JOBS_TOKEN`, a read-only `read:repository` token). It never
+  hands jobs the forge token, which can write every repo, and the checkout
+  leaves no token where the command can read it. Without a jobs token, jobs can
+  check out only public repos. Hermes's forgejo skill uses the
+  same repo and file. A GitHub-only repo needs a forge copy or pull mirror
+  first.
+- **Run in Studio sandbox** makes a throwaway container on Hermes Studio's
+  machine (ubuntu, debian, fedora, rocky, alpine, arch, opensuse, or node,
+  python and go images), copies the repo in, runs the command and removes it.
+  **No network** cuts it off from everything; **keep it** leaves it for more
+  commands (Studio's Test Lab page lists and removes sandboxes). Needs the
+  Hermes Studio connection.
+
+What goes wrong: a job that stays **waiting** means no idle runner has that
+label. "no job workflow" means **Set up jobs** wasn't run. "Studio isn't set
+up" means the Hermes Studio connection is off (Settings → Hermes Studio).
+
 ## Actions (forks)
 
 A fork runs every workflow it inherits, and upstream's release, deploy and

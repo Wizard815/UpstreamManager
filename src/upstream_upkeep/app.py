@@ -35,7 +35,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, render_template_string, abort, send_file
 
-from . import (actions, autoapprove, board, issues, notify, overseer, agent_context, components, config, credentials, daily_check, edits, github, gitops, hermes,
+from . import (actions, autoapprove, board, issues, notify, overseer, agent_context, components, config, credentials, daily_check, edits, forge, github, gitops, hermes,
                herdr, memory, orb, pull_report, references, registry, services, stacks, storage, store, studio, tasks, upstream_check, wiki, workflows, workspaces)
 from .store import settings as get_settings, save_settings
 
@@ -396,7 +396,7 @@ def api_credentials_save():
 def api_credentials_test():
     which = (request.get_json(silent=True) or {}).get("which")
     try:
-        info = github.whoami() if which == "github" else github.dockerhub_check()
+        info = github.whoami() if which == "github" else forge.whoami() if which == "forge" else github.dockerhub_check()
     except github.GitHubError as e:
         return jsonify({"ok": False, "error": str(e)})
     return jsonify({"ok": True, **info})
@@ -404,11 +404,27 @@ def api_credentials_test():
 
 # ------------------------------------------------------------ publish
 def _github_remotes(repo: dict) -> list[dict]:
+    """Every remote, with the forge it is on ("github", "forge" for the homelab's
+    Forgejo/Gitea, or None) and its owner/repo there."""
     out = []
     for name, url in gitops.remotes(repo["path"]).items():
-        gh = github.parse_remote(url)
-        out.append({"name": name, "url": url, "owner": gh[0] if gh else None, "repo": gh[1] if gh else None})
+        r = forge.parse(url)
+        out.append({"name": name, "url": url, "forge": r.forge if r else None,
+                    "owner": r.owner if r else None, "repo": r.repo if r else None})
     return out
+
+
+def _home_remote(repo: dict, remotes: list[dict]) -> str | None:
+    """The remote this repo pushes to by default: the one picked for it, else its forge remote when the
+    default home is the forge (Settings -> Accounts), else origin."""
+    names = [r["name"] for r in remotes]
+    if repo.get("home_remote") in names:
+        return repo["home_remote"]
+    if (credentials.get("forge_default_home") or "").strip().lower() == "forge":
+        on_forge = [r["name"] for r in remotes if r.get("forge") == "forge"]
+        if on_forge:
+            return "origin" if "origin" in on_forge else on_forge[0]
+    return "origin" if "origin" in names else (names[0] if names else None)
 
 
 @flask_app.route("/api/repo/<repo_id>/publish")
@@ -422,9 +438,11 @@ def api_publish_info(repo_id):
     for r in remotes:
         ref = f"refs/remotes/{r['name']}/{branch}"
         r["ahead"] = gitops.behind_ahead(repo["path"], branch, ref)[1] if gitops.ref_exists(repo["path"], ref) else None
-    origin = next((r for r in remotes if r["name"] == "origin" and r["owner"]), next((r for r in remotes if r["owner"]), None))
+    origin = next((r for r in remotes if r["name"] == "origin" and r["forge"] == "github"), next((r for r in remotes if r["forge"] == "github"), None))
     return jsonify({"ok": True, "branch": branch, "remotes": remotes, "owner": origin and origin["owner"],
-                    "github_repo": origin and origin["repo"], "accounts": credentials.public(),
+                    "github_repo": origin and origin["repo"], "home": _home_remote(repo, remotes),
+                    "forge": {"configured": forge.configured(), "url": forge.url() or None},
+                    "accounts": credentials.public(),
                     "dockerfiles": workflows.detect(repo), "workflows": workflows.existing(repo)})
 
 
@@ -435,9 +453,10 @@ def api_push_request(repo_id):
     if not repo:
         abort(404)
     data = request.get_json(force=True) or {}
-    remote = data.get("remote") or "origin"
+    remotes = _github_remotes(repo)
+    remote = data.get("remote") or _home_remote(repo, remotes) or "origin"
     branch = gitops.current_branch(repo["path"])
-    rem = next((r for r in _github_remotes(repo) if r["name"] == remote), None)
+    rem = next((r for r in remotes if r["name"] == remote), None)
     if not rem:
         return jsonify({"ok": False, "error": f"no remote named {remote}"}), 400
     ref = f"refs/remotes/{remote}/{branch}"
@@ -450,11 +469,29 @@ def api_push_request(repo_id):
         "id": f"{repo['id']}:push:{branch}", "type": "push", "repo_id": repo["id"], "repo_name": repo["name"],
         "focus_branch": branch, "remote": remote, "remote_url": rem["url"], "branch": branch,
         "head": gitops.short_sha(repo["path"], f"refs/heads/{branch}"),
-        "open_pr": pr, "base": base, "owner": rem["owner"], "github_repo": rem["repo"],
+        "open_pr": pr, "base": base, "owner": rem["owner"], "github_repo": rem["repo"], "forge": rem["forge"] or "github",
         "commits": commits, "safe": True, "status": "pending", "created_at": config.now_iso(),
         "comment": None, "decided_at": None, "upstreams": [], "conflicts": [],
     })
     return jsonify({"ok": True, "request": store.snapshot(rec)})
+
+
+def _sync_forge_mirrors_of(repo: dict, pushed_url: str) -> list[dict]:
+    """After a push to GitHub: a forge copy of this repo that pull-mirrors that GitHub repo fetches now,
+    instead of at its next scheduled sync, so the forge (and its runners) see the commit."""
+    gh = github.parse_remote(pushed_url)
+    if not gh or not forge.configured():
+        return []
+    out = []
+    for r in (x for x in _github_remotes(repo) if x["forge"] == "forge"):
+        try:
+            info = forge.repo_info(r["owner"], r["repo"])
+            if info and info["mirror"] and github.parse_remote(info.get("original_url") or "") == gh:
+                forge.sync(r["owner"], r["repo"])
+                out.append({"upstream": f"forge mirror {r['owner']}/{r['repo']}", "ok": True, "detail": "the forge copy is fetching it now"})
+        except github.GitHubError as e:
+            out.append({"upstream": f"forge mirror {r['owner']}/{r['repo']}", "ok": False, "detail": str(e)})
+    return out
 
 
 def _do_push(repo: dict, req: dict) -> list[dict]:
@@ -464,12 +501,13 @@ def _do_push(repo: dict, req: dict) -> list[dict]:
     except github.GitHubError as e:
         return [{"upstream": req["remote"], "ok": False, "detail": str(e)}]
     out = [{"upstream": req["remote"], "ok": True, "detail": f"{res['detail']} (using {res['auth']})"}]
+    out += _sync_forge_mirrors_of(repo, req.get("remote_url") or "")
     if req.get("open_pr"):
         subjects = "\n".join(f"- {c['subject']}" for c in (req.get("commits") or [])[:20])
         try:
             pr = github.open_pr(req["owner"], req["github_repo"], req["branch"], req["base"],
                                 (req.get("commits") or [{}])[0].get("subject") or req["branch"],
-                                f"Commits:\n{subjects}\n\nOpened from Upstream Manager.")
+                                f"Commits:\n{subjects}\n\nOpened from Upstream Manager.", forge=req.get("forge") or "github")
             out.append({"upstream": "pull request", "ok": True, "url": pr["url"],
                         "detail": f"{'existing' if pr['existing'] else 'opened'} PR #{pr['number']}: {pr['url']}"})
         except github.GitHubError as e:
@@ -498,23 +536,444 @@ def api_docker_workflow(repo_id):
 
 @flask_app.route("/api/repo/<repo_id>/github/secrets", methods=["POST"])
 def api_github_secrets(repo_id):
-    """Copy the saved Docker Hub login into the GitHub repo's Actions secrets."""
+    """Copy the saved Docker Hub login into the repo's Actions secrets (GitHub or the forge)."""
     repo = registry.get_repo(repo_id)
     if not repo:
         abort(404)
     rem = next((r for r in _github_remotes(repo) if r["name"] == ((request.get_json(silent=True) or {}).get("remote") or "origin")), None)
     if not rem or not rem["owner"]:
-        return jsonify({"ok": False, "error": "this repo has no github.com remote"})
+        return jsonify({"ok": False, "error": "this remote is not on github.com or the forge"})
     values = {"DOCKERHUB_USERNAME": credentials.get("dockerhub_username"), "DOCKERHUB_TOKEN": credentials.get("dockerhub_token")}
     if not all(values.values()):
         return jsonify({"ok": False, "error": "save your Docker Hub username and access token first (Settings -> Accounts)"})
     try:
         for name, value in values.items():
-            github.set_secret(rem["owner"], rem["repo"], name, value)
-        names = github.secret_names(rem["owner"], rem["repo"])
+            github.set_secret(rem["owner"], rem["repo"], name, value, forge=rem["forge"])
+        names = github.secret_names(rem["owner"], rem["repo"], forge=rem["forge"])
     except github.GitHubError as e:
         return jsonify({"ok": False, "error": str(e)})
     return jsonify({"ok": True, "repo": f"{rem['owner']}/{rem['repo']}", "secrets": names})
+
+
+# ------------------------------------------------------------ forge: home remote and mirrors
+# The homelab's own Forgejo/Gitea (forge.py). A repo's "home" is the remote it
+# pushes to by default; mirrors on the forge keep GitHub (or an upstream) in step.
+def _forge_remote(repo: dict, name: str | None) -> dict | None:
+    rems = [r for r in _github_remotes(repo) if r["forge"] == "forge"]
+    return next((r for r in rems if r["name"] == name), None) if name else (rems[0] if rems else None)
+
+
+@flask_app.route("/api/forge")
+def api_forge():
+    return jsonify({"ok": True, "configured": forge.configured(), "url": forge.url() or None,
+                    "hosts": sorted(forge.hosts()), "token": credentials.public()["forge_token"]["set"]})
+
+
+@flask_app.route("/api/repo/<repo_id>/home", methods=["POST"])
+def api_repo_home(repo_id):
+    """Pick the remote this repo pushes to by default (GitHub, the forge, anything)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    name = (request.get_json(force=True) or {}).get("remote")
+    if name not in gitops.remotes(repo["path"]):
+        return jsonify({"ok": False, "error": f"no remote named {name}"}), 400
+    with store.lock:
+        repo["home_remote"] = name
+        store.save_repo(repo)
+    return jsonify({"ok": True, "home": name})
+
+
+@flask_app.route("/api/repo/<repo_id>/mirrors")
+def api_repo_mirrors(repo_id):
+    """The forge copy of this repo: whether it is a pull mirror, and its push mirrors."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    if not forge.configured():
+        return jsonify({"ok": True, "configured": False, "remotes": []})
+    out = []
+    for rem in (r for r in _github_remotes(repo) if r["forge"] == "forge"):
+        try:
+            info = forge.repo_info(rem["owner"], rem["repo"])
+            mirrors = forge.push_mirrors(rem["owner"], rem["repo"]) if info else []
+            out.append({"remote": rem["name"], "found": info is not None, **(info or {}), "push_mirrors": mirrors})
+        except github.GitHubError as e:
+            out.append({"remote": rem["name"], "error": str(e)})
+    github_remotes = [{"name": r["name"], "url": f"https://github.com/{r['owner']}/{r['repo']}"}
+                      for r in _github_remotes(repo) if r["forge"] == "github"]
+    return jsonify({"ok": True, "configured": True, "url": forge.url(), "remotes": out, "github": github_remotes})
+
+
+@flask_app.route("/api/repo/<repo_id>/forge/create", methods=["POST"])
+def api_repo_forge_create(repo_id):
+    """Make a private copy of this repo on the forge: create it there, add a git
+    remote for it, and optionally make it home and mirror it on to GitHub.
+    Nothing is pushed here: push the branch from Publish (an approval request)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    data = request.get_json(force=True) or {}
+    remote = data.get("remote") or "forge"
+    if remote in gitops.remotes(repo["path"]):
+        return jsonify({"ok": False, "error": f"this repo already has a remote named {remote}"}), 400
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", remote):
+        return jsonify({"ok": False, "error": "remote name may only use letters, digits, '.', '_' and '-'"}), 400
+    try:
+        made = forge.create_repo(data.get("name") or repo["name"], private=data.get("private", True) is not False,
+                                 description=data.get("description") or "", org=data.get("org") or None)
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    res = gitops._run(["git", "remote", "add", remote, made["clone_url"]], cwd=repo["path"])
+    if res.returncode != 0:
+        return jsonify({"ok": False, "error": (res.stderr or res.stdout).strip() or "git remote add failed",
+                        "created": made})
+    out = {"ok": True, "created": made, "remote": remote, "detail": [f"created {made['web_url']} and added remote {remote}"]}
+    if data.get("make_home"):
+        with store.lock:
+            repo["home_remote"] = remote
+            store.save_repo(repo)
+        out["detail"].append(f"{remote} is now this repo's home")
+    if data.get("mirror_to"):
+        try:
+            out["detail"].append(forge.add_push_mirror(made["owner"], made["repo"], data["mirror_to"])["detail"])
+        except github.GitHubError as e:
+            out["mirror_error"] = str(e)
+    return jsonify(out)
+
+
+@flask_app.route("/api/repo/<repo_id>/mirrors/push", methods=["POST"])
+def api_repo_mirror_add(repo_id):
+    """Mirror the forge copy to a GitHub repo: every push to the forge goes on to GitHub."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    data = request.get_json(force=True) or {}
+    rem = _forge_remote(repo, data.get("remote"))
+    if not rem:
+        return jsonify({"ok": False, "error": "this repo has no remote on the forge"})
+    try:
+        return jsonify(forge.add_push_mirror(rem["owner"], rem["repo"], data.get("to") or "",
+                                             interval=data.get("interval") or "8h",
+                                             sync_on_commit=data.get("sync_on_commit", True) is not False))
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/repo/<repo_id>/mirrors/push/remove", methods=["POST"])
+def api_repo_mirror_remove(repo_id):
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    data = request.get_json(force=True) or {}
+    rem = _forge_remote(repo, data.get("remote"))
+    if not rem:
+        return jsonify({"ok": False, "error": "this repo has no remote on the forge"})
+    try:
+        forge.remove_push_mirror(rem["owner"], rem["repo"], data.get("name") or "")
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/repo/<repo_id>/mirrors/sync", methods=["POST"])
+def api_repo_mirror_sync(repo_id):
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    rem = _forge_remote(repo, (request.get_json(silent=True) or {}).get("remote"))
+    if not rem:
+        return jsonify({"ok": False, "error": "this repo has no remote on the forge"})
+    try:
+        return jsonify(forge.sync(rem["owner"], rem["repo"]))
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/forge/import", methods=["POST"])
+def api_forge_import():
+    """Copy a GitHub repo onto the forge as a pull mirror that keeps fetching it."""
+    data = request.get_json(force=True) or {}
+    try:
+        return jsonify({"ok": True, **forge.import_mirror(data.get("url") or "", name=data.get("name") or None,
+                                                         private=data.get("private", True) is not False,
+                                                         interval=data.get("interval") or "8h")})
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+# ------------------------------------------------------------ a repo as the base for a new one
+# Three ways to start a repo on the forge from another one, then watch it here:
+#   copy      a new private forge repo with the base's full history pushed in; the base (a forge repo
+#             or any git URL, e.g. GitHub) stays an upstream, so its changes show up like any upstream's
+#   fork      the forge's own fork of a forge repo (the forge shows the link; needs another owner or an org)
+#   template  a forge template repo's files with fresh history (no upstream: nothing to merge from)
+def _base_url(base: str) -> tuple[str, "forge.Remote | None"]:
+    base = (base or "").strip()
+    if re.fullmatch(r"\w[\w.-]*/\w[\w.-]*", base):
+        if not forge.configured():
+            raise github.GitHubError("no forge set up (Settings -> Accounts)")
+        return f"{forge.url()}/{base}.git", forge.Remote("forge", *base.split("/", 1))
+    if not base.startswith(("https://", "http://", "git@", "ssh://")) or base.startswith("-"):
+        raise github.GitHubError("the base is OWNER/REPO on the forge, or a git URL (e.g. https://github.com/owner/repo)")
+    return base, forge.parse(base)
+
+
+def _git_auth(url: str) -> dict | None:
+    """The token for url's host: the forge token for the forge, the GitHub token for github.com."""
+    env = gitops.forge_env(url)
+    if env is None and url.startswith("https://github.com/") and credentials.get("github_token"):
+        env = github.auth_env(credentials.get("github_token"))
+    return env
+
+
+@flask_app.route("/api/forge/repos")
+def api_forge_repos():
+    try:
+        return jsonify({"ok": True, "repos": forge.search_repos(request.args.get("q") or "")})
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e), "repos": []})
+
+
+@flask_app.route("/api/forge/new", methods=["POST"])
+def api_forge_new():
+    """Start a forge repo from a base ({base, mode copy|fork|template, name, private, org}), clone it and watch it."""
+    d = request.get_json(force=True) or {}
+    mode = d.get("mode") or "copy"
+    if mode not in ("copy", "fork", "template"):
+        return jsonify({"ok": False, "error": "mode is copy, fork or template"})
+    try:
+        base_url, base = _base_url(d.get("base") or "")
+        name = (d.get("name") or (base.repo if base else re.sub(r"\.git$", "", base_url.rstrip("/").rsplit("/", 1)[-1]))).strip()
+        private = d.get("private", True) is not False
+        if mode != "copy" and not (base and base.forge == "forge"):
+            raise github.GitHubError(f"{mode} needs a base repo on the forge; use copy for a GitHub or other base")
+        if mode == "fork":
+            made = forge.fork(base.owner, base.repo, name if (name != base.repo or d.get("org")) else "", org=d.get("org") or None, private=private)
+        elif mode == "template":
+            made = forge.generate(base.owner, base.repo, name, private=private, new_owner=d.get("org") or "")
+        else:
+            made = forge.create_repo(name, private=private, description=f"Based on {base_url}"[:255], org=d.get("org") or None)
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    dest = registry.repo_dir_for_url(registry.WATCH_FOLDERS[0], made["clone_url"])
+    if os.path.exists(dest):
+        return jsonify({"ok": False, "error": f"{dest} already exists here; the forge repo {made['owner']}/{made['repo']} was made, add it by URL"})
+    steps = [f"made {made['web_url']} ({mode}{', private' if made.get('private') else ', NOT private'})"]
+    if made.get("visibility_error"):
+        steps.append(made["visibility_error"])
+    try:
+        if mode == "copy":
+            res = gitops._run(["git", "clone", "--", base_url, dest], timeout=1800, extra_env=_git_auth(base_url))
+            if res.returncode != 0:
+                raise github.GitHubError(f"could not clone the base: {(res.stderr or res.stdout).strip()[-300:]}")
+            gitops._run(["git", "remote", "rename", "origin", "base"], cwd=dest)
+            gitops._run(["git", "remote", "add", "origin", made["clone_url"]], cwd=dest)
+            branches = [b.strip() for b in gitops._run(["git", "for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/base"], cwd=dest).stdout.split() if b.strip() not in ("", "HEAD")]
+            refspecs = [f"refs/remotes/base/{b}:refs/heads/{b}" for b in branches]
+            res = gitops._run(["git", "push", "origin", *refspecs, "--tags"], cwd=dest, timeout=1800, extra_env=gitops.forge_env(made["clone_url"]))
+            if res.returncode != 0:
+                raise github.GitHubError(f"could not push the base into the new repo: {(res.stderr or res.stdout).strip()[-300:]}")
+            gitops._run(["git", "fetch", "origin"], cwd=dest, extra_env=gitops.forge_env(made["clone_url"]))
+            steps.append(f"pushed {len(branches)} branch(es) and the tags from the base")
+        else:
+            gitops.clone_into(dest, made["clone_url"])
+            if mode == "fork":
+                gitops._run(["git", "remote", "add", "base", base_url], cwd=dest)
+                gitops.fetch(dest, "base")
+    except (github.GitHubError, gitops.GitError) as e:
+        return jsonify({"ok": False, "error": str(e), "made": made})
+    repo = registry.add_repo(dest, None, d.get("label") or made["repo"])
+    with store.lock:
+        repo = store.get_repo(repo["id"])
+        repo["home_remote"] = "origin"   # pushes go to the new forge repo; the base stays an upstream
+        store.save_repo(repo)
+    steps.append(f"cloned into {dest} and watching it" + (" with the base as upstream" if mode != "template" else ""))
+    return jsonify({"ok": True, "repo": repo["id"], "made": made, "detail": "; ".join(steps)})
+
+
+# ------------------------------------------------------------ forge webhooks
+# The forge tells Upstream about pushes, so a push there (a commit on the home copy, a pull mirror
+# fetching GitHub, a base repo moving on) shows here at once instead of at the next check.
+def _webhook_secret() -> str:
+    secret = credentials.get("forge_webhook_secret")
+    if not secret:
+        import secrets as _secrets
+        secret = _secrets.token_hex(24)
+        credentials.set("forge_webhook_secret", secret)
+    return secret
+
+
+@flask_app.route("/api/repo/<repo_id>/forge/webhook", methods=["POST"])
+def api_repo_forge_webhook(repo_id):
+    """Ask the forge to tell Upstream about pushes to this repo's forge remotes (home copy and base)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    target = (credentials.get("forge_callback_url") or "").strip().rstrip("/")
+    if not target:
+        return jsonify({"ok": False, "error": "set Upstream's address as the forge reaches it (Settings -> Accounts, e.g. http://upstream-manager:5000)"})
+    want = (request.get_json(silent=True) or {}).get("remote")
+    rems = [r for r in _github_remotes(repo) if r["forge"] == "forge" and want in (None, "", r["name"])]
+    if not rems:
+        return jsonify({"ok": False, "error": "this repo has no remote on the forge"})
+    out = []
+    for r in rems:
+        try:
+            out.append({"remote": r["name"], **forge.add_push_hook(r["owner"], r["repo"], f"{target}/api/hooks/forge", _webhook_secret())})
+        except github.GitHubError as e:
+            out.append({"remote": r["name"], "ok": False, "detail": str(e)})
+    return jsonify({"ok": all(x["ok"] for x in out), "items": out, "detail": "; ".join(x["detail"] for x in out)})
+
+
+def _hook_targets(full_name: str) -> list[tuple[dict, list[dict]]]:
+    """Watched repos with a remote on forge repo owner/name, and those remotes' upstream entries."""
+    out = []
+    for repo in registry.get_watching_repos():
+        names = {r["name"] for r in _github_remotes(repo) if r["forge"] == "forge" and f"{r['owner']}/{r['repo']}".lower() == full_name.lower()}
+        if names:
+            out.append((repo, [u for u in repo.get("upstreams", []) if u.get("name") in names and u.get("enabled", True)] or [{"name": n} for n in names]))
+    return out
+
+
+_HOOK_RUNS: dict = {}
+
+
+@flask_app.route("/api/hooks/forge", methods=["POST"])
+def api_hooks_forge():
+    """A push (or branch made/removed) on the forge: fetch the matching remotes of every watched repo and check them."""
+    raw = request.get_data(cache=True)
+    if not forge.verify_hook(raw, request.headers, credentials.get("forge_webhook_secret") or ""):
+        return jsonify({"ok": False, "error": "bad or missing signature"}), 401
+    event = request.headers.get("X-Forgejo-Event") or request.headers.get("X-Gitea-Event") or request.headers.get("X-GitHub-Event") or ""
+    body = request.get_json(silent=True) or {}
+    full = ((body.get("repository") or {}).get("full_name") or "").strip()
+    if event == "ping" or not full:
+        return jsonify({"ok": True, "event": event or "ping", "repos": []})
+    targets = _hook_targets(full)
+
+    def go():
+        for repo, ups in targets:
+            try:
+                upstream_check.build_merge_plan(repo["path"], repo["id"], repo["name"], ups,
+                                                focus_branch=repo.get("focus_branch"), fetch=True)
+                for u in ups:   # a remote that is home but not an upstream is fetched too
+                    if not u.get("url"):
+                        gitops.fetch(repo["path"], u["name"])
+                _HOOK_RUNS[repo["id"]] = {"at": config.now_iso(), "event": event, "forge_repo": full, "ok": True}
+            except Exception as e:  # a webhook must never take the app down
+                _HOOK_RUNS[repo["id"]] = {"at": config.now_iso(), "event": event, "forge_repo": full, "ok": False, "error": str(e)}
+
+    threading.Thread(target=go, daemon=True, name="forge-hook").start()
+    return jsonify({"ok": True, "event": event, "repos": [r["id"] for r, _ in targets]}), 202
+
+
+# ------------------------------------------------------------ test somewhere clean
+# Two places to run a repo's build or tests away from this machine: the forge's own runners
+# (forge.job_run: ubuntu-latest, gpu, ...) and Studio's throwaway sandboxes (studio.try_in_sandbox:
+# any distro, internet or offline). Both use what is pushed, not uncommitted work.
+@flask_app.route("/api/forge/runners")
+def api_forge_runners():
+    try:
+        return jsonify({"ok": True, "runners": forge.runners()})
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e), "runners": []})
+
+
+@flask_app.route("/api/forge/jobs/setup", methods=["POST"])
+def api_forge_jobs_setup():
+    try:
+        return jsonify(forge.job_setup())
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/forge/jobs", methods=["POST"])
+def api_forge_job_run():
+    """Run one command on a forge runner, with a forge repo (OWNER/REPO) checked out if given."""
+    d = request.get_json(force=True) or {}
+    try:
+        return jsonify(forge.job_run(d.get("command") or "", runner=d.get("runner") or "ubuntu-latest", image=d.get("image") or "",
+                                     repo=d.get("repo") or "", ref=d.get("ref") or "", title=d.get("title") or ""))
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/forge/jobs/<int:run_id>/cancel", methods=["POST"])
+def api_forge_job_cancel(run_id):
+    try:
+        return jsonify(forge.job_cancel(run_id))
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/forge/jobs/<int:run_id>")
+def api_forge_job_status(run_id):
+    try:
+        return jsonify(forge.job_status(run_id, logs=int(request.args.get("logs") or 80)))
+    except (github.GitHubError, ValueError) as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+def _test_target(repo: dict, remote: str | None) -> dict | None:
+    """The remote a clean test uses: the one asked for, else the repo's home remote."""
+    remotes = _github_remotes(repo)
+    name = remote or _home_remote(repo, remotes)
+    return next((r for r in remotes if r["name"] == name), None)
+
+
+@flask_app.route("/api/repo/<repo_id>/forge/job", methods=["POST"])
+def api_repo_forge_job(repo_id):
+    """Run a command on a forge runner with this repo's forge copy checked out (its current branch unless ref)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    d = request.get_json(force=True) or {}
+    rem = _forge_remote(repo, d.get("remote"))
+    if not rem:
+        return jsonify({"ok": False, "error": "this repo has no remote on the forge: make a forge copy (Publish → Home forge) or a pull mirror first"})
+    try:
+        return jsonify(forge.job_run(d.get("command") or "", runner=d.get("runner") or "ubuntu-latest", image=d.get("image") or "",
+                                     repo=f"{rem['owner']}/{rem['repo']}", ref=d.get("ref") or gitops.current_branch(repo["path"]),
+                                     title=d.get("title") or f"{rem['repo']}: {(d.get('command') or '')[:80]}"))
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/sandboxes")
+def api_sandboxes():
+    try:
+        return jsonify({"ok": True, **studio.sandbox("list")})
+    except studio.StudioError as e:
+        return jsonify({"ok": False, "error": str(e), "sandboxes": [], "distros": {}})
+
+
+@flask_app.route("/api/sandboxes/<action>", methods=["POST"])
+def api_sandbox_action(action):
+    try:
+        return jsonify({"ok": True, **studio.sandbox(action, request.get_json(silent=True) or {})})
+    except studio.StudioError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/repo/<repo_id>/sandbox", methods=["POST"])
+def api_repo_sandbox(repo_id):
+    """Try this repo in a throwaway Studio sandbox: copy it in (as pushed), run the command, remove it unless keep."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    d = request.get_json(force=True) or {}
+    rem = _test_target(repo, d.get("remote"))
+    if not rem:
+        return jsonify({"ok": False, "error": "this repo has no remote to copy from: Studio clones what is pushed"})
+    try:
+        return jsonify(studio.try_in_sandbox(rem["url"], d.get("command") or "", distro=d.get("distro") or "ubuntu", image=d.get("image") or "",
+                                             ref=d.get("ref") or gitops.current_branch(repo["path"]),
+                                             network="none" if d.get("network") == "none" else "internet",
+                                             timeout_seconds=int(d.get("timeout_seconds") or 900), keep=bool(d.get("keep")),
+                                             purpose=f"Upstream Manager: {repo['name']}"))
+    except (studio.StudioError, ValueError) as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 
 # ------------------------------------------------------------ github actions
@@ -548,7 +1007,8 @@ def api_workflows():
     def one(repo):
         base = {"repo_id": repo["id"], "repo_name": repo.get("name") or repo["id"]}
         try:
-            return {**base, **actions.health(repo)}
+            # The home remote's CI: GitHub Actions or the forge's.
+            return {**base, **actions.health(repo, _home_remote(repo, _github_remotes(repo)) or "origin")}
         except Exception as e:  # GitHub errors, rate limits, network
             return {**base, "ok": False, "error": str(e)}
     repos = store.snapshot(store.all_repos())

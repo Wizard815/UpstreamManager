@@ -122,6 +122,33 @@ function requestLine(r) {
     : `merge ${u.behind} commit(s) from ${u.name}/${u.branch}` + (u.conflict ? `, conflicts in ${(u.conflict_files || []).slice(0, 3).join(", ")}` : u.ahead ? ` · ${u.ahead} of yours · merges cleanly` : "")).join("; ")
 }
 
+// Start a new repo on the home forge from a base: a forge repo (OWNER/REPO) or any git URL.
+// copy pushes the base's history into a new private repo and keeps the base as upstream;
+// fork is the forge's own fork; template copies a template repo's files with fresh history.
+function baseRow() {
+  const baseIn = el("input", { placeholder: "base: OWNER/REPO on the forge, or https://github.com/owner/repo", list: "forge-bases", "aria-label": "Base repo", style: "flex:2 1 300px" })
+  const list = el("datalist", { id: "forge-bases" })
+  baseIn.addEventListener("focus", () => {
+    if (list.childElementCount) return
+    api(apiUrl("/api/forge/repos")).then(r => { if (r.ok) list.replaceChildren(...r.repos.map(x => el("option", { value: x.full_name }, `${x.full_name}${x.template ? " (template)" : ""}${x.mirror ? " (mirror)" : ""}`))) }).catch(() => {})
+  }, { once: true })
+  const nameIn = el("input", { placeholder: "new name (optional)", "aria-label": "New repo name", style: "flex:1 1 140px" })
+  const mode = el("select", { "aria-label": "How to start from the base" },
+    el("option", { value: "copy" }, "copy (history, base stays upstream)"),
+    el("option", { value: "fork" }, "fork on the forge"),
+    el("option", { value: "template" }, "from template (fresh history)"))
+  const go = el("button", { class: "btn" }, "Start on forge")
+  go.onclick = () => busy(go, "Creating…", async () => {
+    if (!baseIn.value.trim()) return toast("Give the base repo", "info")
+    const r = await api(apiUrl("/api/forge/new"), { method: "POST", body: JSON.stringify({ base: baseIn.value.trim(), mode: mode.value, name: nameIn.value.trim() || undefined }) })
+    toast(r.ok ? r.detail : r.error, r.ok ? "ok" : "error")
+    if (r.ok) await renderRepos()
+  })
+  return el("div", { style: "margin-top:12px" },
+    el("strong", {}, "Or start a private repo on your forge from a base"),
+    el("div", { class: "row", style: "margin-top:6px" }, baseIn, list, mode, nameIn, go))
+}
+
 async function renderRepos() {
   const content = $("#content")
   content.replaceChildren(loading("Checking repos…"))
@@ -150,7 +177,8 @@ async function renderRepos() {
     })
   }
   addBox.append(el("div", { class: "row" }, urlIn, dirIn, nameIn, addBtn),
-    el("p", { class: "muted", style: "margin:8px 0 0" }, "A URL is cloned into the watch folder. A local folder is watched where it is. Add more upstreams on the repo's page."))
+    el("p", { class: "muted", style: "margin:8px 0 0" }, "A URL is cloned into the watch folder. A local folder is watched where it is. Add more upstreams on the repo's page."),
+    baseRow())
   const addToggle = el("button", { class: "btn ghost" }, "+ Add repo")
   addToggle.onclick = () => { addBox.hidden = !addBox.hidden; if (!addBox.hidden) urlIn.focus() }
   const fetchBtn = el("button", { class: "btn ghost" }, group ? `Fetch ${group}` : "Fetch all")
@@ -414,7 +442,7 @@ async function renderRepoPage(repoId) {
     menu(`More actions for ${repo.name || repoId}`, [
       { label: "New task…", run: () => taskDialog({ repo: repoId }) },
       { label: "Groups…", run: editGroups },
-      { label: "Import GitHub issues…", run: () => issuesDialog(repoId) },
+      { label: "Import issues…", run: () => issuesDialog(repoId) },
       { label: "Copy folder path", run: () => { navigator.clipboard?.writeText(repo.path); toast("Path copied", "ok") } },
       { label: "Remove from Upstream Manager", danger: true, run: removeRepo },
     ])))
@@ -1011,17 +1039,27 @@ async function renderPublish(wrap, repoId) {
   const acc = info.accounts
   const accountLine = el("div", { class: "muted" },
     `GitHub token: ${acc.github_token.set ? `set (${acc.github_token.source})` : "not set: pushes use this machine's git login"} · `,
+    `Forge: ${info.forge.configured ? `${info.forge.url}${acc.forge_token.set ? "" : " (no token)"}` : "not set up"} · `,
     `Docker Hub: ${acc.dockerhub_username.set && acc.dockerhub_token.set ? acc.dockerhub_username.hint : "not set"} · `,
     el("a", { href: `${BASE}/settings`, style: "color:#9fb4ff" }, "Accounts"))
 
   // --- push
-  const remSel = el("select", { "aria-label": "Remote" }, ...info.remotes.map(r => el("option", { value: r.name }, `${r.name}${r.owner ? ` (${r.owner}/${r.repo})` : ""}`)))
+  const where = (r) => r.forge === "forge" ? "forge" : r.forge === "github" ? "GitHub" : ""
+  const remSel = el("select", { "aria-label": "Remote" }, ...info.remotes.map(r => el("option", { value: r.name },
+    `${r.name}${r.owner ? ` (${where(r)}: ${r.owner}/${r.repo})` : ""}${r.name === info.home ? " · home" : ""}`)))
+  if (info.home) remSel.value = info.home
   const ahead = () => { const r = info.remotes.find(x => x.name === remSel.value); return r?.ahead == null ? "new branch on the remote" : `${r.ahead} commit(s) to push` }
   const aheadEl = el("span", { class: "muted" }, ahead())
   remSel.onchange = () => { aheadEl.textContent = ahead() }
   const prIn = el("input", { type: "checkbox", "aria-label": "Open a pull request" })
   const baseIn = el("input", { value: "main", "aria-label": "Pull request base branch", style: "width:110px" })
   const pushBtn = el("button", { class: "btn" }, "Request push")
+  const homeBtn = el("button", { class: "btn ghost", title: "Push here by default: Hermes, tasks and this page use it" }, "Make home")
+  homeBtn.onclick = () => busy(homeBtn, "Saving…", async () => {
+    const r = await api(apiUrl(`/api/repo/${repoId}/home`), { method: "POST", body: JSON.stringify({ remote: remSel.value }) })
+    toast(r.ok ? `${r.home} is now this repo's home` : r.error, r.ok ? "ok" : "error")
+    if (r.ok) await renderPublish(wrap, repoId)
+  })
   pushBtn.onclick = () => busy(pushBtn, "Raising…", async () => {
     await api(apiUrl(`/api/repo/${repoId}/push/request`), { method: "POST", body: JSON.stringify({ remote: remSel.value, open_pr: prIn.checked, base: baseIn.value.trim() }) })
     toast("Push request raised. Approve it on the Requests page.", "ok"); route("/requests")
@@ -1030,7 +1068,7 @@ async function renderPublish(wrap, repoId) {
     el("strong", {}, `Push ${info.branch}`), " ", aheadEl,
     el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px" },
       el("label", { class: "muted" }, "to ", remSel),
-      el("label", { class: "muted" }, prIn, " open a pull request into ", baseIn), pushBtn),
+      el("label", { class: "muted" }, prIn, " open a pull request into ", baseIn), pushBtn, homeBtn),
     el("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, "Never force-pushes. A remote that has moved on is refused: fetch and merge first."))
 
   // --- docker workflow builder
@@ -1101,7 +1139,146 @@ async function renderPublish(wrap, repoId) {
     el("div", { class: "muted" }, info.owner ? `Sets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN on ${info.owner}/${info.github_repo} (encrypted with the repo's key). GHCR needs no secret.` : "This repo has no github.com remote."),
     el("div", { style: "margin-top:6px" }, secBtn))
 
-  wrap.append(accountLine, pushCard, dockerCard, secCard)
+  wrap.append(accountLine, pushCard, await mirrorsCard(wrap, repoId, info), cleanTestCard(repoId, info), dockerCard, secCard)
+}
+
+// Test somewhere clean: run a command on the forge's own runners (like CI, GPU too) or in a
+// throwaway Studio sandbox (any distro, or offline). Both use what is pushed, not local changes.
+function cleanTestCard(repoId, info) {
+  const card = el("div", { class: "upstream" }, el("strong", {}, "Test somewhere clean"),
+    el("div", { class: "muted" }, `Runs a command on what is pushed (branch ${info.branch}), away from this machine. Push first.`))
+  const cmdIn = el("input", { placeholder: "command, e.g. make test", "aria-label": "Command to run", style: "width:320px" })
+  const out = el("pre", { class: "muted", style: "white-space:pre-wrap;max-height:320px;overflow:auto;display:none", "aria-live": "polite" })
+  const show = (text) => { out.style.display = ""; out.textContent = text }
+  const runnerIn = el("input", { value: "ubuntu-latest", list: `runners-${repoId}`, "aria-label": "Runner label", style: "width:150px" })
+  const runnerList = el("datalist", { id: `runners-${repoId}` }, el("option", { value: "ubuntu-latest" }), el("option", { value: "gpu" }))
+  const imageIn = el("input", { placeholder: "image (optional)", "aria-label": "Container image for the runner job", style: "width:180px" })
+  const runBtn = el("button", { class: "btn" }, "Run on forge runner")
+  const setupBtn = el("button", { class: "btn ghost" }, "Set up jobs")
+  setupBtn.onclick = () => busy(setupBtn, "Setting up…", async () => {
+    const r = await api(apiUrl("/api/forge/jobs/setup"), { method: "POST", body: "{}" })
+    toast(r.ok ? `Jobs go through ${r.jobs_repo} (workflow ${r.workflow}; checkouts use ${r.checkout_token})` : r.error, r.ok ? "ok" : "error")
+  })
+  runBtn.onclick = () => busy(runBtn, "Running…", async () => {
+    if (!cmdIn.value.trim()) return toast("Type the command to run", "info")
+    let r = await api(apiUrl(`/api/repo/${repoId}/forge/job`), { method: "POST", body: JSON.stringify({ command: cmdIn.value.trim(), runner: runnerIn.value.trim(), image: imageIn.value.trim() }) })
+    if (!r.ok) return toast(r.error, "error")
+    const started = Date.now()
+    while (!r.done && Date.now() - started < 30 * 60_000) {
+      show(`Run ${r.run}: ${r.status}${r.note ? ` (${r.note})` : ""} · ${r.url || ""}`)
+      await new Promise(res => setTimeout(res, 5000))
+      r = await api(apiUrl(`/api/forge/jobs/${r.run}`))
+      if (!r.ok) return toast(r.error, "error")
+    }
+    show(`Run ${r.run}: ${r.status} · ${r.url || ""}\n\n${r.output || ""}`)
+    toast(r.status === "success" ? "Passed on the runner" : `Runner job: ${r.status}`, r.status === "success" ? "ok" : "error")
+  })
+  api(apiUrl("/api/forge/runners")).then(r => {
+    if (!r.ok) return
+    runnerList.replaceChildren(...[...new Set(r.runners.flatMap(x => x.labels))].map(l => el("option", { value: l })))
+  }).catch(() => {})
+  const distroSel = el("select", { "aria-label": "Sandbox distro" }, ...["ubuntu", "debian", "fedora", "rocky", "alpine", "arch", "opensuse", "node", "python", "go"].map(d => el("option", { value: d }, d)))
+  const offline = el("input", { type: "checkbox", "aria-label": "No network" })
+  const keep = el("input", { type: "checkbox", "aria-label": "Keep the sandbox" })
+  const boxBtn = el("button", { class: "btn" }, "Run in Studio sandbox")
+  boxBtn.onclick = () => busy(boxBtn, "Running…", async () => {
+    if (!cmdIn.value.trim()) return toast("Type the command to run", "info")
+    const r = await api(apiUrl(`/api/repo/${repoId}/sandbox`), { method: "POST",
+      body: JSON.stringify({ command: cmdIn.value.trim(), distro: distroSel.value, network: offline.checked ? "none" : "internet", keep: keep.checked }) })
+    if (r.error) return toast(r.error, "error")
+    show(`${r.image}: exit ${r.exit_code}${r.timed_out ? " (timed out)" : ""}${r.kept ? ` · kept as sandbox ${r.sandbox}` : ""}\n\n${r.output}`)
+    toast(r.ok ? `Passed on ${distroSel.value}` : `Exit ${r.exit_code} on ${distroSel.value}`, r.ok ? "ok" : "error")
+  })
+  card.append(el("div", { style: "margin-top:6px" }, cmdIn),
+    info.forge.configured ? el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px" }, runnerIn, runnerList, imageIn, runBtn, setupBtn) : null,
+    el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px" }, distroSel,
+      el("label", { class: "muted" }, offline, " no network"), el("label", { class: "muted" }, keep, " keep it"), boxBtn),
+    out)
+  return card
+}
+
+// Mirrors: the repo's copy on the homelab forge. Make one (private), make it
+// home, and mirror it on to GitHub so public repos stay in step by themselves.
+async function mirrorsCard(wrap, repoId, info) {
+  const when = (t) => !t || t.startsWith("1970") || t.startsWith("0001") ? "never" : new Date(t).toLocaleString()
+  const card = el("div", { class: "upstream" }, el("strong", {}, "Home forge and mirrors"))
+  if (!info.forge.configured) {
+    card.append(el("div", { class: "muted" }, "No forge set up. Add its address and token in ",
+      el("a", { href: `${BASE}/settings`, style: "color:#9fb4ff" }, "Settings → Accounts"), " to keep private copies at home and mirror them to GitHub."))
+    return card
+  }
+  const m = await api(apiUrl(`/api/repo/${repoId}/mirrors`))
+  const ghSel = (skip = []) => {
+    const left = (m.github || []).filter(g => !skip.includes(`${g.url}.git`))
+    const sel = el("select", { "aria-label": "GitHub repo to mirror to" }, el("option", { value: "" }, "no GitHub mirror"),
+      ...left.map(g => el("option", { value: g.url }, `mirror to ${g.url.replace("https://", "")}`)))
+    if (left.length) sel.value = left[0].url
+    return [sel, left.length]
+  }
+  if (!m.remotes.length) {
+    const nameIn = el("input", { value: info.github_repo || "", placeholder: "repo name", "aria-label": "Name on the forge", style: "width:180px" })
+    const [mirror] = ghSel()
+    const home = el("input", { type: "checkbox", "aria-label": "Make it home" }); home.checked = true
+    const make = el("button", { class: "btn" }, "Create private copy on the forge")
+    make.onclick = () => busy(make, "Creating…", async () => {
+      const r = await api(apiUrl(`/api/repo/${repoId}/forge/create`), { method: "POST",
+        body: JSON.stringify({ name: nameIn.value.trim() || undefined, make_home: home.checked, mirror_to: mirror.value || undefined }) })
+      toast(r.ok ? r.detail.join("; ") + (r.mirror_error ? ` (mirror failed: ${r.mirror_error})` : "") + ". Push the branch to fill it." : r.error,
+        r.ok && !r.mirror_error ? "ok" : "error")
+      if (r.ok) await renderPublish(wrap, repoId)
+    })
+    card.append(el("div", { class: "muted" }, `This repo has no copy on ${m.url} yet.`),
+      el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px" },
+        nameIn, mirror, el("label", { class: "muted" }, home, " make it home"), make))
+    return card
+  }
+  for (const r of m.remotes) {
+    if (r.error || !r.found) {
+      card.append(el("div", { class: "muted" }, `${r.remote}: ${r.error || "not found on the forge (deleted, or the token can't see it)"}`))
+      continue
+    }
+    const lines = [el("div", {}, el("a", { href: r.web_url, target: "_blank", rel: "noopener", style: "color:#9fb4ff" }, `${r.owner}/${r.repo}`),
+      el("span", { class: "muted" }, ` · remote ${r.remote} · ${r.private ? "private" : "visible to forge users"}` +
+        (r.mirror ? ` · pull mirror of ${r.original_url} every ${r.mirror_interval}, last ${when(r.mirror_updated)}` : "")))]
+    for (const pm of r.push_mirrors) {
+      const rm = el("button", { class: "btn ghost" }, "Stop mirroring")
+      rm.onclick = () => busy(rm, "Removing…", async () => {
+        if (!confirm(`Stop mirroring ${r.owner}/${r.repo} to ${pm.address}? Nothing on GitHub is deleted.`)) return
+        const x = await api(apiUrl(`/api/repo/${repoId}/mirrors/push/remove`), { method: "POST", body: JSON.stringify({ remote: r.remote, name: pm.name }) })
+        toast(x.ok ? "Mirror removed" : x.error, x.ok ? "ok" : "error"); if (x.ok) await renderPublish(wrap, repoId)
+      })
+      lines.push(el("div", { class: "muted", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
+        `→ ${pm.address} (${pm.sync_on_commit ? "on every push" : `every ${pm.interval}`}, last ${when(pm.last_update)})`,
+        pm.last_error ? el("span", { style: "color:#e08080" }, pm.last_error) : null, rm))
+    }
+    const syncBtn = el("button", { class: "btn ghost" }, "Sync now")
+    syncBtn.onclick = () => busy(syncBtn, "Syncing…", async () => {
+      const x = await api(apiUrl(`/api/repo/${repoId}/mirrors/sync`), { method: "POST", body: JSON.stringify({ remote: r.remote }) })
+      toast(x.ok ? x.detail : x.error, x.ok ? "ok" : "error")
+    })
+    const row = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px" })
+    if (!r.mirror) {
+      const [mirror, left] = ghSel(r.push_mirrors.map(pm => pm.address))
+      const add = el("button", { class: "btn" }, "Add GitHub mirror")
+      add.onclick = () => busy(add, "Adding…", async () => {
+        if (!mirror.value) return toast("Pick the GitHub repo to mirror to", "info")
+        const x = await api(apiUrl(`/api/repo/${repoId}/mirrors/push`), { method: "POST", body: JSON.stringify({ remote: r.remote, to: mirror.value }) })
+        toast(x.ok ? x.detail : x.error, x.ok ? "ok" : "error"); if (x.ok) await renderPublish(wrap, repoId)
+      })
+      if (left) row.append(mirror, add)
+    }
+    if (r.mirror || r.push_mirrors.length) row.append(syncBtn)
+    const hookBtn = el("button", { class: "btn ghost" }, "Tell Upstream about pushes")
+    hookBtn.onclick = () => busy(hookBtn, "Adding…", async () => {
+      const x = await api(apiUrl(`/api/repo/${repoId}/forge/webhook`), { method: "POST", body: JSON.stringify({ remote: r.remote }) })
+      toast(x.ok ? x.detail : (x.error || x.detail), x.ok ? "ok" : "error")
+    })
+    row.append(hookBtn)
+    card.append(...lines, row)
+  }
+  card.append(el("div", { class: "muted", style: "font-size:12px;margin-top:4px" },
+    "Commit on one side only: a mirror stops at the first conflict. The forge keeps the GitHub token for its mirrors."))
+  return card
 }
 
 // Actions: the repo's GitHub workflows with recent failures and triggers. In a
@@ -2164,6 +2341,12 @@ async function renderSettings() {
     }
     const accRows = [
       accRow("github_token", "GitHub token (fine-grained: Contents, Pull requests, Secrets, Workflows, Actions read/write)", "password", "github_pat_…"),
+      accRow("forge_url", "Home forge address (Forgejo or Gitea), as this machine reaches it", "text", "http://forgejo:3000"),
+      accRow("forge_token", "Home forge token (write:repository, write:issue, read:user)", "password", "token from the forge's Settings → Applications"),
+      accRow("forge_default_home", "Default home: forge (a repo with a forge remote pushes there unless you pick another), or blank for origin", "text", "forge"),
+      accRow("forge_jobs_token", "Forge jobs token (read:repository only): runner jobs check out private repos with it", "password", "a read-only token"),
+      accRow("forge_callback_url", "Upstream's address as the forge reaches it (for push webhooks), e.g. http://upstream-manager:5000", "text", "http://upstream-manager:5000"),
+      accRow("forge_jobs_repo", "Forge jobs repo (OWNER/REPO that runner jobs go through; shared with Hermes), or blank for YOUR-LOGIN/hermes-jobs", "text", "wizard/hermes-jobs"),
       accRow("dockerhub_username", "Docker Hub username", "text", "username"),
       accRow("dockerhub_token", "Docker Hub access token (Account settings → Personal access tokens)", "password", "dckr_pat_…"),
     ]
@@ -2184,16 +2367,16 @@ async function renderSettings() {
     }
     const removeBtn = el("button", { class: "btn ghost" }, "Remove all")
     removeBtn.onclick = () => {
-      if (!confirm("Remove the saved GitHub token and Docker Hub login? (Environment variables are not affected.)")) return
+      if (!confirm("Remove the saved GitHub token, forge address and token, and Docker Hub login? (Environment variables are not affected.)")) return
       return busy(removeBtn, "Removing…", async () => {
-        await api(apiUrl('/api/credentials'), { method: "POST", body: JSON.stringify({ github_token: "", dockerhub_username: "", dockerhub_token: "" }) })
+        await api(apiUrl('/api/credentials'), { method: "POST", body: JSON.stringify({ github_token: "", forge_url: "", forge_token: "", forge_default_home: "", forge_jobs_repo: "", forge_jobs_token: "", forge_callback_url: "", dockerhub_username: "", dockerhub_token: "" }) })
         toast("Removed", "ok"); await renderSettings()
       })
     }
     card.append(el("h4", { style: "margin-top:20px" }, "Accounts"),
-      el("div", { class: "muted" }, "Used to push branches, open pull requests and set Actions secrets. Environment variables UPSTREAM_GITHUB_TOKEN, UPSTREAM_DOCKERHUB_USERNAME and UPSTREAM_DOCKERHUB_TOKEN override these."),
+      el("div", { class: "muted" }, "Used to push branches, open pull requests, set Actions secrets and set up mirrors. Each token goes only to its own host. Environment variables UPSTREAM_GITHUB_TOKEN, UPSTREAM_FORGE_URL, UPSTREAM_FORGE_TOKEN, UPSTREAM_DOCKERHUB_USERNAME and UPSTREAM_DOCKERHUB_TOKEN override these; UPSTREAM_FORGE_HOSTS lists other addresses of the same forge."),
       el("div", { style: "display:flex;flex-direction:column;gap:12px;margin-top:8px" }, ...accRows.map(r => r.row),
-        el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, accSave, testBtn("github", "Test GitHub"), testBtn("dockerhub", "Test Docker Hub"), removeBtn)))
+        el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, accSave, testBtn("github", "Test GitHub"), testBtn("forge", "Test forge"), testBtn("dockerhub", "Test Docker Hub"), removeBtn)))
     const mem = local.memory || {}
     const st = await api(apiUrl('/api/memory/status'))
     const onOff = (v) => { const sel = el("select", { style: "width:160px" }, el("option", { value: "on" }, "On"), el("option", { value: "off" }, "Off")); sel.value = v ? "on" : "off"; return sel }
@@ -2270,14 +2453,14 @@ function herdrPicker(ints, current) {
 }
 
 let drawDests = null
-// Import GitHub issues as Work tasks: pick a remote and the issues; ones already imported link to their task.
+// Import GitHub or forge issues as Work tasks: pick a remote and the issues; ones already imported link to their task.
 async function issuesDialog(repoId) {
   const body = el("div", { class: "col", style: "gap:10px;min-width:min(620px,86vw)" }, loading("Asking GitHub…"))
-  let close = openDialog("Import GitHub issues", body), remote = "", state = "open"
+  let close = openDialog("Import issues", body), remote = "", state = "open"
   const draw = async () => {
-    body.replaceChildren(loading("Asking GitHub…"))
+    body.replaceChildren(loading("Fetching issues…"))
     const r = await api(apiUrl(`/api/repo/${repoId}/issues?state=${state}${remote ? `&remote=${encodeURIComponent(remote)}` : ""}`)).catch(e => ({ ok: false, error: e.message }))
-    const remSel = el("select", { "aria-label": "Remote" }, ...(r.remotes || []).map(x => el("option", { value: x.remote }, `${x.remote} · ${x.slug}`)))
+    const remSel = el("select", { "aria-label": "Remote" }, ...(r.remotes || []).map(x => el("option", { value: x.remote }, `${x.remote} · ${x.slug}${x.forge === "forge" ? " (forge)" : ""}`)))
     remSel.value = r.source?.remote || remote; remSel.onchange = () => { remote = remSel.value; draw() }
     const stSel = el("select", { "aria-label": "Which issues" }, ...["open", "closed", "all"].map(x => el("option", { value: x }, x)))
     stSel.value = state; stSel.onchange = () => { state = stSel.value; draw() }
@@ -2461,7 +2644,7 @@ async function renderWork() {
   }
   repoSel.onchange = () => { repoF = repoSel.value; draw() }
   const newBtn = el("button", { class: "btn", onclick: () => taskDialog({ repo: repoF || undefined }) }, "+ New task")
-  const issuesBtn = el("button", { class: "btn ghost", title: "Make tasks of a repo's GitHub issues", onclick: () => repoF ? issuesDialog(repoF) : toast("Pick a repo first (the list above)", "info") }, "Import issues")
+  const issuesBtn = el("button", { class: "btn ghost", title: "Make tasks of a repo's GitHub or forge issues", onclick: () => repoF ? issuesDialog(repoF) : toast("Pick a repo first (the list above)", "info") }, "Import issues")
   let view = picked ? "list" : params.get("view") === "board" ? "board" : params.get("view") === "list" ? "list" : store_.get("workView", "list")
   const viewBar = el("div", { class: "tabs", role: "tablist", "aria-label": "View" })
   const grid = el("div", { class: "work-grid" }, el("div", { class: "col", style: "gap:12px;min-width:0" }, el("div", { class: "panel", style: "min-width:0" }, fbar, listBox), roster), detail)
@@ -3533,7 +3716,7 @@ async function renderWorkflows(refresh = false) {
     if (r.ok) {
       const c = r.counts || {}
       head.append(c.failing ? badge("bad", `${c.failing} failing`) : "", c.running ? badge("info", `${c.running} running`) : "",
-        badge(c.failing ? "" : "up", `${c.passing || 0} passing`), el("a", { href: r.url, target: "_blank", rel: "noopener", class: "small" }, "GitHub Actions ↗"),
+        badge(c.failing ? "" : "up", `${c.passing || 0} passing`), el("a", { href: r.url, target: "_blank", rel: "noopener", class: "small" }, r.forge === "forge" ? "Forge Actions ↗" : "GitHub Actions ↗"),
         el("a", { href: `${BASE}/repo/${r.repo_id}`, class: "small", onclick: (e) => { e.preventDefault(); e.stopPropagation(); store_.set(`tab:${r.repo_id}`, "Actions"); route(`/repo/${r.repo_id}`) } }, "Manage"))
     }
     const card = el("section", { class: "card" }, head)

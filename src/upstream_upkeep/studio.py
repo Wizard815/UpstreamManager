@@ -255,3 +255,47 @@ def messages(session_id: str) -> list[dict]:
             names = [((c.get("function") or {}).get("name") or c.get("name") or "a tool") for c in (m.get("tool_calls") or []) if isinstance(c, dict)]
             out.append({"role": "tool", "content": "used " + (", ".join(names) or m.get("tool_name") or "a tool")})
     return out
+
+
+# ------------------------------------------------------------------ sandboxes
+# Throwaway Linux containers on Studio's machine (Studio's docs/sandbox.md): any distro preset or image,
+# internet or no network, removed when their time is up. Upstream uses them to try a repo somewhere clean.
+SANDBOX_ACTIONS = ("list", "create", "exec", "write_file", "read_file", "copy_repo", "extend", "remove")
+
+
+def sandbox(action: str, fields: dict | None = None) -> dict:
+    """One sandbox action through Studio (POST /api/studio/sandbox/tool/{action}); Studio checks the fields."""
+    if action not in SANDBOX_ACTIONS:
+        raise StudioError(f"unknown sandbox action {action!r}: {', '.join(SANDBOX_ACTIONS)}")
+    fields = dict(fields or {})
+    try:
+        exec_wait = min(3600, max(1, int(fields.get("timeoutSeconds") or 300))) + 60
+    except (TypeError, ValueError):
+        raise StudioError("timeoutSeconds is a number of seconds") from None
+    wait = exec_wait if action == "exec" else 600 if action in ("create", "copy_repo") else TIMEOUT
+    return _req("POST", f"/api/studio/sandbox/tool/{action}", timeout=wait, json=fields)
+
+
+def try_in_sandbox(repo_url: str, command: str, distro: str = "ubuntu", image: str = "", ref: str = "", network: str = "internet",
+                   minutes: int = 30, timeout_seconds: int = 900, keep: bool = False, purpose: str = "") -> dict:
+    """Make a sandbox, copy the repo in (as pushed: Studio clones it), run the command in it, and remove the
+    sandbox unless keep. Returns the exit code and the end of the output."""
+    if not (command or "").strip():
+        raise StudioError("give the command to run, e.g. make test")
+    made = sandbox("create", {"distro": "" if image else distro, "image": image, "network": network, "minutes": minutes,
+                              "purpose": purpose or f"Upstream Manager: {command[:120]}"})
+    box = (made.get("sandbox") or {}).get("id")
+    if not box:
+        raise StudioError("Studio didn't say which sandbox it made")
+    try:
+        copied = sandbox("copy_repo", {"sandbox": box, "repo": repo_url, "ref": ref})
+        ran = sandbox("exec", {"sandbox": box, "command": command, "workdir": copied.get("path") or "/work", "timeoutSeconds": timeout_seconds})
+    finally:
+        if not keep:
+            try:
+                sandbox("remove", {"sandbox": box})
+            except StudioError:
+                pass
+    return {"ok": ran.get("exitCode") == 0, "sandbox": box, "kept": keep, "image": (made.get("sandbox") or {}).get("image"),
+            "path": copied.get("path"), "exit_code": ran.get("exitCode"), "timed_out": bool(ran.get("timedOut")),
+            "output": ran.get("output") or "", "truncated": bool(ran.get("truncated"))}

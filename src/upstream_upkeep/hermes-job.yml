@@ -1,0 +1,67 @@
+# Hermes jobs: run one command on a forge runner, optionally in a given image
+# and with a repo from this forge checked out. Written by the forgejo skill
+# (forge.py job); dispatched through the API, never on push.
+name: hermes-job
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: runner label (runs-on), e.g. ubuntu-latest or gpu
+        default: ubuntu-latest
+      image:
+        description: container image; empty uses the runner label's own image
+        default: ""
+      repo:
+        description: owner/name on this forge to check out; empty for none
+        default: ""
+      ref:
+        description: branch, tag or commit of repo
+        default: ""
+      command:
+        description: shell command to run
+        required: true
+      title:
+        description: shown as the run title
+        default: hermes job
+run-name: ${{ inputs.title }}
+jobs:
+  run:
+    if: ${{ inputs.image == '' }}
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        if: ${{ inputs.repo != '' }}
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref }}
+          # a read-only token if job setup was given one, else this run's own token;
+          # never left in .git/config, where the command could read it
+          token: ${{ secrets.JOBS_TOKEN || github.token }}
+          persist-credentials: false
+      - name: command
+        env:
+          HERMES_JOB_COMMAND: ${{ inputs.command }}
+        run: |
+          echo "=== hermes job output ==="
+          bash -eo pipefail -c "$HERMES_JOB_COMMAND"
+  run-in-image:
+    if: ${{ inputs.image != '' }}
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: ${{ inputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        if: ${{ inputs.repo != '' }}
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref }}
+          # a read-only token if job setup was given one, else this run's own token;
+          # never left in .git/config, where the command could read it
+          token: ${{ secrets.JOBS_TOKEN || github.token }}
+          persist-credentials: false
+      - name: command
+        env:
+          HERMES_JOB_COMMAND: ${{ inputs.command }}
+        run: |
+          echo "=== hermes job output ==="
+          sh -c "$HERMES_JOB_COMMAND"
