@@ -557,7 +557,7 @@ the MCP tools `forge_job_run`, `forge_job_status`, `forge_runners`,
 
 What goes wrong: a job that stays **waiting** means no idle runner has that
 label. "no job workflow" means **Set up jobs** wasn't run. "Studio isn't set
-up" means the Hermes Studio connection is off (Settings → Connections).
+up" means the Hermes Studio connection is off (Settings → Hermes Studio).
 
 ## Actions (forks)
 
