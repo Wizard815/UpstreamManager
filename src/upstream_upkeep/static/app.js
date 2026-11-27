@@ -1111,7 +1111,62 @@ async function renderPublish(wrap, repoId) {
     el("div", { class: "muted" }, info.owner ? `Sets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN on ${info.owner}/${info.github_repo} (encrypted with the repo's key). GHCR needs no secret.` : "This repo has no github.com remote."),
     el("div", { style: "margin-top:6px" }, secBtn))
 
-  wrap.append(accountLine, pushCard, await mirrorsCard(wrap, repoId, info), dockerCard, secCard)
+  wrap.append(accountLine, pushCard, await mirrorsCard(wrap, repoId, info), cleanTestCard(repoId, info), dockerCard, secCard)
+}
+
+// Test somewhere clean: run a command on the forge's own runners (like CI, GPU too) or in a
+// throwaway Studio sandbox (any distro, or offline). Both use what is pushed, not local changes.
+function cleanTestCard(repoId, info) {
+  const card = el("div", { class: "upstream" }, el("strong", {}, "Test somewhere clean"),
+    el("div", { class: "muted" }, `Runs a command on what is pushed (branch ${info.branch}), away from this machine. Push first.`))
+  const cmdIn = el("input", { placeholder: "command, e.g. make test", "aria-label": "Command to run", style: "width:320px" })
+  const out = el("pre", { class: "muted", style: "white-space:pre-wrap;max-height:320px;overflow:auto;display:none", "aria-live": "polite" })
+  const show = (text) => { out.style.display = ""; out.textContent = text }
+  const runnerIn = el("input", { value: "ubuntu-latest", list: `runners-${repoId}`, "aria-label": "Runner label", style: "width:150px" })
+  const runnerList = el("datalist", { id: `runners-${repoId}` }, el("option", { value: "ubuntu-latest" }), el("option", { value: "gpu" }))
+  const imageIn = el("input", { placeholder: "image (optional)", "aria-label": "Container image for the runner job", style: "width:180px" })
+  const runBtn = el("button", { class: "btn" }, "Run on forge runner")
+  const setupBtn = el("button", { class: "btn ghost" }, "Set up jobs")
+  setupBtn.onclick = () => busy(setupBtn, "Setting up…", async () => {
+    const r = await api(apiUrl("/api/forge/jobs/setup"), { method: "POST", body: "{}" })
+    toast(r.ok ? `Jobs go through ${r.jobs_repo} (workflow ${r.workflow}; checkouts use ${r.checkout_token})` : r.error, r.ok ? "ok" : "error")
+  })
+  runBtn.onclick = () => busy(runBtn, "Running…", async () => {
+    if (!cmdIn.value.trim()) return toast("Type the command to run", "info")
+    let r = await api(apiUrl(`/api/repo/${repoId}/forge/job`), { method: "POST", body: JSON.stringify({ command: cmdIn.value.trim(), runner: runnerIn.value.trim(), image: imageIn.value.trim() }) })
+    if (!r.ok) return toast(r.error, "error")
+    const started = Date.now()
+    while (!r.done && Date.now() - started < 30 * 60_000) {
+      show(`Run ${r.run}: ${r.status}${r.note ? ` (${r.note})` : ""} · ${r.url || ""}`)
+      await new Promise(res => setTimeout(res, 5000))
+      r = await api(apiUrl(`/api/forge/jobs/${r.run}`))
+      if (!r.ok) return toast(r.error, "error")
+    }
+    show(`Run ${r.run}: ${r.status} · ${r.url || ""}\n\n${r.output || ""}`)
+    toast(r.status === "success" ? "Passed on the runner" : `Runner job: ${r.status}`, r.status === "success" ? "ok" : "error")
+  })
+  api(apiUrl("/api/forge/runners")).then(r => {
+    if (!r.ok) return
+    runnerList.replaceChildren(...[...new Set(r.runners.flatMap(x => x.labels))].map(l => el("option", { value: l })))
+  }).catch(() => {})
+  const distroSel = el("select", { "aria-label": "Sandbox distro" }, ...["ubuntu", "debian", "fedora", "rocky", "alpine", "arch", "opensuse", "node", "python", "go"].map(d => el("option", { value: d }, d)))
+  const offline = el("input", { type: "checkbox", "aria-label": "No network" })
+  const keep = el("input", { type: "checkbox", "aria-label": "Keep the sandbox" })
+  const boxBtn = el("button", { class: "btn" }, "Run in Studio sandbox")
+  boxBtn.onclick = () => busy(boxBtn, "Running…", async () => {
+    if (!cmdIn.value.trim()) return toast("Type the command to run", "info")
+    const r = await api(apiUrl(`/api/repo/${repoId}/sandbox`), { method: "POST",
+      body: JSON.stringify({ command: cmdIn.value.trim(), distro: distroSel.value, network: offline.checked ? "none" : "internet", keep: keep.checked }) })
+    if (r.error) return toast(r.error, "error")
+    show(`${r.image}: exit ${r.exit_code}${r.timed_out ? " (timed out)" : ""}${r.kept ? ` · kept as sandbox ${r.sandbox}` : ""}\n\n${r.output}`)
+    toast(r.ok ? `Passed on ${distroSel.value}` : `Exit ${r.exit_code} on ${distroSel.value}`, r.ok ? "ok" : "error")
+  })
+  card.append(el("div", { style: "margin-top:6px" }, cmdIn),
+    info.forge.configured ? el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px" }, runnerIn, runnerList, imageIn, runBtn, setupBtn) : null,
+    el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px" }, distroSel,
+      el("label", { class: "muted" }, offline, " no network"), el("label", { class: "muted" }, keep, " keep it"), boxBtn),
+    out)
+  return card
 }
 
 // Mirrors: the repo's copy on the homelab forge. Make one (private), make it
@@ -2255,6 +2310,7 @@ async function renderSettings() {
       accRow("forge_url", "Home forge address (Forgejo or Gitea), as this machine reaches it", "text", "http://forgejo:3000"),
       accRow("forge_token", "Home forge token (write:repository, write:issue, read:user)", "password", "token from the forge's Settings → Applications"),
       accRow("forge_default_home", "Default home: forge (a repo with a forge remote pushes there unless you pick another), or blank for origin", "text", "forge"),
+      accRow("forge_jobs_repo", "Forge jobs repo (OWNER/REPO that runner jobs go through; shared with Hermes), or blank for YOUR-LOGIN/hermes-jobs", "text", "wizard/hermes-jobs"),
       accRow("dockerhub_username", "Docker Hub username", "text", "username"),
       accRow("dockerhub_token", "Docker Hub access token (Account settings → Personal access tokens)", "password", "dckr_pat_…"),
     ]
@@ -2277,7 +2333,7 @@ async function renderSettings() {
     removeBtn.onclick = () => {
       if (!confirm("Remove the saved GitHub token, forge address and token, and Docker Hub login? (Environment variables are not affected.)")) return
       return busy(removeBtn, "Removing…", async () => {
-        await api(apiUrl('/api/credentials'), { method: "POST", body: JSON.stringify({ github_token: "", forge_url: "", forge_token: "", forge_default_home: "", dockerhub_username: "", dockerhub_token: "" }) })
+        await api(apiUrl('/api/credentials'), { method: "POST", body: JSON.stringify({ github_token: "", forge_url: "", forge_token: "", forge_default_home: "", forge_jobs_repo: "", dockerhub_username: "", dockerhub_token: "" }) })
         toast("Removed", "ok"); await renderSettings()
       })
     }

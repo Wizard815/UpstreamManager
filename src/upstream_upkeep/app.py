@@ -683,6 +683,106 @@ def api_forge_import():
         return jsonify({"ok": False, "error": str(e)})
 
 
+# ------------------------------------------------------------ test somewhere clean
+# Two places to run a repo's build or tests away from this machine: the forge's own runners
+# (forge.job_run: ubuntu-latest, gpu, ...) and Studio's throwaway sandboxes (studio.try_in_sandbox:
+# any distro, internet or offline). Both use what is pushed, not uncommitted work.
+@flask_app.route("/api/forge/runners")
+def api_forge_runners():
+    try:
+        return jsonify({"ok": True, "runners": forge.runners()})
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e), "runners": []})
+
+
+@flask_app.route("/api/forge/jobs/setup", methods=["POST"])
+def api_forge_jobs_setup():
+    try:
+        return jsonify(forge.job_setup())
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/forge/jobs", methods=["POST"])
+def api_forge_job_run():
+    """Run one command on a forge runner, with a forge repo (OWNER/REPO) checked out if given."""
+    d = request.get_json(force=True) or {}
+    try:
+        return jsonify(forge.job_run(d.get("command") or "", runner=d.get("runner") or "ubuntu-latest", image=d.get("image") or "",
+                                     repo=d.get("repo") or "", ref=d.get("ref") or "", title=d.get("title") or ""))
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/forge/jobs/<int:run_id>")
+def api_forge_job_status(run_id):
+    try:
+        return jsonify(forge.job_status(run_id, logs=int(request.args.get("logs") or 80)))
+    except (github.GitHubError, ValueError) as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+def _test_target(repo: dict, remote: str | None) -> dict | None:
+    """The remote a clean test uses: the one asked for, else the repo's home remote."""
+    remotes = _github_remotes(repo)
+    name = remote or _home_remote(repo, remotes)
+    return next((r for r in remotes if r["name"] == name), None)
+
+
+@flask_app.route("/api/repo/<repo_id>/forge/job", methods=["POST"])
+def api_repo_forge_job(repo_id):
+    """Run a command on a forge runner with this repo's forge copy checked out (its current branch unless ref)."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    d = request.get_json(force=True) or {}
+    rem = _forge_remote(repo, d.get("remote"))
+    if not rem:
+        return jsonify({"ok": False, "error": "this repo has no remote on the forge: make a forge copy (Publish → Home forge) or a pull mirror first"})
+    try:
+        return jsonify(forge.job_run(d.get("command") or "", runner=d.get("runner") or "ubuntu-latest", image=d.get("image") or "",
+                                     repo=f"{rem['owner']}/{rem['repo']}", ref=d.get("ref") or gitops.current_branch(repo["path"]),
+                                     title=d.get("title") or f"{rem['repo']}: {(d.get('command') or '')[:80]}"))
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/sandboxes")
+def api_sandboxes():
+    try:
+        return jsonify({"ok": True, **studio.sandbox("list")})
+    except studio.StudioError as e:
+        return jsonify({"ok": False, "error": str(e), "sandboxes": [], "distros": {}})
+
+
+@flask_app.route("/api/sandboxes/<action>", methods=["POST"])
+def api_sandbox_action(action):
+    try:
+        return jsonify({"ok": True, **studio.sandbox(action, request.get_json(silent=True) or {})})
+    except studio.StudioError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@flask_app.route("/api/repo/<repo_id>/sandbox", methods=["POST"])
+def api_repo_sandbox(repo_id):
+    """Try this repo in a throwaway Studio sandbox: copy it in (as pushed), run the command, remove it unless keep."""
+    repo = registry.get_repo(repo_id)
+    if not repo:
+        abort(404)
+    d = request.get_json(force=True) or {}
+    rem = _test_target(repo, d.get("remote"))
+    if not rem:
+        return jsonify({"ok": False, "error": "this repo has no remote to copy from: Studio clones what is pushed"})
+    try:
+        return jsonify(studio.try_in_sandbox(rem["url"], d.get("command") or "", distro=d.get("distro") or "ubuntu", image=d.get("image") or "",
+                                             ref=d.get("ref") or gitops.current_branch(repo["path"]),
+                                             network="none" if d.get("network") == "none" else "internet",
+                                             timeout_seconds=int(d.get("timeout_seconds") or 900), keep=bool(d.get("keep")),
+                                             purpose=f"Upstream Manager: {repo['name']}"))
+    except (studio.StudioError, ValueError) as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 # ------------------------------------------------------------ github actions
 @flask_app.route("/api/repo/<repo_id>/actions")
 def api_actions(repo_id):

@@ -53,6 +53,11 @@ a merge workspace. Then stack_status (running? healthy? which ports), stack_logs
 summary), stack_request (send HTTP requests, e.g. seed demo data and check the API answers), and
 stack_exec (run a command in a container). stack_down when done. These never touch the real install.
 
+To run a build or tests somewhere clean, two places, both with what is pushed: try_in_sandbox runs it in a
+throwaway container on Studio's machine (any distro, or offline), and forge_job_run runs it on the home forge's
+runners like CI (runner ubuntu-latest, or gpu for GPU work), followed by forge_job_status. You decide when either
+helps; say which you used.
+
 Working alongside other agents: call overseer_plan first. The Overseer (plain rules, not a model) ranks repos
 and tasks by what matters now. next_task(agent=<your name>) hands you the most important open task nobody has,
 claimed for you; check in at least every 30 minutes (heartbeat_task / comment_task / update_task) or the claim
@@ -117,12 +122,12 @@ class AppError(ToolError):
     """A refusal or failure from the app; its message reaches the agent as the tool's error."""
 
 
-def _call(method: str, endpoint: str, body: dict | None = None, /, **params) -> Any:
+def _call(method: str, endpoint: str, body: dict | None = None, timeout: float | None = None, /, **params) -> Any:
     """One request to the app. The JSON body type is what its cross-site guard expects.
     Its own arguments are positional-only, so a query parameter may be called `path` (list_references)."""
     try:
         resp = requests.request(method, APP + endpoint, params={k: v for k, v in params.items() if v not in (None, "")},
-                                json=(body or {}) if method != "GET" else None, timeout=TIMEOUT,
+                                json=(body or {}) if method != "GET" else None, timeout=timeout or TIMEOUT,
                                 headers={"X-Upstream-Client": "agent"})  # the app keeps some things for the user
     except requests.ConnectionError:
         raise AppError(f"Upstream Manager is not running at {APP} (start it, or set UPSTREAM_APP_URL)")
@@ -529,6 +534,58 @@ def workflow_health(repo: Annotated[str, Field(description="Only this repo (id f
     branch, event) and the last 10 results."""
     out = _call("GET", "/api/workflows")
     return [r for r in out if not repo or r.get("repo_id") == repo]
+
+
+# ------------------------------------------------------------------ test somewhere clean
+@server.tool(annotations=READ)
+def forge_runners() -> dict:
+    """The home forge's runners and their labels (e.g. ubuntu-latest, gpu). Needs an admin forge token; without one, ask the user."""
+    return _call("GET", "/api/forge/runners")
+
+
+@server.tool(annotations=WRITE)
+def forge_job_run(command: Annotated[str, Field(min_length=1, description="Shell command to run, e.g. 'pytest -q' or 'nvidia-smi'.")],
+                  runner: Annotated[str, Field(description="Runner label: ubuntu-latest for normal builds and tests, gpu (or the user's GPU label) for GPU work.")] = "ubuntu-latest",
+                  repo: Annotated[str, Field(description="A repo id from list_repos to check out (its forge copy, at its current branch unless ref); empty for none.")] = "",
+                  image: Annotated[str, Field(description="Container image to run in, e.g. node:24-bookworm; empty for the runner's own.")] = "",
+                  ref: Annotated[str, Field(description="Branch, tag or commit of repo.")] = "") -> dict:
+    """Run one command on the home forge's own runners, like CI, and return its run id. Uses what is pushed to the forge.
+    Follow it with forge_job_status. Jobs run real code on the user's machines: only run what the task needs."""
+    body = {"command": command, "runner": runner, "image": image, "ref": ref}
+    return _call("POST", _r(repo) + "/forge/job" if repo else "/api/forge/jobs", body)
+
+
+@server.tool(annotations=READ)
+def forge_job_status(run_id: Annotated[int, Field(description="The run id forge_job_run returned.")],
+                     logs: Annotated[int, Field(ge=0, le=500, description="Output lines to return once it is done.")] = 80) -> dict:
+    """A forge job's status (waiting = no idle runner with that label yet, running, success, failure, cancelled) and, when done, its output."""
+    return _call("GET", f"/api/forge/jobs/{int(run_id)}", logs=logs)
+
+
+@server.tool(annotations=WRITE)
+def try_in_sandbox(repo: Repo,
+                   command: Annotated[str, Field(min_length=1, description="Run in the repo's folder, e.g. 'apt-get update && apt-get install -y make && make test'.")],
+                   distro: Annotated[Literal["ubuntu", "debian", "fedora", "rocky", "alpine", "arch", "opensuse", "node", "python", "go"],
+                                     Field(description="Linux to try it on (node/python/go come with that toolchain on Debian).")] = "ubuntu",
+                   image: Annotated[str, Field(description="Any other Docker image instead of a distro.")] = "",
+                   offline: Annotated[bool, Field(description="No network at all (nothing can be downloaded).")] = False,
+                   timeout_seconds: Annotated[int, Field(ge=10, le=3600, description="How long the command may run before it is stopped.")] = 900,
+                   keep: Annotated[bool, Field(description="Keep the sandbox for more commands (sandbox tool); else it is removed.")] = False) -> dict:
+    """Try a repo in a throwaway Linux container on Hermes Studio's machine: a clean system, or another distro, with nothing
+    of this machine inside. The repo is copied in as pushed (its home remote, current branch). Returns exit code and output."""
+    body = {"command": command, "distro": distro, "image": image, "network": "none" if offline else "internet",
+            "timeout_seconds": timeout_seconds, "keep": keep}
+    return _call("POST", _r(repo) + "/sandbox", body, timeout_seconds + 700)
+
+
+@server.tool(annotations=WRITE)
+def sandbox(action: Annotated[Literal["list", "create", "exec", "write_file", "read_file", "copy_repo", "extend", "remove"], Field(description="What to do.")],
+            arguments: Annotated[dict, Field(description='The action\'s fields: create {distro or image, network internet/none, minutes, purpose}; '
+                                                         'exec {sandbox, command, workdir, timeoutSeconds}; write_file {sandbox, path, content}; '
+                                                         'read_file {sandbox, path}; copy_repo {sandbox, repo: git URL, ref}; extend {sandbox, minutes}; remove {sandbox}.')] = {}) -> dict:
+    """Studio's throwaway containers, step by step (try_in_sandbox does create, copy, run and remove in one go). Remove sandboxes you are done with."""
+    wait = int((arguments or {}).get("timeoutSeconds") or 300) + 90 if action == "exec" else 700
+    return _call("POST", f"/api/sandboxes/{action}", arguments or {}, wait)
 
 
 # ------------------------------------------------------------------ chats

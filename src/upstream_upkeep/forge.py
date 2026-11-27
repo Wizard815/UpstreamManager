@@ -18,6 +18,7 @@ GitHub, a pull mirror copies a GitHub repo onto the forge on a schedule.
 """
 from __future__ import annotations
 
+import base64
 import os
 import re
 import time
@@ -346,3 +347,136 @@ def issues(owner: str, repo: str, state: str = "open", limit: int = 50) -> list[
 
 def issue(owner: str, repo: str, number: int) -> dict:
     return _api("GET", f"/repos/{quote(owner)}/{quote(repo)}/issues/{int(number)}")
+
+
+# ------------------------------------------------------------ jobs on the forge's runners
+# One command on one of the forge's own runners (e.g. ubuntu-latest, or a GPU runner labelled gpu),
+# optionally in a given container image and with a forge repo checked out. Jobs go through a private
+# jobs repo (LOGIN/hermes-jobs unless Settings -> Accounts names another) that holds one
+# workflow_dispatch workflow. Hermes's forgejo skill (`forge.py job`) writes the very same file to the
+# same repo, so the two share it; keep hermes-job.yml identical to the skill's templates/hermes-job.yml.
+JOB_WORKFLOW = ".forgejo/workflows/hermes-job.yml"
+_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hermes-job.yml")
+DONE = {"success", "failure", "cancelled", "skipped"}
+_MARK = "=== hermes job output ==="
+_STAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ")
+_REPO = re.compile(r"^\w[\w.-]*/\w[\w.-]*$")
+
+
+def jobs_repo() -> tuple[str, str]:
+    """owner, name of the jobs repo: Settings -> Accounts (forge_jobs_repo), else LOGIN/hermes-jobs."""
+    named = (credentials.get("forge_jobs_repo") or "").strip()
+    if named:
+        if not _REPO.match(named):
+            raise ForgeError(f"the jobs repo is OWNER/REPO on the forge, not {named!r} (Settings -> Accounts)")
+        owner, name = named.split("/", 1)
+        return owner, name
+    return _api("GET", "/user")["login"], "hermes-jobs"
+
+
+def job_setup() -> dict:
+    """Make the jobs repo (private) if needed, write the job workflow, and set the JOBS_TOKEN secret jobs
+    check out repos with (UPSTREAM_FORGE_JOBS_TOKEN, a read-only token, else the forge token)."""
+    owner, name = jobs_repo()
+    if _api("GET", f"/repos/{quote(owner)}/{quote(name)}", ok404=True) is None:
+        me = _api("GET", "/user")["login"]
+        path = "/user/repos" if owner == me else f"/orgs/{quote(owner)}/repos"
+        _api("POST", path, json={"name": name, "private": True, "auto_init": True,
+                                 "description": "Jobs run on the forge's runners (Hermes forgejo skill, Upstream Manager)"})
+    with open(_TEMPLATE, encoding="utf-8") as f:
+        wanted = f.read()
+    content = base64.b64encode(wanted.encode()).decode()
+    cur = _api("GET", f"/repos/{quote(owner)}/{quote(name)}/contents/{JOB_WORKFLOW}", ok404=True)
+    if cur is None:
+        _api("POST", f"/repos/{quote(owner)}/{quote(name)}/contents/{JOB_WORKFLOW}", json={"content": content, "message": "job workflow"})
+        workflow = "created"
+    elif base64.b64decode(cur.get("content") or "").decode("utf-8", "replace") != wanted:
+        _api("PUT", f"/repos/{quote(owner)}/{quote(name)}/contents/{JOB_WORKFLOW}",
+             json={"content": content, "sha": cur["sha"], "message": "update job workflow"})
+        workflow = "updated"
+    else:
+        workflow = "unchanged"
+    read_only = os.environ.get("UPSTREAM_FORGE_JOBS_TOKEN", "").strip()
+    _api("PUT", f"/repos/{quote(owner)}/{quote(name)}/actions/secrets/JOBS_TOKEN", json={"data": read_only or _token(None)})
+    return {"ok": True, "jobs_repo": f"{owner}/{name}", "workflow": workflow,
+            "checkout_token": "UPSTREAM_FORGE_JOBS_TOKEN" if read_only else "the forge token"}
+
+
+def _api_text(path: str) -> str:
+    token = _token(None)
+    try:
+        r = requests.get(f"{url()}/api/v1{path}", headers={"Authorization": f"token {token}"}, timeout=30)
+    except requests.RequestException as e:
+        raise ForgeError(f"can't reach the forge at {url()}: {e.__class__.__name__}")
+    if r.status_code >= 400:
+        raise ForgeError(f"forge {r.status_code} reading the job log")
+    return r.text
+
+
+def job_output(log: str, limit: int = 80) -> str:
+    """The command's own lines (after the workflow's marker), without timestamps; the log's tail if no marker."""
+    lines = [_STAMP.sub("", line) for line in log.rstrip().splitlines()]
+    if _MARK in lines:
+        lines = lines[lines.index(_MARK) + 1:]
+        end = next((i for i, line in enumerate(lines) if line.startswith(("⭐ Run Post", "🏁"))), len(lines))
+        lines = lines[:end]
+    return "\n".join(lines[-max(1, int(limit)):])
+
+
+def job_status(run_id: int, logs: int = 80) -> dict:
+    owner, name = jobs_repo()
+    base = f"/repos/{quote(owner)}/{quote(name)}/actions/runs/{int(run_id)}"
+    run = _api("GET", base)
+    jobs = _api("GET", f"{base}/jobs") or []
+    jobs = jobs if isinstance(jobs, list) else jobs.get("jobs") or []
+    ran = [j for j in jobs if j.get("status") != "skipped"] or jobs
+    out = {"ok": True, "run": int(run_id), "status": run.get("status"), "done": run.get("status") in DONE,
+           "title": run.get("title") or run.get("display_title"), "url": run.get("html_url"),
+           "jobs": [{"name": j.get("name"), "status": j.get("status"), "runs_on": j.get("runs_on")} for j in ran]}
+    if out["status"] == "waiting":
+        out["note"] = "waiting: no idle runner has this label yet"
+    if logs and ran and ran[0].get("status") in DONE:
+        text = job_output(_api_text(f"/repos/{quote(owner)}/{quote(name)}/actions/jobs/{int(ran[0]['id'])}/logs"), logs)
+        tok = credentials.get("forge_token") or ""
+        out["output"] = text.replace(tok, "****") if tok else text
+    return out
+
+
+def job_run(command: str, runner: str = "ubuntu-latest", image: str = "", repo: str = "", ref: str = "", title: str = "") -> dict:
+    """Dispatch one job and return at once with its run id (job_status follows it)."""
+    command = (command or "").strip()
+    if not command:
+        raise ForgeError("give the command to run")
+    runner = (runner or "ubuntu-latest").strip()
+    if not re.match(r"^[\w.-]{1,64}$", runner):
+        raise ForgeError("runner is a runner label, e.g. ubuntu-latest or gpu")
+    if repo and not _REPO.match(repo):
+        raise ForgeError("repo is OWNER/REPO on the forge")
+    if image and not re.match(r"^[\w][\w.\-/:@]{0,299}$", image):
+        raise ForgeError("image is a container image name, e.g. node:24-bookworm")
+    if ref and not re.match(r"^[\w./-]{1,200}$", ref):
+        raise ForgeError("ref is a branch, tag or commit")
+    owner, name = jobs_repo()
+    inputs = {"runner": runner, "image": image or "", "repo": repo or "", "ref": ref or "",
+              "command": command, "title": (title or command)[:120]}
+    try:
+        run = _api("POST", f"/repos/{quote(owner)}/{quote(name)}/actions/workflows/hermes-job.yml/dispatches",
+                   json={"ref": "main", "inputs": inputs, "return_run_info": True})
+    except ForgeError as e:
+        if "404" in str(e):
+            raise ForgeError(f"no job workflow in {owner}/{name} yet: press Set up jobs (or POST /api/forge/jobs/setup) once") from None
+        raise
+    return job_status(int(run["id"]), logs=0)
+
+
+def runners() -> list[dict]:
+    """The forge's runners and their labels (needs an admin token, else the user's own runners)."""
+    for path in ("/admin/actions/runners", "/user/actions/runners"):
+        try:
+            data = _api("GET", path)
+        except ForgeError:
+            continue
+        items = data if isinstance(data, list) else (data or {}).get("runners") or (data or {}).get("entries") or []
+        return [{"name": r.get("name"), "status": r.get("status"),
+                 "labels": [lb.get("name") if isinstance(lb, dict) else lb for lb in r.get("labels") or []]} for r in items]
+    raise ForgeError("the forge token can't list runners (that needs an admin token); type the label, e.g. ubuntu-latest or gpu")

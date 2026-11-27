@@ -532,6 +532,33 @@ is in the Overseer repo, `deploy/forgejo/`.
   write access only to the repos you mirror.
 - Pull mirrors need an `https://` source: Forgejo refuses plain http.
 
+## Test somewhere clean (forge runners and Studio sandboxes)
+
+The Publish tab's **Test somewhere clean** card runs a command on what is
+pushed (the current branch), away from this machine. Agents get the same as
+the MCP tools `forge_job_run`, `forge_job_status`, `forge_runners`,
+`try_in_sandbox` and `sandbox`.
+
+- **Run on forge runner** runs it on one of the forge's runners, like CI, with
+  the repo's forge copy checked out. Type the runner label: `ubuntu-latest`,
+  or your GPU runner's label (`gpu`). An image runs it in that container.
+  Press **Set up jobs** once: it makes a private `YOUR-LOGIN/hermes-jobs` repo
+  (or the one in Settings → Accounts, **Forge jobs repo**) with the job
+  workflow and a `JOBS_TOKEN` secret for checkouts (`UPSTREAM_FORGE_JOBS_TOKEN`,
+  a read-only token, else the forge token). Hermes's forgejo skill uses the
+  same repo and file. A GitHub-only repo needs a forge copy or pull mirror
+  first.
+- **Run in Studio sandbox** makes a throwaway container on Hermes Studio's
+  machine (ubuntu, debian, fedora, rocky, alpine, arch, opensuse, or node,
+  python and go images), copies the repo in, runs the command and removes it.
+  **No network** cuts it off from everything; **keep it** leaves it for more
+  commands (Studio's Test Lab page lists and removes sandboxes). Needs the
+  Hermes Studio connection.
+
+What goes wrong: a job that stays **waiting** means no idle runner has that
+label. "no job workflow" means **Set up jobs** wasn't run. "Studio isn't set
+up" means the Hermes Studio connection is off (Settings → Connections).
+
 ## Actions (forks)
 
 A fork runs every workflow it inherits, and upstream's release, deploy and
