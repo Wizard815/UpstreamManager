@@ -44,6 +44,14 @@ class GitError(Exception):
     pass
 
 
+def forge_env(url: str) -> dict[str, str] | None:
+    """The forge token as a one-off header when `url` is on the homelab forge
+    (private repos there can't be read without it), else None. See forge.py."""
+    from . import credentials, forge
+    token = credentials.get("forge_token")
+    return forge.auth_env(token) if token and forge.sends_token_to(url) else None
+
+
 def _git(args: list[str], cwd: str) -> str:
     res = _run(["git", *args], cwd=cwd)
     if res.returncode != 0:
@@ -94,7 +102,7 @@ def remotes(path: str) -> dict[str, str]:
 
 def clone_into(dest: str, url: str) -> None:
     """Clone `url` into `dest`."""
-    res = _run(["git", "clone", url, dest], check=False)
+    res = _run(["git", "clone", url, dest], check=False, extra_env=forge_env(url))
     if res.returncode != 0:
         raise GitError(f"clone failed: {res.stderr.strip() or res.stdout.strip() or 'unknown error'}")
 
@@ -170,7 +178,7 @@ def fetch(path: str, remote: str, branch: str | None = None) -> tuple[bool, str]
         args += ["--no-tags", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"]
     else:
         args.append(remote)
-    res = _run(args, cwd=path, timeout=FETCH_TIMEOUT)
+    res = _run(args, cwd=path, timeout=FETCH_TIMEOUT, extra_env=forge_env(_remotes(path).get(remote, "")))
     return res.returncode == 0, (res.stderr or res.stdout).strip()
 
 

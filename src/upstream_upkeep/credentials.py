@@ -1,4 +1,4 @@
-"""Credentials for GitHub and Docker Hub, kept out of the app's state file.
+"""Credentials for GitHub, the homelab forge and Docker Hub, kept out of the app's state file.
 
 Lookup order for each value:
   1. environment variable (UPSTREAM_GITHUB_TOKEN, UPSTREAM_DOCKERHUB_USERNAME,
@@ -22,6 +22,8 @@ from . import config
 SERVICE = "upstream-manager"
 FIELDS = {
     "github_token": "UPSTREAM_GITHUB_TOKEN",
+    "forge_url": "UPSTREAM_FORGE_URL",        # the homelab's Forgejo/Gitea, e.g. http://forgejo:3000 (see forge.py)
+    "forge_token": "UPSTREAM_FORGE_TOKEN",    # an access token on that forge
     "dockerhub_username": "UPSTREAM_DOCKERHUB_USERNAME",
     "dockerhub_token": "UPSTREAM_DOCKERHUB_TOKEN",
     "wiki_api_key": "UPSTREAM_WIKI_API_KEY",  # the vault's Obsidian Local REST API key
@@ -32,7 +34,7 @@ FIELDS = {
     "ntfy_token": "UPSTREAM_NTFY_TOKEN",          # an ntfy access token, for a protected topic
     "gotify_token": "UPSTREAM_GOTIFY_TOKEN",      # a Gotify application token  # the login Studio hands over when Upstream opens in its tab
 }
-SECRET_FIELDS = {"github_token", "dockerhub_token", "wiki_api_key", "orb_token", "hermes_api_key", "studio_token", "studio_proxy_token", "ntfy_token", "gotify_token"}  # usernames are not secret
+SECRET_FIELDS = {"github_token", "forge_token", "dockerhub_token", "wiki_api_key", "orb_token", "hermes_api_key", "studio_token", "studio_proxy_token", "ntfy_token", "gotify_token"}  # usernames are not secret
 
 
 def _file() -> Path:

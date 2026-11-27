@@ -9,6 +9,10 @@ The GitHub token (credentials.github_token) is used two ways:
   * the REST API - opening pull requests and setting repository Actions
     secrets (encrypted with the repo's public key, as GitHub requires).
 
+Remotes on the homelab's own forge (Forgejo/Gitea, see forge.py) get the
+forge token the same way, sent only to the forge's hosts; `forge="forge"` on
+open_pr / set_secret / secret_names sends those calls to the forge's API.
+
 Recommended token: fine-grained, limited to the repos you manage, with
 Contents, Pull requests, Secrets and Actions: read/write, and
 Workflows: read/write (needed to push changes under .github/workflows).
@@ -94,13 +98,19 @@ def push(repo_path: str, remote: str, branch: str, head: str | None = None) -> d
     url = gitops.remotes(repo_path).get(remote)
     if not url:
         raise GitHubError(f"no remote named {remote}")
-    token = credentials.get("github_token")
-    extra = auth_env(token) if token and parse_remote(url) and url.startswith("https://") else None
+    from . import forge
+    token, extra = credentials.get("github_token"), None
+    if token and parse_remote(url) and url.startswith("https://"):
+        extra = auth_env(token)
+    elif forge.sends_token_to(url) and credentials.get("forge_token"):
+        token = credentials.get("forge_token")
+        extra = forge.auth_env(token)
     res = gitops._run(["git", "push", "--porcelain", remote, f"{source}:refs/heads/{branch}"],
                       cwd=repo_path, extra_env=extra)
     out = (res.stdout + res.stderr).strip()
-    if token:
-        out = out.replace(token, "****")
+    for secret in {token, credentials.get("forge_token")}:
+        if secret:
+            out = out.replace(secret, "****")
     if res.returncode != 0:
         if "rejected" in out or "non-fast-forward" in out:
             raise GitHubError(f"{remote}/{branch} has commits this branch doesn't have; fetch and merge first")
@@ -110,8 +120,11 @@ def push(repo_path: str, remote: str, branch: str, head: str | None = None) -> d
     return {"ok": True, "detail": f"pushed {branch} to {remote}", "auth": "token" if extra else "machine login", "output": out[-600:]}
 
 
-def open_pr(owner: str, repo: str, head: str, base: str, title: str, body: str) -> dict:
+def open_pr(owner: str, repo: str, head: str, base: str, title: str, body: str, forge: str = "github") -> dict:
     """Open a PR head -> base, or return the one already open."""
+    if forge == "forge":
+        from . import forge as home
+        return home.open_pr(owner, repo, head, base, title, body)
     try:
         pr = _api("POST", f"/repos/{owner}/{repo}/pulls", json={"title": title, "head": head, "base": base, "body": body})
         return {"url": pr["html_url"], "number": pr["number"], "existing": False}
@@ -124,8 +137,11 @@ def open_pr(owner: str, repo: str, head: str, base: str, title: str, body: str) 
     return {"url": found[0]["html_url"], "number": found[0]["number"], "existing": True}
 
 
-def set_secret(owner: str, repo: str, name: str, value: str) -> None:
+def set_secret(owner: str, repo: str, name: str, value: str, forge: str = "github") -> None:
     """Create or update a repository Actions secret."""
+    if forge == "forge":
+        from . import forge as home
+        return home.set_secret(owner, repo, name, value)
     from nacl import encoding, public
     if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name) or name.startswith("GITHUB_"):
         raise GitHubError(f"invalid secret name {name}")
@@ -135,7 +151,10 @@ def set_secret(owner: str, repo: str, name: str, value: str) -> None:
     _api("PUT", f"/repos/{owner}/{repo}/actions/secrets/{name}", json={"encrypted_value": sealed, "key_id": key["key_id"]})
 
 
-def secret_names(owner: str, repo: str) -> list[str]:
+def secret_names(owner: str, repo: str, forge: str = "github") -> list[str]:
+    if forge == "forge":
+        from . import forge as home
+        return home.secret_names(owner, repo)
     return [s["name"] for s in _api("GET", f"/repos/{owner}/{repo}/actions/secrets").get("secrets", [])]
 
 

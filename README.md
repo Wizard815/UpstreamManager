@@ -502,6 +502,31 @@ Each repo's **Publish** tab:
 - **Copy Docker Hub login to GitHub secrets** sets those two secrets on the
   repo, encrypted with the repo's public key.
 
+## Home forge (Forgejo or Gitea) and mirrors
+
+Repos can live on your own forge instead of, or as well as, GitHub. Set the
+forge's address and a token in **Settings → Accounts** (or
+`UPSTREAM_FORGE_URL` and `UPSTREAM_FORGE_TOKEN`). If the same forge answers
+under other addresses, list them in `UPSTREAM_FORGE_HOSTS`, comma separated
+(`forgejo:3000,192.168.20.5:3030`). The forge token is sent only to those
+hosts; the GitHub token only to github.com. The Unraid compose for the forge
+is in the Overseer repo, `deploy/forgejo/`.
+
+- **Home.** Each repo has one remote it pushes to by default. Pick it in
+  Publish with **Make home**; otherwise it is `origin`. Pushes, pull requests
+  and Actions secrets go to whichever forge that remote is on.
+- **Create private copy on the forge** makes an empty private repo there,
+  adds it as remote `forge`, and can make it home and mirror it on to the
+  repo's GitHub remote. Then push the branch as usual.
+- **Mirrors** are the forge's own. A push mirror sends every push on the forge
+  on to GitHub. A pull mirror (`POST /api/forge/import`) copies a GitHub repo
+  onto the forge and fetches it every 8 hours. **Sync now** runs either one.
+- Commit on one side only. A mirror stops at the first conflict, and the forge
+  shows the error under the repo's mirror settings.
+- The forge keeps the GitHub token for each mirror it runs, so give that token
+  write access only to the repos you mirror.
+- Pull mirrors need an `https://` source: Forgejo refuses plain http.
+
 ## Actions (forks)
 
 A fork runs every workflow it inherits, and upstream's release, deploy and
