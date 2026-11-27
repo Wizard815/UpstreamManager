@@ -899,6 +899,14 @@ def api_forge_job_run():
         return jsonify({"ok": False, "error": str(e)})
 
 
+@flask_app.route("/api/forge/jobs/<int:run_id>/cancel", methods=["POST"])
+def api_forge_job_cancel(run_id):
+    try:
+        return jsonify(forge.job_cancel(run_id))
+    except github.GitHubError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 @flask_app.route("/api/forge/jobs/<int:run_id>")
 def api_forge_job_status(run_id):
     try:

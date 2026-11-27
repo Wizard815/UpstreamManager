@@ -466,7 +466,7 @@ def jobs_repo() -> tuple[str, str]:
 
 def job_setup() -> dict:
     """Make the jobs repo (private) if needed, write the job workflow, and set the JOBS_TOKEN secret jobs
-    check out repos with (UPSTREAM_FORGE_JOBS_TOKEN, a read-only token, else the forge token)."""
+    check out repos with: UPSTREAM_FORGE_JOBS_TOKEN, a read-only token, or none."""
     owner, name = jobs_repo()
     if _api("GET", f"/repos/{quote(owner)}/{quote(name)}", ok404=True) is None:
         me = _api("GET", "/user")["login"]
@@ -486,10 +486,16 @@ def job_setup() -> dict:
         workflow = "updated"
     else:
         workflow = "unchanged"
-    read_only = os.environ.get("UPSTREAM_FORGE_JOBS_TOKEN", "").strip()
-    _api("PUT", f"/repos/{quote(owner)}/{quote(name)}/actions/secrets/JOBS_TOKEN", json={"data": read_only or _token(None)})
+    # Never the forge token: it can write every repo, and job commands are code from a model.
+    read_only = (credentials.get("forge_jobs_token") or "").strip()
+    secret = f"/repos/{quote(owner)}/{quote(name)}/actions/secrets/JOBS_TOKEN"
+    if read_only:
+        _api("PUT", secret, json={"data": read_only})
+    else:  # also takes back a full token an older setup left there
+        _api("DELETE", secret, ok404=True)
     return {"ok": True, "jobs_repo": f"{owner}/{name}", "workflow": workflow,
-            "checkout_token": "UPSTREAM_FORGE_JOBS_TOKEN" if read_only else "the forge token"}
+            "checkout_token": "UPSTREAM_FORGE_JOBS_TOKEN" if read_only else
+            "the run's own token (only the jobs repo and public repos): save a read-only Forge jobs token to check out private repos"}
 
 
 def _api_text(path: str) -> str:
@@ -503,14 +509,33 @@ def _api_text(path: str) -> str:
     return r.text
 
 
+_CHATTER = ("⭐ Run Post", "🏁", "⚙️ [runner]", "skipping post step", "Cleaning up container")
+_EXIT = re.compile(r"exitcode '(\d+)'")
+
+
 def job_output(log: str, limit: int = 80) -> str:
-    """The command's own lines (after the workflow's marker), without timestamps; the log's tail if no marker."""
+    """The command's own lines (after the workflow's marker, before the runner's own lines), without
+    timestamps; the log's tail if no marker (e.g. the image could not be pulled)."""
     lines = [_STAMP.sub("", line) for line in log.rstrip().splitlines()]
     if _MARK in lines:
         lines = lines[lines.index(_MARK) + 1:]
-        end = next((i for i, line in enumerate(lines) if line.startswith(("⭐ Run Post", "🏁"))), len(lines))
+        end = next((i for i, line in enumerate(lines) if line.lstrip().startswith(_CHATTER)), len(lines))
         lines = lines[:end]
     return "\n".join(lines[-max(1, int(limit)):])
+
+
+def job_exit_code(log: str) -> int | None:
+    """The command's exit code when the runner reported a failure (it prints none on success)."""
+    m = _EXIT.search(log)
+    return int(m.group(1)) if m else None
+
+
+def runner_labels() -> set[str] | None:
+    """Every label some runner has, or None when the token can't see the runners."""
+    try:
+        return {lb for r in runners() for lb in r["labels"] if lb} or None
+    except ForgeError:
+        return None
 
 
 def job_status(run_id: int, logs: int = 80) -> dict:
@@ -526,9 +551,11 @@ def job_status(run_id: int, logs: int = 80) -> dict:
     if out["status"] == "waiting":
         out["note"] = "waiting: no idle runner has this label yet"
     if logs and ran and ran[0].get("status") in DONE:
-        text = job_output(_api_text(f"/repos/{quote(owner)}/{quote(name)}/actions/jobs/{int(ran[0]['id'])}/logs"), logs)
+        log = _api_text(f"/repos/{quote(owner)}/{quote(name)}/actions/jobs/{int(ran[0]['id'])}/logs")
+        text = job_output(log, logs)
         tok = credentials.get("forge_token") or ""
         out["output"] = text.replace(tok, "****") if tok else text
+        out["exit_code"] = 0 if out["status"] == "success" else job_exit_code(log)
     return out
 
 
@@ -546,7 +573,13 @@ def job_run(command: str, runner: str = "ubuntu-latest", image: str = "", repo: 
         raise ForgeError("image is a container image name, e.g. node:24-bookworm")
     if ref and not re.match(r"^[\w./-]{1,200}$", ref):
         raise ForgeError("ref is a branch, tag or commit")
+    labels = runner_labels()
+    if labels is not None and runner not in labels:
+        raise ForgeError(f"no runner has the label {runner!r}, so the job would wait forever. Labels: {', '.join(sorted(labels))}")
     owner, name = jobs_repo()
+    if repo and not ref:  # the job's own token can't look this up for another repo
+        r_owner, r_name = repo.split("/", 1)
+        ref = (_api("GET", f"/repos/{quote(r_owner)}/{quote(r_name)}") or {}).get("default_branch") or ""
     inputs = {"runner": runner, "image": image or "", "repo": repo or "", "ref": ref or "",
               "command": command, "title": (title or command)[:120]}
     try:
@@ -557,6 +590,13 @@ def job_run(command: str, runner: str = "ubuntu-latest", image: str = "", repo: 
             raise ForgeError(f"no job workflow in {owner}/{name} yet: press Set up jobs (or POST /api/forge/jobs/setup) once") from None
         raise
     return job_status(int(run["id"]), logs=0)
+
+
+def job_cancel(run_id: int) -> dict:
+    """Stop a job that is waiting or running."""
+    owner, name = jobs_repo()
+    _api("POST", f"/repos/{quote(owner)}/{quote(name)}/actions/runs/{int(run_id)}/cancel")
+    return job_status(run_id, logs=0)
 
 
 def runners() -> list[dict]:

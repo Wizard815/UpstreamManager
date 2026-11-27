@@ -48,12 +48,16 @@ class FakeForgeApi:
                 return self.files.get(path) if path in self.files else None
             self.files[path] = {"content": body["content"], "sha": "s1"}
             return {}
+        if path == "/repos/w/r":
+            return {"full_name": "w/r", "default_branch": "trunk"}
         if path == "/repos/wizard/hermes-jobs":
             return {"name": "hermes-jobs"} if "hermes-jobs" in self.repos else None
         if path == "/user/repos":
             self.repos.add(body["name"])
             return {}
         if path.endswith("/actions/secrets/JOBS_TOKEN"):
+            if method == "DELETE":
+                return {} if self.secrets.pop("JOBS_TOKEN", None) else None
             self.secrets["JOBS_TOKEN"] = body["data"]
             return {}
         if path.endswith("/dispatches"):
@@ -64,7 +68,11 @@ class FakeForgeApi:
             return [{"id": 7, "name": "run", "status": self.run_status, "runs_on": ["gpu"]},
                     {"id": 8, "name": "run-in-image", "status": "skipped"}]
         if path == "/admin/actions/runners":
-            return [{"name": "forgebot-2", "status": "idle", "labels": [{"name": "gpu"}]}]
+            return [{"name": "forgebot-1", "status": "idle", "labels": ["ubuntu-latest"]},
+                    {"name": "forgebot-2", "status": "idle", "labels": [{"name": "gpu"}]}]
+        if path.endswith("/actions/runs/41/cancel"):
+            self.run_status = "cancelled"
+            return {}
         raise AssertionError(f"unexpected {method} {path}")
 
 
@@ -85,15 +93,35 @@ def test_job_workflow_is_the_same_file_hermes_writes():
 
 
 def test_job_setup_makes_the_private_jobs_repo_workflow_and_secret(fake_api, monkeypatch):
+    fake_api.secrets["JOBS_TOKEN"] = TOKEN  # what an older setup left there
     out = forge.job_setup()
-    assert out == {"ok": True, "jobs_repo": "wizard/hermes-jobs", "workflow": "created", "checkout_token": "the forge token"}
+    assert out["workflow"] == "created" and out["checkout_token"].startswith("the run's own token")
     assert ("POST", "/user/repos", {"name": "hermes-jobs", "private": True, "auto_init": True,
                                     "description": "Jobs run on the forge's runners (Hermes forgejo skill, Upstream Manager)"}) in fake_api.calls
     path = f"/repos/wizard/hermes-jobs/contents/{forge.JOB_WORKFLOW}"
     assert base64.b64decode(fake_api.files[path]["content"]).decode() == open(forge._TEMPLATE, encoding="utf-8").read()
-    assert fake_api.secrets["JOBS_TOKEN"] == TOKEN
-    monkeypatch.setenv("UPSTREAM_FORGE_JOBS_TOKEN", "readonly")
-    assert forge.job_setup()["workflow"] == "unchanged" and fake_api.secrets["JOBS_TOKEN"] == "readonly"
+    # the write token never goes to jobs, and an old copy of it is taken back
+    assert "JOBS_TOKEN" not in fake_api.secrets and TOKEN not in str([c[2] for c in fake_api.calls])
+    credentials.set("forge_jobs_token", "readonly")
+    out = forge.job_setup()
+    assert out["workflow"] == "unchanged" and out["checkout_token"] == "UPSTREAM_FORGE_JOBS_TOKEN"
+    assert fake_api.secrets["JOBS_TOKEN"] == "readonly"
+
+
+def test_job_checkout_leaves_no_token_for_the_command():
+    wf = open(forge._TEMPLATE, encoding="utf-8").read()
+    assert wf.count("uses: actions/checkout@v4") == wf.count("persist-credentials: false") == 2
+    assert "secrets.FORGE_TOKEN" not in wf and wf.count("${{ secrets.JOBS_TOKEN || github.token }}") == 2
+    # the command gets only its own text, never a secret, in its environment
+    for step in wf.split("- name: command")[1:]:
+        assert "secrets." not in step.split("steps:")[0]
+
+
+def test_job_with_a_repo_and_no_ref_sends_its_default_branch(fake_api):
+    # the run's own token can't look up another repo's default branch, so Upstream does
+    forge.job_run("ls", repo="w/r")
+    body = next(c[2] for c in fake_api.calls if c[1].endswith("/dispatches"))
+    assert body["inputs"]["repo"] == "w/r" and body["inputs"]["ref"] == "trunk"
 
 
 def test_repo_job_checks_out_its_forge_copy_and_reports_masked_output(fake_api, client, repos):
@@ -123,7 +151,21 @@ def test_jobs_refuse_bad_input_and_say_what_to_do(fake_api, client, repos):
 
 
 def test_runners_lists_labels(fake_api, client):
-    assert client.get("/api/forge/runners").get_json()["runners"] == [{"name": "forgebot-2", "status": "idle", "labels": ["gpu"]}]
+    assert client.get("/api/forge/runners").get_json()["runners"][1] == {"name": "forgebot-2", "status": "idle", "labels": ["gpu"]}
+
+
+def test_a_label_no_runner_has_is_refused_instead_of_waiting_forever(fake_api, client):
+    r = client.post("/api/forge/jobs", json={"command": "x", "runner": "gpu2"}).get_json()
+    assert "no runner has the label 'gpu2'" in r["error"] and "gpu, ubuntu-latest" in r["error"]
+    assert not any(c[1].endswith("/dispatches") for c in fake_api.calls)
+
+
+def test_cancel_and_exit_code(fake_api, client, monkeypatch):
+    assert client.post("/api/forge/jobs/41/cancel", json={}).get_json()["status"] == "cancelled"
+    fake_api.run_status = "failure"
+    monkeypatch.setattr(forge, "_api_text", lambda path: "setup\n=== hermes job output ===\nboom\n⚙️ [runner]: exitcode '7': failure\nskipping post step for 'x'\n")
+    r = client.get("/api/forge/jobs/41").get_json()
+    assert r["output"] == "boom" and r["exit_code"] == 7
 
 
 # ------------------------------------------------------------------ sandboxes through Studio

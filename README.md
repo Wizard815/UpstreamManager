@@ -576,8 +576,11 @@ the MCP tools `forge_job_run`, `forge_job_status`, `forge_runners`,
   or your GPU runner's label (`gpu`). An image runs it in that container.
   Press **Set up jobs** once: it makes a private `YOUR-LOGIN/hermes-jobs` repo
   (or the one in Settings → Accounts, **Forge jobs repo**) with the job
-  workflow and a `JOBS_TOKEN` secret for checkouts (`UPSTREAM_FORGE_JOBS_TOKEN`,
-  a read-only token, else the forge token). Hermes's forgejo skill uses the
+  workflow and a `JOBS_TOKEN` secret for checkouts from **Forge jobs token**
+  (`UPSTREAM_FORGE_JOBS_TOKEN`, a read-only `read:repository` token). It never
+  hands jobs the forge token, which can write every repo, and the checkout
+  leaves no token where the command can read it. Without a jobs token, jobs can
+  check out only public repos. Hermes's forgejo skill uses the
   same repo and file. A GitHub-only repo needs a forge copy or pull mirror
   first.
 - **Run in Studio sandbox** makes a throwaway container on Hermes Studio's

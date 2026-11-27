@@ -2344,6 +2344,7 @@ async function renderSettings() {
       accRow("forge_url", "Home forge address (Forgejo or Gitea), as this machine reaches it", "text", "http://forgejo:3000"),
       accRow("forge_token", "Home forge token (write:repository, write:issue, read:user)", "password", "token from the forge's Settings → Applications"),
       accRow("forge_default_home", "Default home: forge (a repo with a forge remote pushes there unless you pick another), or blank for origin", "text", "forge"),
+      accRow("forge_jobs_token", "Forge jobs token (read:repository only): runner jobs check out private repos with it", "password", "a read-only token"),
       accRow("forge_callback_url", "Upstream's address as the forge reaches it (for push webhooks), e.g. http://upstream-manager:5000", "text", "http://upstream-manager:5000"),
       accRow("forge_jobs_repo", "Forge jobs repo (OWNER/REPO that runner jobs go through; shared with Hermes), or blank for YOUR-LOGIN/hermes-jobs", "text", "wizard/hermes-jobs"),
       accRow("dockerhub_username", "Docker Hub username", "text", "username"),
@@ -2368,7 +2369,7 @@ async function renderSettings() {
     removeBtn.onclick = () => {
       if (!confirm("Remove the saved GitHub token, forge address and token, and Docker Hub login? (Environment variables are not affected.)")) return
       return busy(removeBtn, "Removing…", async () => {
-        await api(apiUrl('/api/credentials'), { method: "POST", body: JSON.stringify({ github_token: "", forge_url: "", forge_token: "", forge_default_home: "", forge_jobs_repo: "", forge_callback_url: "", dockerhub_username: "", dockerhub_token: "" }) })
+        await api(apiUrl('/api/credentials'), { method: "POST", body: JSON.stringify({ github_token: "", forge_url: "", forge_token: "", forge_default_home: "", forge_jobs_repo: "", forge_jobs_token: "", forge_callback_url: "", dockerhub_username: "", dockerhub_token: "" }) })
         toast("Removed", "ok"); await renderSettings()
       })
     }

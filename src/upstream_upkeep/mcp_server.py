@@ -581,6 +581,12 @@ def forge_job_status(run_id: Annotated[int, Field(description="The run id forge_
 
 
 @server.tool(annotations=WRITE)
+def forge_job_cancel(run_id: Annotated[int, Field(description="The run id forge_job_run returned.")]) -> dict:
+    """Stop a forge job that is waiting or running (e.g. one you started by mistake)."""
+    return _call("POST", f"/api/forge/jobs/{int(run_id)}/cancel", {})
+
+
+@server.tool(annotations=WRITE)
 def try_in_sandbox(repo: Repo,
                    command: Annotated[str, Field(min_length=1, description="Run in the repo's folder, e.g. 'apt-get update && apt-get install -y make && make test'.")],
                    distro: Annotated[Literal["ubuntu", "debian", "fedora", "rocky", "alpine", "arch", "opensuse", "node", "python", "go"],

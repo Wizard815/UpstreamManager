@@ -34,7 +34,10 @@ jobs:
         with:
           repository: ${{ inputs.repo }}
           ref: ${{ inputs.ref }}
-          token: ${{ secrets.JOBS_TOKEN }}
+          # a read-only token if job setup was given one, else this run's own token;
+          # never left in .git/config, where the command could read it
+          token: ${{ secrets.JOBS_TOKEN || github.token }}
+          persist-credentials: false
       - name: command
         env:
           HERMES_JOB_COMMAND: ${{ inputs.command }}
@@ -52,7 +55,10 @@ jobs:
         with:
           repository: ${{ inputs.repo }}
           ref: ${{ inputs.ref }}
-          token: ${{ secrets.JOBS_TOKEN }}
+          # a read-only token if job setup was given one, else this run's own token;
+          # never left in .git/config, where the command could read it
+          token: ${{ secrets.JOBS_TOKEN || github.token }}
+          persist-credentials: false
       - name: command
         env:
           HERMES_JOB_COMMAND: ${{ inputs.command }}
