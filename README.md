@@ -513,8 +513,13 @@ hosts; the GitHub token only to github.com. The Unraid compose for the forge
 is in the Overseer repo, `deploy/forgejo/`.
 
 - **Home.** Each repo has one remote it pushes to by default. Pick it in
-  Publish with **Make home**; otherwise it is `origin`. Pushes, pull requests
-  and Actions secrets go to whichever forge that remote is on.
+  Publish with **Make home**; otherwise it is `origin`, or the repo's forge
+  remote when **Default home** in Settings → Accounts is `forge`
+  (`UPSTREAM_FORGE_DEFAULT_HOME=forge`). Pushes, pull requests and Actions
+  secrets go to whichever forge that remote is on.
+- **Workflows** shows each repo's home CI: GitHub Actions, or Forgejo Actions
+  for a forge home (the forge lists only workflows that have run).
+- **Import issues** reads issues from a GitHub or forge remote.
 - **Create private copy on the forge** makes an empty private repo there,
   adds it as remote `forge`, and can make it home and mirror it on to the
   repo's GitHub remote. Then push the branch as usual.

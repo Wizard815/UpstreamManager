@@ -414,7 +414,7 @@ async function renderRepoPage(repoId) {
     menu(`More actions for ${repo.name || repoId}`, [
       { label: "New task…", run: () => taskDialog({ repo: repoId }) },
       { label: "Groups…", run: editGroups },
-      { label: "Import GitHub issues…", run: () => issuesDialog(repoId) },
+      { label: "Import issues…", run: () => issuesDialog(repoId) },
       { label: "Copy folder path", run: () => { navigator.clipboard?.writeText(repo.path); toast("Path copied", "ok") } },
       { label: "Remove from Upstream Manager", danger: true, run: removeRepo },
     ])))
@@ -2254,6 +2254,7 @@ async function renderSettings() {
       accRow("github_token", "GitHub token (fine-grained: Contents, Pull requests, Secrets, Workflows, Actions read/write)", "password", "github_pat_…"),
       accRow("forge_url", "Home forge address (Forgejo or Gitea), as this machine reaches it", "text", "http://forgejo:3000"),
       accRow("forge_token", "Home forge token (write:repository, write:issue, read:user)", "password", "token from the forge's Settings → Applications"),
+      accRow("forge_default_home", "Default home: forge (a repo with a forge remote pushes there unless you pick another), or blank for origin", "text", "forge"),
       accRow("dockerhub_username", "Docker Hub username", "text", "username"),
       accRow("dockerhub_token", "Docker Hub access token (Account settings → Personal access tokens)", "password", "dckr_pat_…"),
     ]
@@ -2276,7 +2277,7 @@ async function renderSettings() {
     removeBtn.onclick = () => {
       if (!confirm("Remove the saved GitHub token, forge address and token, and Docker Hub login? (Environment variables are not affected.)")) return
       return busy(removeBtn, "Removing…", async () => {
-        await api(apiUrl('/api/credentials'), { method: "POST", body: JSON.stringify({ github_token: "", forge_url: "", forge_token: "", dockerhub_username: "", dockerhub_token: "" }) })
+        await api(apiUrl('/api/credentials'), { method: "POST", body: JSON.stringify({ github_token: "", forge_url: "", forge_token: "", forge_default_home: "", dockerhub_username: "", dockerhub_token: "" }) })
         toast("Removed", "ok"); await renderSettings()
       })
     }
@@ -2360,14 +2361,14 @@ function herdrPicker(ints, current) {
 }
 
 let drawDests = null
-// Import GitHub issues as Work tasks: pick a remote and the issues; ones already imported link to their task.
+// Import GitHub or forge issues as Work tasks: pick a remote and the issues; ones already imported link to their task.
 async function issuesDialog(repoId) {
   const body = el("div", { class: "col", style: "gap:10px;min-width:min(620px,86vw)" }, loading("Asking GitHub…"))
-  let close = openDialog("Import GitHub issues", body), remote = "", state = "open"
+  let close = openDialog("Import issues", body), remote = "", state = "open"
   const draw = async () => {
-    body.replaceChildren(loading("Asking GitHub…"))
+    body.replaceChildren(loading("Fetching issues…"))
     const r = await api(apiUrl(`/api/repo/${repoId}/issues?state=${state}${remote ? `&remote=${encodeURIComponent(remote)}` : ""}`)).catch(e => ({ ok: false, error: e.message }))
-    const remSel = el("select", { "aria-label": "Remote" }, ...(r.remotes || []).map(x => el("option", { value: x.remote }, `${x.remote} · ${x.slug}`)))
+    const remSel = el("select", { "aria-label": "Remote" }, ...(r.remotes || []).map(x => el("option", { value: x.remote }, `${x.remote} · ${x.slug}${x.forge === "forge" ? " (forge)" : ""}`)))
     remSel.value = r.source?.remote || remote; remSel.onchange = () => { remote = remSel.value; draw() }
     const stSel = el("select", { "aria-label": "Which issues" }, ...["open", "closed", "all"].map(x => el("option", { value: x }, x)))
     stSel.value = state; stSel.onchange = () => { state = stSel.value; draw() }
@@ -2551,7 +2552,7 @@ async function renderWork() {
   }
   repoSel.onchange = () => { repoF = repoSel.value; draw() }
   const newBtn = el("button", { class: "btn", onclick: () => taskDialog({ repo: repoF || undefined }) }, "+ New task")
-  const issuesBtn = el("button", { class: "btn ghost", title: "Make tasks of a repo's GitHub issues", onclick: () => repoF ? issuesDialog(repoF) : toast("Pick a repo first (the list above)", "info") }, "Import issues")
+  const issuesBtn = el("button", { class: "btn ghost", title: "Make tasks of a repo's GitHub or forge issues", onclick: () => repoF ? issuesDialog(repoF) : toast("Pick a repo first (the list above)", "info") }, "Import issues")
   let view = picked ? "list" : params.get("view") === "board" ? "board" : params.get("view") === "list" ? "list" : store_.get("workView", "list")
   const viewBar = el("div", { class: "tabs", role: "tablist", "aria-label": "View" })
   const grid = el("div", { class: "work-grid" }, el("div", { class: "col", style: "gap:12px;min-width:0" }, el("div", { class: "panel", style: "min-width:0" }, fbar, listBox), roster), detail)
@@ -3623,7 +3624,7 @@ async function renderWorkflows(refresh = false) {
     if (r.ok) {
       const c = r.counts || {}
       head.append(c.failing ? badge("bad", `${c.failing} failing`) : "", c.running ? badge("info", `${c.running} running`) : "",
-        badge(c.failing ? "" : "up", `${c.passing || 0} passing`), el("a", { href: r.url, target: "_blank", rel: "noopener", class: "small" }, "GitHub Actions ↗"),
+        badge(c.failing ? "" : "up", `${c.passing || 0} passing`), el("a", { href: r.url, target: "_blank", rel: "noopener", class: "small" }, r.forge === "forge" ? "Forge Actions ↗" : "GitHub Actions ↗"),
         el("a", { href: `${BASE}/repo/${r.repo_id}`, class: "small", onclick: (e) => { e.preventDefault(); e.stopPropagation(); store_.set(`tab:${r.repo_id}`, "Actions"); route(`/repo/${r.repo_id}`) } }, "Manage"))
     }
     const card = el("section", { class: "card" }, head)

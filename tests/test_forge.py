@@ -149,6 +149,54 @@ def test_publish_shows_forge_and_home_remote(home, client, repos):
     assert client.post(f"/api/repo/{repo['id']}/home", json={"remote": "nope"}).status_code == 400
 
 
+def test_default_home_forge_picks_the_forge_remote(home, client, repos):
+    _, mine = repos
+    git(mine, "remote", "set-url", "origin", "https://github.com/Wizard815/proj.git")
+    git(mine, "remote", "add", "forge", "http://forgejo:3000/wizard/proj.git")
+    repo = registry.add_repo(str(mine), None, "mine")
+    credentials.set("forge_default_home", "forge")
+    assert client.get(f"/api/repo/{repo['id']}/publish").get_json()["home"] == "forge"
+    assert client.post(f"/api/repo/{repo['id']}/home", json={"remote": "origin"}).get_json()["ok"]
+    assert client.get(f"/api/repo/{repo['id']}/publish").get_json()["home"] == "origin"   # a pick wins
+
+
+# ------------------------------------------------------------------ CI and issues on the forge
+RUNS = {"workflow_runs": [
+    {"id": 9, "name": "ci", "workflow_id": "ci.yml", "status": "running", "head_branch": "main", "url": "http://forgejo:3000/w/r/actions/runs/9"},
+    {"id": 8, "name": "ci", "workflow_id": "ci.yml", "status": "failure", "head_branch": "main", "url": "u8"},
+    {"id": 7, "name": "lint", "workflow_id": "lint.yml", "status": "success", "head_branch": "main", "url": "u7"},
+]}
+
+
+def test_workflow_health_reads_forge_actions(home, monkeypatch, repos):
+    from upstream_upkeep import actions
+    _, mine = repos
+    git(mine, "remote", "set-url", "origin", "http://forgejo:3000/w/r.git")
+    monkeypatch.setattr(forge, "_api", lambda method, path, token=None, ok404=False, **kw: RUNS if path == "/repos/w/r/actions/tasks" else None)
+    h = actions.health({"path": str(mine)}, "origin")
+    assert h["ok"] and h["forge"] == "forge" and h["url"] == "http://forgejo:3000/w/r/actions"
+    by = {w["name"]: w for w in h["workflows"]}
+    assert by["ci"]["health"] == "running" and by["ci"]["recent"] == ["running", "failure"]
+    assert by["lint"]["health"] == "passing"
+
+
+def test_issue_import_reads_forge_issues(home, monkeypatch, repos):
+    from upstream_upkeep import issues
+    _, mine = repos
+    repo = registry.add_repo(str(mine), None, "mine")
+    repo["remote_url"] = "http://forgejo:3000/w/r.git"
+    plain = {"number": 4, "title": "Fix it", "html_url": "http://forgejo:3000/w/r/issues/4", "state": "open",
+             "labels": [{"name": "bug"}], "user": {"login": "wizard"}, "body": "broken", "pull_request": None}
+    monkeypatch.setattr(forge, "_api", lambda method, path, token=None, ok404=False, **kw:
+                        [plain, {**plain, "number": 5, "pull_request": {"merged": False}}] if path == "/repos/w/r/issues" else plain)
+    listed = issues.list_issues(repo)
+    assert listed["source"] == {"remote": "origin", "slug": "w/r", "forge": "forge"}
+    assert [i["number"] for i in listed["items"]] == [4]       # the PR is left out, the null pull_request isn't
+    made = issues.import_issues(repo, [4])
+    assert made["created"][0]["title"] == "#4 Fix it" and "From forge issue w/r#4" in made["created"][0]["body"]
+    assert issues.import_issues(repo, [4])["skipped"][0]["why"] == "already a task"
+
+
 # ------------------------------------------------------------------ against a real Forgejo
 LIVE_URL, LIVE_TOKEN = os.environ.get("FORGE_TEST_URL"), os.environ.get("FORGE_TEST_TOKEN")
 live = pytest.mark.skipif(not (LIVE_URL and LIVE_TOKEN), reason="set FORGE_TEST_URL and FORGE_TEST_TOKEN to run against a real Forgejo")
@@ -215,3 +263,15 @@ def test_live_pull_mirror(live_forge):
     info = forge.repo_info(m["owner"], name)
     assert info["mirror"] and info["private"] and info["original_url"]
     assert forge.sync(m["owner"], name)["ok"]
+
+
+@live
+def test_live_forge_actions_and_issues(live_forge, repos):
+    """Against a forge with a repo that has run CI (FORGE_TEST_CI_REPO, owner/name)."""
+    slug = os.environ.get("FORGE_TEST_CI_REPO")
+    if not slug:
+        pytest.skip("set FORGE_TEST_CI_REPO to a forge repo with Actions runs")
+    owner, name = slug.split("/")
+    h = forge.actions_health(owner, name)
+    assert h["items"] and all(i["last"]["url"] for i in h["items"])
+    assert isinstance(forge.issues(owner, name, "all"), list)

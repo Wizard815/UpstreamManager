@@ -22,7 +22,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import requests
 
@@ -306,3 +306,43 @@ def import_mirror(source_url: str, name: str | None = None, private: bool = True
         raise
     return {"owner": r["owner"]["login"], "repo": r["name"], "clone_url": r["clone_url"], "web_url": r["html_url"],
             "detail": f"{source_url} is mirrored to {r['html_url']} every {interval}"}
+
+
+# ------------------------------------------------------------ CI and issues
+_RUN_STATE = {"success": "success", "failure": "failure", "cancelled": "cancelled", "skipped": "skipped",
+              "running": None, "waiting": None, "blocked": None}
+
+
+def actions_health(owner: str, repo: str) -> dict:
+    """Forgejo Actions in the same shape as actions.health(): each workflow's latest run and its last 10.
+
+    Forgejo has no workflow list in its API, so workflows are the ones that ran (newest 50 runs)."""
+    data = _api("GET", f"/repos/{quote(owner)}/{quote(repo)}/actions/tasks", params={"limit": 50}, ok404=True)
+    runs = (data or {}).get("workflow_runs") or []
+    by_wf: dict[str, list] = {}
+    for r in runs:  # newest first
+        by_wf.setdefault(r.get("workflow_id") or r.get("name") or "?", []).append(r)
+    items = []
+    for wf, rs in by_wf.items():
+        last = rs[0]
+        status = last.get("status") or ""
+        items.append({
+            "name": rs[0].get("name") or wf, "path": f".forgejo/workflows/{wf}" if "/" not in wf else wf, "state": "active",
+            "html_url": f"{url()}/{owner}/{repo}/actions?workflow={wf}",
+            "last": {"conclusion": _RUN_STATE.get(status, status), "status": "completed" if _RUN_STATE.get(status) else status,
+                     "url": last.get("url"), "branch": last.get("head_branch"), "event": last.get("event"),
+                     "at": last.get("created_at"), "title": last.get("display_title")},
+            "recent": [_RUN_STATE.get(r.get("status"), r.get("status")) or r.get("status") for r in rs[:10]],
+        })
+    return {"owner": owner, "repo": repo, "url": f"{url()}/{owner}/{repo}/actions", "items": items,
+            "actions_off": data is None}
+
+
+def issues(owner: str, repo: str, state: str = "open", limit: int = 50) -> list[dict]:
+    """Issues (not PRs), newest change first, in GitHub's shape (html_url, user.login, labels)."""
+    return _api("GET", f"/repos/{quote(owner)}/{quote(repo)}/issues",
+                params={"state": state, "type": "issues", "limit": max(1, min(int(limit), 50)), "sort": "recentupdate"}) or []
+
+
+def issue(owner: str, repo: str, number: int) -> dict:
+    return _api("GET", f"/repos/{quote(owner)}/{quote(repo)}/issues/{int(number)}")

@@ -1,14 +1,15 @@
-"""GitHub issues as Work tasks.
+"""GitHub and home-forge issues as Work tasks.
 
-A repo's issues come from the GitHub repo behind one of its remotes (origin by default, else the
-first upstream on github.com; the user can pick another). Importing one makes a task with the issue's
+A repo's issues come from the GitHub or forge repo behind one of its remotes (origin by default, else
+the first upstream on github.com or the forge; the user can pick another). Forge issues need the forge
+token (Settings -> Accounts). Importing one makes a task with the issue's
 title and text and a link back to it; an issue already imported is not imported twice. Public repos
 work without a token (GitHub allows 60 requests an hour); a saved token raises that and opens private
 repos. Nothing is written to GitHub.
 """
 from __future__ import annotations
 
-from . import actions, github, store, tasks
+from . import actions, forge, github, store, tasks
 
 MAX_IMPORT = 50
 _KIND_BY_LABEL = {"bug": "bug", "defect": "bug", "regression": "bug", "enhancement": "feature", "feature": "feature",
@@ -20,26 +21,46 @@ class IssueError(ValueError):
 
 
 def remotes(repo: dict) -> list[dict]:
-    """The repo's remotes that are on github.com: [{remote, slug}], origin first."""
+    """The repo's remotes on github.com or the home forge: [{remote, slug, forge}], origin first."""
     seen, out = set(), []
     cands = [("origin", repo.get("remote_url"))] + [(u["name"], u.get("url")) for u in repo.get("upstreams") or []]
     for name, url in cands:
-        hit = github.parse_remote(url or "")
+        hit = forge.parse(url or "")
         if hit and name not in seen:
             seen.add(name)
-            out.append({"remote": name, "slug": f"{hit[0]}/{hit[1]}"})
+            out.append({"remote": name, "slug": f"{hit.owner}/{hit.repo}", "forge": hit.forge})
     return out
+
+
+def _fetch_list(src: dict, state: str, limit: int) -> list:
+    if src.get("forge") == "forge":
+        owner, name = src["slug"].split("/", 1)
+        return forge.issues(owner, name, state, limit)
+    return actions._get(f"/repos/{src['slug']}/issues", {"state": state, "per_page": max(1, min(int(limit), 100)),
+                                                       "sort": "updated"})
+
+
+def _fetch_one(src: dict, n: int) -> dict:
+    if src.get("forge") == "forge":
+        owner, name = src["slug"].split("/", 1)
+        return forge.issue(owner, name, n)
+    return actions._get(f"/repos/{src['slug']}/issues/{n}")
+
+
+def _is_pr(i: dict, src: dict) -> bool:
+    # GitHub adds pull_request only to PRs; Forgejo sends it as null on plain issues.
+    return i.get("pull_request") is not None if src.get("forge") == "forge" else "pull_request" in i
 
 
 def _source(repo: dict, remote: str | None) -> dict:
     rs = remotes(repo)
     if not rs:
-        raise IssueError("this repo has no remote on github.com")
+        raise IssueError("this repo has no remote on github.com or the home forge")
     if remote:
         for r in rs:
             if r["remote"] == remote:
                 return r
-        raise IssueError(f"{remote} is not a github.com remote of this repo")
+        raise IssueError(f"{remote} is not a github.com or forge remote of this repo")
     return rs[0]
 
 
@@ -60,10 +81,9 @@ def list_issues(repo: dict, remote: str | None = None, state: str = "open", limi
     src = _source(repo, remote)
     if state not in ("open", "closed", "all"):
         raise IssueError("state is open, closed or all")
-    data = actions._get(f"/repos/{src['slug']}/issues", {"state": state, "per_page": max(1, min(int(limit), 100)),
-                                                       "sort": "updated"})
+    data = _fetch_list(src, state, limit)
     done = _imported(repo["id"])
-    items = [_shape(i, done) for i in data if isinstance(i, dict) and "pull_request" not in i]   # issues, not PRs
+    items = [_shape(i, done) for i in data if isinstance(i, dict) and not _is_pr(i, src)]   # issues, not PRs
     return {"ok": True, "source": src, "remotes": remotes(repo), "items": items}
 
 
@@ -79,11 +99,11 @@ def import_issues(repo: dict, numbers: list, remote: str | None = None, by: str 
     made, skipped = [], []
     for n in wanted:
         try:
-            i = actions._get(f"/repos/{src['slug']}/issues/{n}")
+            i = _fetch_one(src, n)
         except github.GitHubError as e:
             skipped.append({"number": n, "why": str(e)})
             continue
-        if "pull_request" in i:
+        if _is_pr(i, src):
             skipped.append({"number": n, "why": "that is a pull request, not an issue"})
             continue
         url = i.get("html_url")
@@ -92,12 +112,13 @@ def import_issues(repo: dict, numbers: list, remote: str | None = None, by: str 
             continue
         labels = [(lb.get("name") or "").lower() for lb in i.get("labels") or [] if isinstance(lb, dict)]
         kind = next((_KIND_BY_LABEL[lb] for lb in labels if lb in _KIND_BY_LABEL), "fix")
-        body = (f"From GitHub issue {src['slug']}#{n} by {(i.get('user') or {}).get('login', '?')}: {url}\n"
+        where = "forge" if src.get("forge") == "forge" else "GitHub"
+        body = (f"From {where} issue {src['slug']}#{n} by {(i.get('user') or {}).get('login', '?')}: {url}\n"
                 + (f"Labels: {', '.join(labels)}\n" if labels else "") + "\n" + (i.get("body") or "").strip())
         t = tasks.create(repo["id"], f"#{n} {i.get('title') or ''}".strip()[:200], body[:20000], kind,
                          [{"type": "issue", "id": url, "label": f"{src['slug']}#{n}"}], by=by)
         with store.lock:
-            t["source"] = {"type": "github-issue", "repo": src["slug"], "number": n, "url": url}
+            t["source"] = {"type": "github-issue", "repo": src["slug"], "number": n, "url": url, "forge": src.get("forge", "github")}
             store.save_state()
         done[url] = t["id"]
         made.append(t)

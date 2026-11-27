@@ -415,10 +415,15 @@ def _github_remotes(repo: dict) -> list[dict]:
 
 
 def _home_remote(repo: dict, remotes: list[dict]) -> str | None:
-    """The remote this repo pushes to by default: the one picked for it, else origin."""
+    """The remote this repo pushes to by default: the one picked for it, else its forge remote when the
+    default home is the forge (Settings -> Accounts), else origin."""
     names = [r["name"] for r in remotes]
     if repo.get("home_remote") in names:
         return repo["home_remote"]
+    if (credentials.get("forge_default_home") or "").strip().lower() == "forge":
+        on_forge = [r["name"] for r in remotes if r.get("forge") == "forge"]
+        if on_forge:
+            return "origin" if "origin" in on_forge else on_forge[0]
     return "origin" if "origin" in names else (names[0] if names else None)
 
 
@@ -709,7 +714,8 @@ def api_workflows():
     def one(repo):
         base = {"repo_id": repo["id"], "repo_name": repo.get("name") or repo["id"]}
         try:
-            return {**base, **actions.health(repo)}
+            # The home remote's CI: GitHub Actions or the forge's.
+            return {**base, **actions.health(repo, _home_remote(repo, _github_remotes(repo)) or "origin")}
         except Exception as e:  # GitHub errors, rate limits, network
             return {**base, "ok": False, "error": str(e)}
     repos = store.snapshot(store.all_repos())

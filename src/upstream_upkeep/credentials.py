@@ -24,6 +24,7 @@ FIELDS = {
     "github_token": "UPSTREAM_GITHUB_TOKEN",
     "forge_url": "UPSTREAM_FORGE_URL",        # the homelab's Forgejo/Gitea, e.g. http://forgejo:3000 (see forge.py)
     "forge_token": "UPSTREAM_FORGE_TOKEN",    # an access token on that forge
+    "forge_default_home": "UPSTREAM_FORGE_DEFAULT_HOME",  # "forge": a repo with a forge remote pushes there unless you pick
     "dockerhub_username": "UPSTREAM_DOCKERHUB_USERNAME",
     "dockerhub_token": "UPSTREAM_DOCKERHUB_TOKEN",
     "wiki_api_key": "UPSTREAM_WIKI_API_KEY",  # the vault's Obsidian Local REST API key

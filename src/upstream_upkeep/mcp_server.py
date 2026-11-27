@@ -253,8 +253,8 @@ def set_task_priority(task: TaskId, agent: AgentName,
 @server.tool(annotations=READ)
 def list_issues(repo: Repo,
                 state: Annotated[Literal["open", "closed", "all"], Field(description="Which issues.")] = "open",
-                remote: Annotated[str, Field(description="Which github.com remote's issues (default: origin, else the first upstream).")] = "") -> dict:
-    """The GitHub issues of a repo (not pull requests), newest activity first, each with the task it became if imported."""
+                remote: Annotated[str, Field(description="Which github.com or home-forge remote's issues (default: origin, else the first upstream).")] = "") -> dict:
+    """The GitHub or home-forge issues of a repo (not pull requests), newest activity first, each with the task it became if imported."""
     return _call("GET", _r(repo) + "/issues", state=state, remote=remote)
 
 
@@ -262,7 +262,7 @@ def list_issues(repo: Repo,
 def import_issues(repo: Repo,
                   numbers: Annotated[list[int], Field(min_length=1, max_length=50, description="Issue numbers from list_issues.")],
                   remote: Annotated[str, Field(description="The remote list_issues used, if not the default.")] = "") -> dict:
-    """Make Work tasks of GitHub issues (title, text and a link back). An issue already imported is skipped."""
+    """Make Work tasks of GitHub or home-forge issues (title, text and a link back). An issue already imported is skipped."""
     return _call("POST", _r(repo) + "/issues/import", {"numbers": numbers, "remote": remote})
 
 
@@ -525,7 +525,7 @@ def add_upstream(
 
 @server.tool(annotations=READ)
 def workflow_health(repo: Annotated[str, Field(description="Only this repo (id from list_repos); empty for every repo.")] = "") -> list[dict]:
-    """GitHub Actions per repo: each workflow passing/failing/running/skipped, its latest run (link,
+    """CI per repo (GitHub Actions, or Forgejo Actions when the home remote is the forge): each workflow passing/failing/running/skipped, its latest run (link,
     branch, event) and the last 10 results."""
     out = _call("GET", "/api/workflows")
     return [r for r in out if not repo or r.get("repo_id") == repo]
