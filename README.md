@@ -1,4 +1,6 @@
 # UpstreamManager
+
+[![License: PolyForm Shield 1.0.0](https://img.shields.io/badge/license-PolyForm%20Shield%201.0.0-blue)](LICENSE)
 Upstreams and Branches, Manage it all and have a IDE and chat to work along with it
 
 ## Install
@@ -607,3 +609,12 @@ conflict; re-enable any time. The tab also flags workflows the next upstream
 pull would add (they arrive active) and ones added since you last reviewed.
 Reading works without a token for public repos; changing needs the token's
 Actions permission.
+
+## License
+
+UpstreamManager is source-available under the
+[PolyForm Shield License 1.0.0](LICENSE). You can read, run, change and share
+it for free, including at work. You can't sell it or offer it as a competing
+product or hosted service without permission: open an issue titled
+"License request" to ask. [docs/LICENSING.md](docs/LICENSING.md) explains it
+in plain English. Versions published before the switch stay under MIT.

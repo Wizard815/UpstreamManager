@@ -2,6 +2,8 @@
 name = "upstream-upkeep"
 version = "0.1.0"
 description = "Studio connector that keeps local repos in sync with upstreams and recent changes, with daily checks, approval-gated pushes, per-repo chat with memory and daily logs, and an LLM settings page sharing the same backend as Studio."
+license = "LicenseRef-PolyForm-Shield-1.0.0"
+license-files = ["LICENSE"]
 readme = "README.md"
 authors = [
     { name = "Wizard815", email = "243372008+Wizard815@users.noreply.github.com" }
